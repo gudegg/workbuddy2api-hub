@@ -3134,6 +3134,11 @@ class AnthropicRequestError(ValueError):
     """A client-side request error that should use Anthropic's error shape."""
 
 
+ANTHROPIC_IMAGE_MEDIA_TYPES = {
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+}
+
+
 def _anthropic_text_block_text(block):
     if not isinstance(block, dict):
         return None
@@ -3147,10 +3152,22 @@ def _anthropic_image_part(block):
         raise AnthropicRequestError("image content requires a source object")
     source_type = str(source.get("type") or "").strip().lower()
     if source_type == "base64":
-        media_type = str(source.get("media_type") or "").strip()
+        media_type = str(source.get("media_type") or source.get("mediaType") or "").strip().lower()
         data = source.get("data")
-        if not media_type or not isinstance(data, str) or not data:
+        if not isinstance(data, str) or not data.strip():
             raise AnthropicRequestError("base64 image source requires media_type and data")
+        data = data.strip()
+        # A few compatibility clients put the complete data URL in `data`
+        # instead of raw base64.  Do not prefix it twice.
+        if data.lower().startswith("data:image/"):
+            return {"type": "image_url", "image_url": {"url": data}}
+        if media_type not in ANTHROPIC_IMAGE_MEDIA_TYPES:
+            raise AnthropicRequestError(
+                "unsupported image media_type: %s" % (media_type or "unknown")
+            )
+        # JSON base64 occasionally arrives wrapped across lines.  Removing
+        # whitespace keeps the resulting data URL consumable by the upstream.
+        data = re.sub(r"\s+", "", data)
         return {"type": "image_url", "image_url": {
             "url": "data:%s;base64,%s" % (media_type, data),
         }}
@@ -3190,6 +3207,20 @@ def _anthropic_content_to_openai(content, allow_images=True):
             if not allow_images:
                 raise AnthropicRequestError("images are not allowed in system content")
             parts.append(_anthropic_image_part(block))
+        elif block_type in ("image_url", "input_image"):
+            # Non-Anthropic clients sometimes send OpenAI-shaped image blocks
+            # through an Anthropic-compatible endpoint.  Accepting these is
+            # harmless and makes the adapter usable with mixed SDK stacks.
+            if not allow_images:
+                raise AnthropicRequestError("images are not allowed in system content")
+            image_url = block.get("image_url") or block.get("url")
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url")
+            if not isinstance(image_url, str) or not image_url.strip():
+                raise AnthropicRequestError("image_url content requires a url")
+            parts.append({"type": "image_url", "image_url": {
+                "url": image_url.strip(),
+            }})
         elif block_type in ("thinking", "redacted_thinking"):
             # Thinking is handled separately for assistant history.  It is not
             # a user-visible prompt block and must not be sent as ordinary text.
@@ -3369,14 +3400,24 @@ def _anthropic_messages_to_chat(payload, require_max_tokens=True):
                 raise AnthropicRequestError("max_tokens must be a positive integer")
 
     messages = []
+    system_parts = []
     system = _anthropic_system_text(payload.get("system"))
     if system:
-        messages.append({"role": "system", "content": system})
+        system_parts.append(system)
 
     for source in raw_messages:
         if not isinstance(source, dict):
             raise AnthropicRequestError("each message must be an object")
         role = str(source.get("role") or "").strip().lower()
+        if role in ("system", "developer"):
+            # Anthropic's public schema places system instructions in the
+            # top-level `system` field, but Claude Code and compatibility
+            # clients can still carry them as message turns.  Normalize them
+            # here instead of forwarding an invalid role to WorkBuddy.
+            system_text = _anthropic_system_text(source.get("content"))
+            if system_text:
+                system_parts.append(system_text)
+            continue
         if role not in ("user", "assistant"):
             raise AnthropicRequestError("message role must be user or assistant")
         content = source.get("content")
@@ -3411,6 +3452,9 @@ def _anthropic_messages_to_chat(payload, require_max_tokens=True):
                 pending.append(block)
         if pending or not saw_tool_result:
             messages.append({"role": "user", "content": _anthropic_content_to_openai(pending)})
+
+    if system_parts:
+        messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
 
     body = {"model": model, "messages": messages}
     if max_tokens is not None:

@@ -59,6 +59,27 @@ check("system becomes a system message", chat["messages"][0] == {
 }, chat["messages"][0])
 check("image becomes an OpenAI data URL",
       chat["messages"][1]["content"][1]["image_url"]["url"] == "data:image/png;base64,abc")
+image_compat = P._anthropic_messages_to_chat({
+    "model": "m",
+    "max_tokens": 8,
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "first"},
+        {"type": "image", "source": {
+            "type": "base64", "media_type": "image/jpeg",
+            "data": "data:image/jpeg;base64,already-normalized",
+        }},
+        {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+    ]}],
+})
+image_parts = image_compat["messages"][0]["content"]
+check("image data URLs are not double-prefixed",
+      image_parts[1]["image_url"]["url"] == "data:image/jpeg;base64,already-normalized")
+check("OpenAI-shaped image compatibility is preserved",
+      image_parts[2]["image_url"]["url"] == "https://example.test/a.png")
+forwarded_image = P.build_upstream_body(image_compat)
+check("image parts survive the WorkBuddy forwarding transform",
+      forwarded_image["messages"][1]["content"][1]["type"] == "image_url" and
+      forwarded_image["messages"][1]["content"][2]["type"] == "image_url")
 assistant = chat["messages"][2]
 check("assistant thinking is preserved as reasoning_content",
       assistant.get("reasoning_content") == "I should call the weather tool.")
@@ -71,6 +92,20 @@ check("tool_result becomes a tool message",
 check("tool schema and choice are translated",
       chat["tools"][0]["function"]["parameters"]["type"] == "object" and
       chat["tool_choice"] == "auto" and chat["parallel_tool_calls"] is False)
+
+legacy_system_chat = P._anthropic_messages_to_chat({
+    "model": "m",
+    "max_tokens": 16,
+    "messages": [
+        {"role": "system", "content": "System instruction from Claude Code."},
+        {"role": "user", "content": "hello"},
+    ],
+})
+check("system message turns are normalized to top-level system semantics",
+      legacy_system_chat["messages"][0] == {
+          "role": "system", "content": "System instruction from Claude Code."
+      } and legacy_system_chat["messages"][1]["role"] == "user",
+      legacy_system_chat["messages"])
 
 print()
 print("[2] Anthropic response and SSE envelope are valid")
