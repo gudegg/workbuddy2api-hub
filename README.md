@@ -19,7 +19,7 @@
 - **国内版自动化**：每日签到、成长任务与积分任务自动接取点亮领奖、猫猫日常旅行与连续打卡；
 - **国际版每日活跃打卡**：自动向国际版官方通道发送轻量对话，全自动领满官方每日活跃 30/50 积分奖励；
 - **后台定时调度器**：09:00/21:00 国内签到旅行与国际版活跃打卡 · 22:00 保活 · 01:00 夜猫；
-- **双协议支持**：Chat Completions 与 Responses API（Codex / Claude Code）；
+- **多协议支持**：Chat Completions、Responses API（Codex / Claude Code）与 Anthropic Messages API；
 - **Web 看板**：指标卡片、模型性能与用量大表、实时请求流水一屏可查。
 
 > ⚡ **Vibe Coding 产物**：本项目为 100% Vibe Coding 协同产物，由人类开发者提出架构与业务意图，AI 助手端到端完成逆向分析、链路调度、WAF 指纹脱敏与界面编写。
@@ -188,6 +188,9 @@ export OPENAI_BASE_URL="http://127.0.0.1:8788/v1"
 export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 ```
 
+### Anthropic Messages API
+兼容 Anthropic SDK 的 `POST /v1/messages`、`POST /v1/messages/count_tokens` 和 `GET /v1/models`。请求使用 `x-api-key` 与 `anthropic-version: 2023-06-01`，流式请求设置 `stream: true`；图片、工具调用、工具结果和 Anthropic SSE 事件会在网关与 WorkBuddy Chat 协议之间转换。
+
 ---
 
 ## 五、看板与接口一览
@@ -201,6 +204,8 @@ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 | GET | / | Web 用量与任务监控看板 |
 | POST | /v1/chat/completions | 标准 Chat Completions 接口 |
 | POST | /v1/responses | Responses API 协议接口 |
+| POST | /v1/messages | Anthropic Messages API（含流式、图片、工具调用） |
+| POST | /v1/messages/count_tokens | Anthropic 输入 token 估算 |
 | GET | /v1/models | 官方对齐模型列表（含能力与规格宣告） |
 | GET | /tasks | 国内版成长任务、连续打卡与猫猫日常状态 |
 | POST | /tasks/run | 触发国内成长任务全自动点亮与领奖 |

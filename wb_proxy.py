@@ -5,6 +5,8 @@ Reuses the credentials the WorkBuddy desktop app already stored on this machine
 login is needed. Exposes:
     GET  /v1/models
     POST /v1/chat/completions     (stream=true and stream=false)
+    POST /v1/messages             (Anthropic Messages compatibility)
+    POST /v1/messages/count_tokens
     GET  /health
 Only the Python standard library is required.
     python3 wb_proxy.py                    # bind 127.0.0.1:8788
@@ -3119,6 +3121,423 @@ def aggregate_stream(raw_iter, model, resp_id):
     out["elapsed_ms"] = int((time.time() - started) * 1000)
     out["first_chunk_at"] = first_chunk_at
     return out
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Messages API <-> WorkBuddy Chat Completions translation
+# ---------------------------------------------------------------------------
+# WorkBuddy's upstream only exposes a Chat Completions-shaped stream.  Keep
+# the Anthropic adapter here, next to the existing stream aggregator, so the
+# two public protocols share account selection, retries, usage recording and
+# model/realm checks without sharing their wire formats.
+class AnthropicRequestError(ValueError):
+    """A client-side request error that should use Anthropic's error shape."""
+
+
+def _anthropic_text_block_text(block):
+    if not isinstance(block, dict):
+        return None
+    value = block.get("text")
+    return value if isinstance(value, str) else None
+
+
+def _anthropic_image_part(block):
+    source = block.get("source") if isinstance(block, dict) else None
+    if not isinstance(source, dict):
+        raise AnthropicRequestError("image content requires a source object")
+    source_type = str(source.get("type") or "").strip().lower()
+    if source_type == "base64":
+        media_type = str(source.get("media_type") or "").strip()
+        data = source.get("data")
+        if not media_type or not isinstance(data, str) or not data:
+            raise AnthropicRequestError("base64 image source requires media_type and data")
+        return {"type": "image_url", "image_url": {
+            "url": "data:%s;base64,%s" % (media_type, data),
+        }}
+    if source_type == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise AnthropicRequestError("url image source requires a url")
+        return {"type": "image_url", "image_url": {"url": url.strip()}}
+    raise AnthropicRequestError("unsupported image source type: %s" % (source_type or "unknown"))
+
+
+def _anthropic_content_to_openai(content, allow_images=True):
+    """Convert Anthropic text/image blocks to Chat Completions content."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        raise AnthropicRequestError("message content must be a string or an array of content blocks")
+
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append({"type": "text", "text": block})
+            continue
+        if not isinstance(block, dict):
+            raise AnthropicRequestError("content blocks must be objects")
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type == "text":
+            text = _anthropic_text_block_text(block)
+            if text is None:
+                raise AnthropicRequestError("text content requires a text string")
+            parts.append({"type": "text", "text": text})
+        elif block_type == "image":
+            if not allow_images:
+                raise AnthropicRequestError("images are not allowed in system content")
+            parts.append(_anthropic_image_part(block))
+        elif block_type in ("thinking", "redacted_thinking"):
+            # Thinking is handled separately for assistant history.  It is not
+            # a user-visible prompt block and must not be sent as ordinary text.
+            continue
+        elif block_type in ("document", "search_result", "server_tool_use", "web_search_tool_result"):
+            raise AnthropicRequestError("unsupported content block type: %s" % block_type)
+        elif block_type:
+            raise AnthropicRequestError("unsupported content block type: %s" % block_type)
+        else:
+            raise AnthropicRequestError("content block is missing type")
+    if not parts:
+        return ""
+    if all(part.get("type") == "text" for part in parts):
+        return "".join(part.get("text") or "" for part in parts)
+    return parts
+
+
+def _anthropic_system_text(system):
+    if system is None:
+        return ""
+    converted = _anthropic_content_to_openai(system, allow_images=False)
+    if isinstance(converted, str):
+        return converted
+    return "".join(part.get("text") or "" for part in converted
+                   if isinstance(part, dict) and part.get("type") == "text")
+
+
+def _anthropic_tool_result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    if isinstance(content, list):
+        text = []
+        for block in content:
+            if isinstance(block, str):
+                text.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text.append(str(block.get("text") or ""))
+            else:
+                text.append(json.dumps(block, ensure_ascii=False, separators=(",", ":")))
+        return "".join(text)
+    if content is None:
+        return ""
+    return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+
+def _anthropic_assistant_blocks(content):
+    """Return (text, reasoning, OpenAI tool_calls) for an assistant turn."""
+    if isinstance(content, str):
+        return content, "", []
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        raise AnthropicRequestError("assistant content must be a string or an array")
+    text_parts = []
+    reasoning_parts = []
+    tool_calls = []
+    for block in content:
+        if isinstance(block, str):
+            text_parts.append(block)
+            continue
+        if not isinstance(block, dict):
+            raise AnthropicRequestError("assistant content blocks must be objects")
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type == "text":
+            text = _anthropic_text_block_text(block)
+            if text is None:
+                raise AnthropicRequestError("text content requires a text string")
+            text_parts.append(text)
+        elif block_type == "thinking":
+            thinking = block.get("thinking")
+            if isinstance(thinking, str):
+                reasoning_parts.append(thinking)
+        elif block_type == "redacted_thinking":
+            # The encrypted redacted value cannot be replayed to WorkBuddy.
+            continue
+        elif block_type == "tool_use":
+            name = str(block.get("name") or "").strip()
+            call_id = str(block.get("id") or "").strip() or _new_id("call_")
+            if not name:
+                raise AnthropicRequestError("tool_use requires a name")
+            arguments = block.get("input")
+            if arguments is None:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                raise AnthropicRequestError("tool_use input must be an object")
+            tool_calls.append({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False,
+                                              separators=(",", ":")),
+                },
+            })
+        elif block_type:
+            raise AnthropicRequestError("unsupported assistant content block type: %s" % block_type)
+        else:
+            raise AnthropicRequestError("assistant content block is missing type")
+    return "".join(text_parts), "".join(reasoning_parts), tool_calls
+
+
+def _anthropic_tools_to_openai(tools):
+    if tools is None:
+        return None
+    if not isinstance(tools, list):
+        raise AnthropicRequestError("tools must be an array")
+    converted = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise AnthropicRequestError("each tool must be an object")
+        name = str(tool.get("name") or "").strip()
+        if not name:
+            raise AnthropicRequestError("each tool requires a name")
+        schema = tool.get("input_schema")
+        if not isinstance(schema, dict):
+            raise AnthropicRequestError("tool %s requires an input_schema object" % name)
+        fn = {
+            "name": name,
+            "description": str(tool.get("description") or ""),
+            "parameters": schema,
+        }
+        if "strict" in tool:
+            fn["strict"] = tool["strict"]
+        converted.append({"type": "function", "function": fn})
+    return converted
+
+
+def _anthropic_tool_choice_to_openai(choice):
+    if choice is None:
+        return None
+    if not isinstance(choice, dict):
+        raise AnthropicRequestError("tool_choice must be an object")
+    kind = str(choice.get("type") or "").strip().lower()
+    if kind == "auto":
+        return "auto"
+    if kind == "any":
+        return "required"
+    if kind == "none":
+        return "none"
+    if kind == "tool":
+        name = str(choice.get("name") or "").strip()
+        if not name:
+            raise AnthropicRequestError("tool_choice type 'tool' requires a name")
+        return name
+    raise AnthropicRequestError("unsupported tool_choice type: %s" % (kind or "unknown"))
+
+
+def _anthropic_messages_to_chat(payload, require_max_tokens=True):
+    """Validate and convert one Anthropic Messages request to Chat shape."""
+    if not isinstance(payload, dict):
+        raise AnthropicRequestError("request body must be a JSON object")
+    model = str(payload.get("model") or "").strip()
+    if not model:
+        raise AnthropicRequestError("model is required")
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list) or not raw_messages:
+        raise AnthropicRequestError("messages must be a non-empty array")
+    if require_max_tokens:
+        try:
+            max_tokens = int(payload.get("max_tokens"))
+        except (TypeError, ValueError):
+            raise AnthropicRequestError("max_tokens is required and must be a positive integer")
+        if max_tokens <= 0:
+            raise AnthropicRequestError("max_tokens must be a positive integer")
+    else:
+        raw_max_tokens = payload.get("max_tokens")
+        if raw_max_tokens is None:
+            max_tokens = None
+        else:
+            try:
+                max_tokens = int(raw_max_tokens)
+            except (TypeError, ValueError):
+                raise AnthropicRequestError("max_tokens must be a positive integer")
+            if max_tokens <= 0:
+                raise AnthropicRequestError("max_tokens must be a positive integer")
+
+    messages = []
+    system = _anthropic_system_text(payload.get("system"))
+    if system:
+        messages.append({"role": "system", "content": system})
+
+    for source in raw_messages:
+        if not isinstance(source, dict):
+            raise AnthropicRequestError("each message must be an object")
+        role = str(source.get("role") or "").strip().lower()
+        if role not in ("user", "assistant"):
+            raise AnthropicRequestError("message role must be user or assistant")
+        content = source.get("content")
+        if role == "assistant":
+            text, reasoning, tool_calls = _anthropic_assistant_blocks(content)
+            message = {"role": "assistant", "content": text}
+            if reasoning:
+                message["reasoning_content"] = reasoning
+                message["reasoning"] = reasoning
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            messages.append(message)
+            continue
+
+        blocks = content if isinstance(content, list) else [content]
+        pending = []
+        saw_tool_result = False
+        for block in blocks:
+            if isinstance(block, dict) and str(block.get("type") or "").strip().lower() == "tool_result":
+                if pending:
+                    messages.append({"role": "user", "content": _anthropic_content_to_openai(pending)})
+                    pending = []
+                tool_id = str(block.get("tool_use_id") or "").strip()
+                if not tool_id:
+                    raise AnthropicRequestError("tool_result requires a tool_use_id")
+                result = _anthropic_tool_result_text(block.get("content"))
+                if block.get("is_error"):
+                    result = "Tool error: " + result
+                messages.append({"role": "tool", "tool_call_id": tool_id, "content": result})
+                saw_tool_result = True
+            else:
+                pending.append(block)
+        if pending or not saw_tool_result:
+            messages.append({"role": "user", "content": _anthropic_content_to_openai(pending)})
+
+    body = {"model": model, "messages": messages}
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+    for key in ("temperature", "top_p", "top_k", "stream", "thinking"):
+        if key in payload:
+            body[key] = payload[key]
+    if "stop_sequences" in payload:
+        stops = payload.get("stop_sequences")
+        if not isinstance(stops, list) or not all(isinstance(item, str) for item in stops):
+            raise AnthropicRequestError("stop_sequences must be an array of strings")
+        body["stop"] = stops
+    tools = _anthropic_tools_to_openai(payload.get("tools"))
+    if tools is not None:
+        body["tools"] = tools
+    choice = _anthropic_tool_choice_to_openai(payload.get("tool_choice"))
+    if choice is not None:
+        body["tool_choice"] = choice
+    if isinstance(payload.get("tool_choice"), dict):
+        body["parallel_tool_calls"] = not bool(
+            payload["tool_choice"].get("disable_parallel_tool_use")
+        )
+    return body
+
+
+def _anthropic_input_tokens(chat_payload):
+    try:
+        raw = json.dumps(chat_payload.get("messages") or [], ensure_ascii=False,
+                          separators=(",", ":"))
+        return max(1, estimate_tokens(raw))
+    except Exception:
+        return 1
+
+
+def _anthropic_stop_reason(finish_reason):
+    mapping = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_calls": "tool_use",
+        "function_call": "tool_use",
+        "content_filter": "refusal",
+        "refusal": "refusal",
+    }
+    return mapping.get(finish_reason, finish_reason or "end_turn")
+
+
+def _anthropic_usage(chat_usage, input_tokens=0, output_text="", reasoning=""):
+    chat_usage = chat_usage or {}
+    prompt = chat_usage.get("prompt_tokens")
+    completion = chat_usage.get("completion_tokens")
+    try:
+        prompt = int(prompt)
+    except (TypeError, ValueError):
+        prompt = 0
+    try:
+        completion = int(completion)
+    except (TypeError, ValueError):
+        completion = 0
+    if prompt <= 0:
+        prompt = max(1, int(input_tokens or 0))
+    if completion <= 0:
+        completion = estimate_tokens((reasoning or "") + (output_text or ""))
+    result = {"input_tokens": prompt, "output_tokens": max(0, completion)}
+    details = chat_usage.get("prompt_tokens_details") or {}
+    try:
+        cached = int(details.get("cached_tokens") or 0)
+    except (TypeError, ValueError):
+        cached = 0
+    if cached > 0:
+        result["cache_read_input_tokens"] = cached
+    return result
+
+
+def _anthropic_response_from_chat(chat_obj, payload, input_tokens=0):
+    choice = ((chat_obj.get("choices") or [{}])[0] or {})
+    message = choice.get("message") or {}
+    text = message.get("content") or ""
+    if not isinstance(text, str):
+        text = str(text)
+    reasoning = message.get("reasoning_content") or ""
+    if not isinstance(reasoning, str):
+        reasoning = str(reasoning)
+    content = []
+    if reasoning:
+        # WorkBuddy has no Anthropic thinking signature.  Keep the block
+        # structurally valid and mark the signature empty instead of leaking
+        # the reasoning into the user-visible text channel.
+        content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
+    if text:
+        content.append({"type": "text", "text": text})
+    for tool_call in message.get("tool_calls") or []:
+        fn = tool_call.get("function") or {}
+        arguments = fn.get("arguments") or "{}"
+        try:
+            tool_input = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except Exception:
+            tool_input = {"_raw_arguments": str(arguments)}
+        if not isinstance(tool_input, dict):
+            tool_input = {"_raw_arguments": json.dumps(tool_input, ensure_ascii=False)}
+        content.append({
+            "type": "tool_use",
+            "id": tool_call.get("id") or _new_id("call_"),
+            "name": fn.get("name") or "",
+            "input": tool_input,
+        })
+    usage = _anthropic_usage(chat_obj.get("usage"), input_tokens,
+                             text, reasoning)
+    return {
+        "id": _new_id("msg_"),
+        "type": "message",
+        "role": "assistant",
+        "model": chat_obj.get("model") or payload.get("model"),
+        "content": content,
+        "stop_reason": _anthropic_stop_reason(choice.get("finish_reason")),
+        "stop_sequence": None,
+        "usage": usage,
+    }
+
+
+def _anthropic_sse_event(event_type, data):
+    payload = dict(data or {})
+    payload.setdefault("type", event_type)
+    return ("event: %s\ndata: %s\n\n" % (
+        event_type, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )).encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Responses API (/v1/responses) <-> Chat Completions translation
 # ---------------------------------------------------------------------------
@@ -4419,6 +4838,44 @@ class Handler(BaseHTTPRequestHandler):
         self._handle_expect_continue()
         self._discard_body()
         self._json(code, {"error": {"message": message, "type": err_type, "code": code}})
+    def _anthropic_error(self, code, message, err_type=None, retry_after=None):
+        """Reply with Anthropic's top-level error envelope."""
+        error_types = {
+            400: "invalid_request_error",
+            401: "authentication_error",
+            403: "permission_error",
+            404: "not_found_error",
+            409: "conflict_error",
+            413: "request_too_large",
+            429: "rate_limit_error",
+        }
+        err_type = err_type or error_types.get(code, "api_error")
+        self._handle_expect_continue()
+        self._discard_body()
+        body = json.dumps({
+            "type": "error",
+            "error": {"type": err_type, "message": str(message)},
+        }, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        if retry_after is not None:
+            self.send_header("Retry-After", str(max(1, int(retry_after))))
+        if cors_origin_allowed(getattr(self, "path", "") or ""):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+    def _anthropic_rate_limited(self, exc):
+        wait = max(1, int(getattr(exc, "wait", 60) or 60))
+        detail = getattr(exc, "detail", "") or ""
+        message = "upstream rate limit reached; retry in %ds" % wait
+        if detail:
+            message += " - " + detail[:200]
+        return self._anthropic_error(429, message, "rate_limit_error", retry_after=wait)
     def _rate_limited(self, exc):
         """429 with Retry-After, so clients back off instead of hammering.
 
@@ -4577,6 +5034,20 @@ class Handler(BaseHTTPRequestHandler):
             pass
         self._error(401, "invalid api key - " + hint, "invalid_request_error")
         return False
+    def _anthropic_authorized(self):
+        if self._key_ok():
+            return True
+        hint = ("send it as 'x-api-key: <key>' or 'Authorization: Bearer <key>'; "
+                "copy the value from the panel's 设置 page")
+        try:
+            if not any(k.get("enabled") for k in configured_keys()) and not API_KEY:
+                hint = ("no key is configured - open the dashboard and add one, "
+                        "or restart with --api-key")
+        except Exception:
+            pass
+        self._anthropic_error(401, "invalid api key - " + hint,
+                              "authentication_error")
+        return False
     # ---- web panel access ----
     def _panel_token(self):
         """Session token from the X-Panel-Token header.
@@ -4626,6 +5097,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_health()
         if path == "/realm":
             return self._get_realm()
+        if path.startswith("/v1/models/") and path.count("/") == 3:
+            return self._get_anthropic_model(path.rsplit("/", 1)[-1])
         if path in ("/v1/models", "/models"):
             return self._get_v1_models()
         if path in ("/usage", "/v1/usage"):
@@ -4709,16 +5182,66 @@ class Handler(BaseHTTPRequestHandler):
     def _get_realm(self):
         return self._json(200, {"current": CURRENT_REALM, "options": ["intl", "cn"]})
 
+    def _is_anthropic_request(self):
+        # The official SDK always sends this version header.  Do not infer the
+        # dialect from x-api-key alone because OpenAI-compatible clients also
+        # use that header spelling.
+        return bool((self.headers.get("anthropic-version") or "").strip())
+
+    @staticmethod
+    def _anthropic_model_entry(mid, meta):
+        meta = meta or {}
+        display_name = meta.get("name") or meta.get("display_name") or mid
+        created_at = meta.get("created_at") or time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
+        return {
+            "type": "model",
+            "id": mid,
+            "display_name": display_name,
+            "created_at": created_at,
+        }
+
     def _get_v1_models(self):
-        if not self._authorized():
+        anthropic = self._is_anthropic_request()
+        if anthropic:
+            if not self._anthropic_authorized():
+                return
+        elif not self._authorized():
             return
         req_realm = self._request_realm() or CURRENT_REALM
         try:
             entries = fetch_models(realm=req_realm)
         except Exception as exc:
+            if anthropic:
+                return self._anthropic_error(502, str(exc), "api_error")
             return self._error(502, str(exc))
+        if anthropic:
+            data = [self._anthropic_model_entry(mid, meta) for mid, meta in entries]
+            return self._json(200, {
+                "data": data,
+                "has_more": False,
+                "first_id": data[0]["id"] if data else None,
+                "last_id": data[-1]["id"] if data else None,
+            })
         data = [model_entry(mid, meta) for mid, meta in entries]
         return self._json(200, {"object": "list", "data": data, "realm": req_realm or CURRENT_REALM})
+
+    def _get_anthropic_model(self, model_id):
+        if not self._is_anthropic_request():
+            return self._error(404, "not found", "invalid_request_error")
+        if not self._anthropic_authorized():
+            return
+        req_realm = self._request_realm() or CURRENT_REALM
+        try:
+            entries = fetch_models(realm=req_realm)
+        except Exception as exc:
+            return self._anthropic_error(502, str(exc), "api_error")
+        for mid, meta in entries:
+            if mid == model_id:
+                return self._json(200, self._anthropic_model_entry(mid, meta))
+        return self._anthropic_error(404, "model %s not found" % model_id,
+                                     "not_found_error")
 
     def _get_v1_usage(self, query):
         if not self._authorized():
@@ -5000,16 +5523,18 @@ class Handler(BaseHTTPRequestHandler):
             # which is the most natural shape for a hand-written file.
             return data
         return {}
-    def _payload_or_error(self, allow_list=False):
+    def _payload_or_error(self, allow_list=False, error_style="openai"):
         """Read the body, replying with the right error and returning None."""
+        fail = self._anthropic_error if error_style == "anthropic" else self._error
         try:
             return self._read_payload(allow_list=allow_list)
         except BodyTooLarge as exc:
-            self._error(413, "payload too large (%d bytes > %d limit)"
-                        % (exc.length, MAX_PAYLOAD_BYTES), "invalid_request_error")
+            fail(413, "payload too large (%d bytes > %d limit)"
+                 % (exc.length, MAX_PAYLOAD_BYTES), "request_too_large"
+                 if error_style == "anthropic" else "invalid_request_error")
             return None
         except BadJSON:
-            self._error(400, "invalid JSON body", "invalid_request_error")
+            fail(400, "invalid JSON body", "invalid_request_error")
             return None
     def _handle_settings_save(self):
         """Persist panel-managed settings from the web settings tab."""
@@ -5836,6 +6361,355 @@ class Handler(BaseHTTPRequestHandler):
                      account=account.uid)
         return self._json(200, result)
 
+    def _handle_anthropic_count_tokens(self, payload):
+        try:
+            chat_request = _anthropic_messages_to_chat(payload, require_max_tokens=False)
+            forwarded = build_upstream_body(chat_request)
+            return self._json(200, {
+                "input_tokens": _anthropic_input_tokens(forwarded),
+            })
+        except AnthropicRequestError as exc:
+            return self._anthropic_error(400, str(exc), "invalid_request_error")
+        except Exception as exc:
+            return self._anthropic_error(400, "invalid request: %s" % exc,
+                                         "invalid_request_error")
+
+    def _handle_anthropic_messages(self, payload):
+        try:
+            chat_request = _anthropic_messages_to_chat(payload)
+            forwarded = build_upstream_body(chat_request)
+        except AnthropicRequestError as exc:
+            return self._anthropic_error(400, str(exc), "invalid_request_error")
+        except Exception as exc:
+            return self._anthropic_error(400, "invalid request: %s" % exc,
+                                         "invalid_request_error")
+
+        model = chat_request.get("model") or "hy4-preview"
+        input_tokens = _anthropic_input_tokens(forwarded)
+        session_key = extract_session_key(self.headers, payload)
+        fp = prompt_fingerprint(forwarded.get("messages"))
+        want_stream = bool(payload.get("stream"))
+        t_start = time.time()
+        log("anthropic messages: model=%s stream=%s msgs=%d tools=%d"
+            % (model, want_stream, len(forwarded.get("messages") or []),
+               len(forwarded.get("tools") or [])))
+        try:
+            req_realm = self._request_realm() or CURRENT_REALM
+            blocked = self._cross_realm_error(model, req_realm)
+            if blocked:
+                return self._anthropic_error(400, blocked, "invalid_request_error")
+            banned = self._banned_model_error(model)
+            if banned:
+                return self._anthropic_error(400, banned, "invalid_request_error")
+            upstream, account = open_upstream(chat_request,
+                                              session_key=session_key,
+                                              target_realm=req_realm)
+        except ContentRejected as exc:
+            record_error(model, 403, exc.detail[:200],
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=getattr(exc, "account_uid", None))
+            return self._anthropic_error(403,
+                                         "upstream 403: %s" % (exc.detail or "content rejected"),
+                                         "invalid_request_error")
+        except RateLimited as exc:
+            record_error(model, 429, exc.detail[:200],
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=getattr(exc, "account_uid", None))
+            return self._anthropic_rate_limited(exc)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(600).decode("utf-8", "replace")
+            record_error(model, exc.code, detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=getattr(exc, "account_uid", None))
+            return self._anthropic_error(exc.code,
+                                         "upstream %s: %s" % (exc.code, detail))
+        except Exception as exc:
+            message = str(exc)
+            record_error(model, 502, message,
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=getattr(exc, "account_uid", None))
+            if message.startswith("no usable account"):
+                return self._anthropic_error(
+                    503, message + " - add or enable one at the dashboard (/)" )
+            return self._anthropic_error(502, "upstream unreachable: %s" % exc)
+
+        with upstream:
+            if want_stream:
+                return self._anthropic_stream_response(
+                    upstream, model, fp, account, t_start, input_tokens)
+            try:
+                chat_obj = aggregate_stream(upstream, model, None)
+            except Exception as exc:
+                record_error(model, 502, str(exc),
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             account=account.uid)
+                return self._anthropic_error(502,
+                                             "upstream stream error: %s" % exc)
+            wall = int((time.time() - t_start) * 1000)
+            first_at = chat_obj.get("first_chunk_at")
+            first_ms = int((first_at - t_start) * 1000) if first_at else None
+            record_usage(model, chat_obj.get("usage"), stream=False,
+                         elapsed_ms=wall, ttft_ms=first_ms,
+                         gen_ms=(wall - first_ms) if first_ms is not None else None,
+                         fp=fp, account=account.uid)
+            return self._json(200, _anthropic_response_from_chat(
+                chat_obj, payload, input_tokens=input_tokens))
+
+    def _anthropic_stream_response(self, upstream, model, fp, account,
+                                   t_start, input_tokens):
+        """Translate WorkBuddy's Chat SSE into Anthropic Messages SSE."""
+        message_id = _new_id("msg_")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        def emit(event_type, data):
+            self.wfile.write(_anthropic_sse_event(event_type, data))
+            self.wfile.flush()
+
+        start_message = {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": max(1, input_tokens), "output_tokens": 0},
+        }
+        try:
+            emit("message_start", {"message": start_message})
+            emit("ping", {})
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+
+        next_index = 0
+        blocks = {}
+        pending_tools = {}
+        text_parts = []
+        reasoning_parts = []
+        finish_reason = "stop"
+        last_usage = None
+        first_ms = None
+
+        def start_block(key, block_type, block):
+            nonlocal next_index
+            state = {
+                "index": next_index,
+                "type": block_type,
+                "id": block.get("id"),
+                "name": block.get("name") or "",
+                "args": [],
+            }
+            next_index += 1
+            blocks[key] = state
+            if block_type == "text":
+                content_block = {"type": "text", "text": ""}
+            elif block_type == "thinking":
+                content_block = {"type": "thinking", "thinking": ""}
+            else:
+                content_block = {
+                    "type": "tool_use",
+                    "id": state["id"] or _new_id("call_"),
+                    "name": state["name"],
+                    "input": {},
+                }
+                state["id"] = content_block["id"]
+            emit("content_block_start", {
+                "index": state["index"], "content_block": content_block,
+            })
+            return state
+
+        def ensure_simple_block(key, block_type):
+            return blocks.get(key) or start_block(key, block_type, {})
+
+        def ensure_tool_block(key, tool_id, tool_name):
+            state = blocks.get(key)
+            if state:
+                return state
+            pending = pending_tools.setdefault(key, {
+                "id": tool_id or _new_id("call_"),
+                "name": tool_name or "",
+                "args": [],
+            })
+            if tool_name:
+                pending["name"] = tool_name
+            # Normally the upstream sends the function name in the first
+            # delta.  Delay the block only for an unusual split-name stream.
+            if pending.get("name"):
+                state = start_block(key, "tool_use", pending)
+                prior_args = list(pending.get("args") or [])
+                state["args"].extend(prior_args)
+                for argument in prior_args:
+                    emit("content_block_delta", {
+                        "index": state["index"],
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": argument,
+                        },
+                    })
+                return state
+            return None
+
+        def flush_pending_tool(key):
+            pending = pending_tools.get(key)
+            if not pending or key in blocks:
+                return blocks.get(key)
+            state = start_block(key, "tool_use", pending)
+            state["args"].extend(pending.get("args") or [])
+            return state
+
+        try:
+            for line in upstream:
+                raw = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+                data = strip_data_prefix(raw)
+                if not data or data == "[DONE]" or data.startswith(":"):
+                    continue
+                try:
+                    chunk = json.loads(data)
+                except Exception:
+                    continue
+                if first_ms is None:
+                    first_ms = int((time.time() - t_start) * 1000)
+                usage = chunk.get("usage")
+                if usage:
+                    if (last_usage is None or
+                            (usage.get("total_tokens") or 0) >=
+                            (last_usage.get("total_tokens") or 0)):
+                        last_usage = usage
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    if choice.get("finish_reason"):
+                        finish_reason = choice.get("finish_reason")
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                    if reasoning:
+                        reasoning_state = ensure_simple_block("thinking", "thinking")
+                        reasoning_parts.append(reasoning)
+                        emit("content_block_delta", {
+                            "index": reasoning_state["index"],
+                            "delta": {"type": "thinking_delta", "thinking": reasoning},
+                        })
+                    text = delta.get("content") or ""
+                    if text:
+                        if not isinstance(text, str):
+                            text = str(text)
+                        text_state = ensure_simple_block("text", "text")
+                        text_parts.append(text)
+                        emit("content_block_delta", {
+                            "index": text_state["index"],
+                            "delta": {"type": "text_delta", "text": text},
+                        })
+                    tool_deltas = list(delta.get("tool_calls") or [])
+                    function_call = delta.get("function_call")
+                    if isinstance(function_call, dict) and (
+                            function_call.get("name") or function_call.get("arguments")):
+                        tool_deltas.append({
+                            "index": 0,
+                            "id": "",
+                            "function": function_call,
+                        })
+                    for tool_delta in tool_deltas:
+                        if not isinstance(tool_delta, dict):
+                            continue
+                        idx = tool_delta.get("index")
+                        key = ("tool", idx if idx is not None else 0)
+                        fn = tool_delta.get("function") or {}
+                        tool_id = tool_delta.get("id")
+                        tool_name = fn.get("name") or ""
+                        state = ensure_tool_block(key, tool_id, tool_name)
+                        arguments = fn.get("arguments") or ""
+                        if arguments:
+                            if state is None:
+                                pending_tools.setdefault(key, {
+                                    "id": tool_id or _new_id("call_"),
+                                    "name": tool_name or "",
+                                    "args": [],
+                                })["args"].append(arguments)
+                                state = ensure_tool_block(key, tool_id, tool_name)
+                            if state is not None:
+                                state["args"].append(arguments)
+                                emit("content_block_delta", {
+                                    "index": state["index"],
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": arguments,
+                                    },
+                                })
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            wall = int((time.time() - t_start) * 1000)
+            record_usage(model, last_usage, stream=True, elapsed_ms=wall,
+                         ttft_ms=first_ms,
+                         gen_ms=(wall - first_ms) if first_ms is not None else None,
+                         fp=fp, account=account.uid, outcome="client_aborted")
+            return
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "stream aborted: %s" % exc,
+                         elapsed_ms=wall, account=account.uid, usage=last_usage,
+                         stream=True, ttft_ms=first_ms,
+                         gen_ms=(wall - first_ms) if first_ms is not None else None,
+                         fp=fp, outcome="upstream_aborted")
+            try:
+                emit("error", {"error": {"type": "api_error",
+                                          "message": "stream aborted: %s" % exc}})
+            except Exception:
+                pass
+            return
+
+        for key in list(pending_tools):
+            flush_pending_tool(key)
+        try:
+            for state in sorted(blocks.values(), key=lambda item: item["index"]):
+                if state["type"] == "thinking":
+                    # No upstream signature exists to verify this translated
+                    # reasoning block; an empty signature keeps the block
+                    # shape accepted by Anthropic SDKs.
+                    emit("content_block_delta", {
+                        "index": state["index"],
+                        "delta": {"type": "signature_delta", "signature": ""},
+                    })
+                emit("content_block_stop", {"index": state["index"]})
+            output_text = "".join(text_parts)
+            reasoning_text = "".join(reasoning_parts)
+            usage = _anthropic_usage(last_usage, input_tokens,
+                                     output_text, reasoning_text)
+            emit("message_delta", {
+                "delta": {
+                    "stop_reason": _anthropic_stop_reason(finish_reason),
+                    "stop_sequence": None,
+                },
+                "usage": {"output_tokens": usage["output_tokens"]},
+            })
+            emit("message_stop", {})
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        wall = int((time.time() - t_start) * 1000)
+        usage_for_record = last_usage
+        if usage_for_record is None or (usage_for_record.get("total_tokens") or 0) == 0:
+            tool_args = "".join(
+                arg for state in blocks.values() for arg in state.get("args") or []
+            )
+            generated = "".join(text_parts) + "".join(reasoning_parts) + tool_args
+            completion = estimate_tokens(generated)
+            usage_for_record = {
+                "prompt_tokens": max(1, input_tokens),
+                "completion_tokens": completion,
+                "total_tokens": max(1, input_tokens) + completion,
+                "completion_tokens_details": {
+                    "reasoning_tokens": estimate_tokens("".join(reasoning_parts)),
+                },
+                "prompt_tokens_details": {"cached_tokens": 0},
+            }
+        record_usage(model, usage_for_record, stream=True, elapsed_ms=wall,
+                     ttft_ms=first_ms,
+                     gen_ms=(wall - first_ms) if first_ms is not None else None,
+                     fp=fp, account=account.uid)
+        return
+
     def do_POST(self):
         path = self.path.split("?")[0]
         if path == "/settings/save":
@@ -5862,13 +6736,25 @@ class Handler(BaseHTTPRequestHandler):
             or path.startswith("/scheduler")
             or path.startswith("/logs")
         )
+        is_anthropic_route = path in (
+            "/v1/messages", "/messages",
+            "/v1/messages/count_tokens", "/messages/count_tokens",
+        )
         if not is_account_route and path not in ("/v1/chat/completions", "/chat/completions",
                                                 "/v1/completions", "/completions",
-                                                "/v1/responses", "/responses"):
+                                                "/v1/responses", "/responses",
+                                                "/v1/messages", "/messages",
+                                                "/v1/messages/count_tokens", "/messages/count_tokens"):
             return self._error(404, "not found", "invalid_request_error")
-        if not self._authorized():
+        if is_anthropic_route:
+            if not self._anthropic_authorized():
+                return
+        elif not self._authorized():
             return
-        payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
+        payload = self._payload_or_error(
+            allow_list=(path == "/accounts/import"),
+            error_style="anthropic" if is_anthropic_route else "openai",
+        )
         if payload is None:
             return
         if is_account_route:
@@ -5895,8 +6781,16 @@ class Handler(BaseHTTPRequestHandler):
                         % (payload.get("model"), reason), level="INFO")
                 except Exception:
                     pass
+                if path in ("/v1/messages", "/messages",
+                            "/v1/messages/count_tokens", "/messages/count_tokens"):
+                    return self._anthropic_error(400, background_request_message(reason),
+                                                 "invalid_request_error")
                 return self._error(400, background_request_message(reason),
                                    "invalid_request_error")
+        if path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
+            return self._handle_anthropic_count_tokens(payload)
+        if path in ("/v1/messages", "/messages"):
+            return self._handle_anthropic_messages(payload)
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
         # Diagnostics: what the client actually asked for, and what we forward.
