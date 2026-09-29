@@ -40,6 +40,7 @@ import uuid
 import wb_accounts
 import wb_catalog
 import wb_settings
+import wb_webtools
 import wb_identity
 IS_WINDOWS = os.name == "nt"
 def launcher_hint(port):
@@ -59,7 +60,8 @@ def detect_model_realm(model_id):
     m = str(model_id).lower()
     intl_only = {
         "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-        "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash"
+        "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
+        "grok-4.7"
     }
     if m in intl_only or any(m.startswith(p) for p in ("gpt-", "gemini-")):
         return "intl"
@@ -84,6 +86,7 @@ CN_EXCLUSIVE_PREFIXES = ("minimax-", "deepseek-v4-pro")
 INTL_EXCLUSIVE = {
     "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
+    "grok-4.7",
 }
 CN_EXCLUSIVE = {
     "deepseek-v4-pro", "glm-5.1", "glm-5v-turbo",
@@ -749,6 +752,113 @@ _snap_lock = threading.Lock()
 # every other poll do the full uncached scan; 15s means at most one rebuild
 # per three polls while the numbers stay a few seconds stale at worst.
 _STATS_TTL = float(os.environ.get("WB_STATS_TTL", 15))
+
+
+# ---------------------------------------------------------------------------
+# Daily token guard
+#
+# The upstream caps a free window at a fixed token budget (code 6004), and by
+# the time it answers 429 the window is already spent. This counter lets the
+# operator park an account at a threshold instead: usage.jsonl is folded into
+# uid -> tokens-since-local-midnight, AccountPool.apply_daily_token_limit()
+# copies the numbers onto the accounts and ready() refuses them, so the next
+# request rotates to another account. The scan is incremental (byte offset +
+# per-day totals), so the hot path only reads rows that arrived since the
+# last scan.
+# ---------------------------------------------------------------------------
+_daily_usage = {"day": "", "totals": None, "offset": 0, "at": 0.0}
+_daily_usage_lock = threading.Lock()
+
+
+def _scan_daily_tokens(offset, totals):
+    """Fold rows at/after today's local midnight into `totals`.
+
+    Returns (totals, new_offset). A line without its trailing newline is left
+    for the next scan: rows are appended whole, so a partial tail only means
+    this read raced the writer.
+    """
+    midnight = _local_midnight()
+    with open(USAGE_LOG, encoding="utf-8") as fh:
+        fh.seek(offset)
+        while True:
+            pos = fh.tell()
+            line = fh.readline()
+            if not line:
+                break
+            if not line.endswith("\n"):
+                return totals, pos
+            offset = fh.tell()
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if (row.get("at") or 0) < midnight:
+                continue
+            # Same rule as the analytics scan: a client cancellation is not a
+            # consumed request, and its token counts are incomplete.
+            if row_outcome(row) == "client_aborted":
+                continue
+            uid = row.get("account")
+            if not uid:
+                continue
+            totals[uid] = totals.get(uid, 0) + (row.get("total_tokens") or 0)
+    return totals, offset
+
+
+def daily_tokens_by_account(ttl=None):
+    """uid -> tokens counted since local midnight, cached for `ttl` seconds.
+
+    None means the log could not be read at all; callers keep that distinct
+    from zero so a failed read never parks an account.
+    """
+    ttl = _STATS_TTL if ttl is None else ttl
+    day = time.strftime("%Y-%m-%d")
+    now = time.time()
+    with _daily_usage_lock:
+        c = _daily_usage
+        if c["day"] == day and c["totals"] is not None and (now - c["at"]) < ttl:
+            return dict(c["totals"])
+        # A new day keeps the byte offset: everything past it is today's, and
+        # the midnight filter drops whatever old rows are still unread.
+        totals = dict(c["totals"] or {}) if c["day"] == day else {}
+        offset = int(c["offset"] or 0)
+        try:
+            size = os.path.getsize(USAGE_LOG)
+        except OSError:
+            size = 0
+        if offset > size:
+            totals, offset = {}, 0
+        try:
+            totals, offset = _scan_daily_tokens(offset, totals)
+        except Exception as exc:
+            log("daily token scan failed: %s" % exc)
+            _daily_usage.update({"day": day, "totals": None, "offset": 0,
+                                 "at": time.time()})
+            return None
+        _daily_usage.update({"day": day, "totals": totals, "offset": offset,
+                             "at": time.time()})
+        return dict(totals)
+
+
+def seconds_until_local_midnight():
+    """Seconds until the local day rolls over (at least a minute)."""
+    lt = time.localtime()
+    nxt = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, 0, 0, -1))
+    return max(60, int(nxt - time.time()))
+
+
+def apply_daily_token_limit(refresh=False):
+    """Push the daily token setting and today's counts into the pool."""
+    if POOL is None:
+        return 0
+    limit = wb_settings.daily_token_limit(ACCOUNTS_DIR)
+    usage = None
+    if limit > 0:
+        usage = daily_tokens_by_account(ttl=0 if refresh else None)
+    return POOL.apply_daily_token_limit(limit, usage)
 
 
 def usage_snapshot(realm=None, ttl=None, range=None, since=None, until=None):
@@ -1438,12 +1548,14 @@ def runtime_settings_view():
         "auth_required": auth_required(),
         "api_keys": keys,
         "reserve_credits": wb_settings.reserve_credits(ACCOUNTS_DIR),
+        "daily_token_limit": wb_settings.daily_token_limit(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
+        "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.6.5",
+        "version": "1.6.10",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -1592,6 +1704,9 @@ VIRTUAL_ALIAS_MODELS = {
     "balanced-model",
     "primary-model",
     "deep-model",
+    # The domestic exit's auto-router entry: the picker shows it, but it is
+    # not a model a client can pin, so it stays out of the advertised list.
+    "auto",
 }
 NON_CHAT_MODELS = {"lite"} | VIRTUAL_ALIAS_MODELS
 NON_CHAT_PREFIXES = ("codewise-", "completion-")
@@ -1632,6 +1747,7 @@ INTL_UI_ORDER = [
     "gpt-5.6-luna",
     "gpt-5.5",
     "gpt-5.4",
+    "grok-4.7",
     "gemini-3.5-flash",
     "glm-5.3-flash",
     "glm-5.3",
@@ -1640,7 +1756,7 @@ INTL_UI_ORDER = [
     "kimi-k2.6",
     "kimi-k2.8-preview",
 ]
-def merge_catalog(primary, realm=None):
+def merge_catalog(primary, realm=None, extras=False):
     r = realm or CURRENT_REALM
     merged = {}
     # "all" is the union of both realms. The analytics dashboard lists every
@@ -1674,20 +1790,42 @@ def merge_catalog(primary, realm=None):
         if mid in merged and mid not in seen:
             seen.add(mid)
             out.append((mid, merged[mid]))
+    if extras:
+        # A model the curated table has never heard of still ships when the
+        # *live* catalogue lists it - that is how a newly added upstream model
+        # reaches /v1/models without a release. The bundled snapshot alone is
+        # not enough: it also carries legacy entries the picker may not show.
+        for mid, _meta in primary or []:
+            if mid in merged and mid not in seen:
+                seen.add(mid)
+                out.append((mid, merged[mid]))
     return out
+_catalog_lock = threading.Lock()
+
 def fetch_models(realm=None):
     r = realm or CURRENT_REALM
     with _lock:
         c = _models_cache.get(r) or {"at": 0.0, "data": None}
         if c["data"] and time.time() - c["at"] < 300:
             return c["data"]
-    live = read_product_config_models(realm=r)
-    if not live and r in ("intl", "all"):
-        live = [(m, {}) for m in fetch_endpoint_models()]
-    entries = merge_catalog(live, realm=r)
-    with _lock:
-        _models_cache[r] = {"at": time.time(), "data": entries}
-    return entries
+    # One upstream walk per realm even when several callers miss the cache at
+    # the same moment: a batch of /v1/models requests must not turn into a
+    # batch of upstream requests.
+    with _catalog_lock:
+        with _lock:
+            c = _models_cache.get(r) or {"at": 0.0, "data": None}
+            if c["data"] and time.time() - c["at"] < 300:
+                return c["data"]
+        live, extras = curated_live_sources(r)
+        if not live and r in ("intl", "all"):
+            # The narrow endpoint is not the desktop catalogue, so it keeps the
+            # old whitelist behaviour: only names the order table knows.
+            live = [(m, {}) for m in fetch_endpoint_models()]
+            extras = False
+        entries = merge_catalog(live, realm=r, extras=extras)
+        with _lock:
+            _models_cache[r] = {"at": time.time(), "data": entries}
+        return entries
 def model_entry(mid, meta):
     """Build a rich /v1/models entry from the desktop app catalog metadata.
     The OpenAI spec only names id/object/created/owned_by, so capability data is
@@ -1834,6 +1972,269 @@ def _read_product_config_dir(cache_dir):
         if isinstance(mid, str) and mid:
             out.append((mid, m))
     return out
+#: The desktop client's own product-config endpoint. The cache file that
+#: read_product_config_models() reads is this response written to disk, so
+#: calling it directly is what lets a machine without the desktop app
+#: (Docker, NAS, a headless server) advertise the live catalogue - live
+#: multipliers included - instead of the narrower endpoint or the bundled
+#: snapshot.
+REMOTE_CONFIG_PATH = "/v3/config"
+
+#: Suffixes that mark a variant of a name the catalogue already carries: the
+#: regional build (deepseek-v4.1-flash-sg) and the experimental one (hy3-x).
+#: Measured on both exits: the plain name is the free (x0.00) one and the
+#: variant is the paid one, so the plain name is what gets advertised.
+VARIANT_SUFFIXES = ("-sg", "-x")
+
+
+def remote_config_headers(account, realm, ua=None):
+    """Headers for the product-config call.
+
+    The UA decides which catalogue comes back and only the desktop UA returns
+    the full list (an unknown one is a hard 400, code 12403), so this uses a
+    realm's fixed desktop UA rather than the account's current identity.
+    """
+    cfg = wb_accounts.get_realm_config(realm)
+    return {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": ua or cfg["chat_ua"],
+        "Origin": cfg["origin"],
+        "Referer": cfg["origin"] + "/",
+        "Authorization": "Bearer " + account.access_token,
+        "X-User-Id": account.uid,
+    }
+
+
+def _agent_model_lists(payload):
+    """Every agent's bare-string model list, cli-named agents first.
+
+    The catalogue the picker shows rides in agents[].models. The endpoint
+    answers with it under a "data" key while the desktop cache file is the
+    same document written to disk without that envelope, so both are read.
+    """
+    roots = [payload]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        roots.append(data)
+    cli, other = [], []
+    for root in roots:
+        agents = root.get("agents")
+        if isinstance(agents, dict):
+            entries = list(agents.items())
+        elif isinstance(agents, list):
+            entries = [((entry.get("name") if isinstance(entry, dict) else None),
+                        entry) for entry in agents]
+        else:
+            continue
+        for name, entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            models = entry.get("models")
+            if not (isinstance(models, list) and models
+                    and isinstance(models[0], str)):
+                continue
+            ids = [str(m).strip() for m in models if isinstance(m, str)]
+            ids = [m for m in ids if m]
+            if not ids:
+                continue
+            (cli if str(name or "").strip().lower() == "cli" else other).append(ids)
+    return cli, other
+
+
+def parse_remote_catalog(payload):
+    """(ids, meta) from a /v3/config response, or None when it carries none.
+
+    The picker's list rides in agents[].models as bare ids - under "data" in
+    the endpoint's answer, at the top level in the desktop cache file. The
+    per-model metadata (credits, limits, copy) lives in a separate models
+    array. An unusable credential answers HTTP 200 with an *empty* list, so
+    an empty catalogue is reported as None and the caller falls back instead
+    of publishing "this exit has no models".
+    """
+    if not isinstance(payload, dict):
+        return None
+    cli_lists, other_lists = _agent_model_lists(payload)
+    pool = cli_lists or other_lists
+    best = max(pool, key=len) if pool else None
+    ids, seen = [], set()
+    for mid in best or []:
+        if mid not in seen:
+            seen.add(mid)
+            ids.append(mid)
+    if not ids:
+        return None
+
+    meta = {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            models = node.get("models")
+            if isinstance(models, list) and models \
+                and isinstance(models[0], dict) and models[0].get("id"):
+                for item in models:
+                    mid = str(item.get("id") or "").strip()
+                    if mid:
+                        meta.setdefault(mid, item)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(payload)
+    return ids, meta
+
+
+def snapshot_credits():
+    """id -> credits from the bundled catalogue (both realms, intl first).
+
+    Used to answer "is there a free sibling?" for a variant the remote lists
+    but whose sibling it no longer does: the free hy4-preview-f, for example,
+    is what the cn picker keeps while the remote only names the paid one.
+    """
+    out = {}
+    for source in (getattr(wb_catalog, "STATIC_INTL_MODELS", []),
+                           getattr(wb_catalog, "STATIC_CN_MODELS", [])):
+        for item in source or []:
+            mid = str(item.get("id") or "").strip()
+            if mid:
+                out.setdefault(mid, str(item.get("credits") or "").strip().lower())
+    return out
+
+
+def curate_remote_catalog(realm, ids, meta=None):
+    """Trim a remote catalogue to the models the picker should offer.
+
+      - virtual aliases (default-model ... auto) are not models;
+      - "-sg" / "-x" builds are the paid variant of a name the list already
+        carries;
+      - when a free ("x0.00") sibling exists, the free one is the one the
+        picker shows, so the paid sibling is dropped;
+      - everything else keeps its upstream order. Names the upstream does not
+        list at all stay available through the curated order tables and the
+        bundled snapshot, which merge_catalog() keeps.
+    """
+    credits = snapshot_credits()
+    for mid, item in (meta or {}).items():
+        if isinstance(item, dict):
+            credits[mid] = str(item.get("credits") or "").strip().lower()
+    order = CN_UI_ORDER if realm == "cn" else INTL_UI_ORDER
+    known = set(ids) | set(credits) | set(order)
+
+    def free(mid):
+        return credits.get(mid) in ("x0.00", "x0", "0", "0.00")
+
+    out = []
+    for mid in ids:
+        if not is_chat_model(mid):
+            continue
+        if mid.endswith(VARIANT_SUFFIXES):
+            continue
+        if mid.endswith("-f"):
+            base = mid[:-2]
+            if base in known and free(base) and not free(mid):
+                continue
+        elif (mid + "-f") in known and free(mid + "-f") and not free(mid):
+            continue
+        out.append(mid)
+    return out
+
+
+def fetch_remote_product_config(realm):
+    """(ids, meta) from the realm's own product-config endpoint, or None.
+
+    At most two 10s attempts bound the wait: one per desktop UA, because the
+    endpoint sits behind the WAF where a dropped connection is normal, and
+    every caller has a fallback (the desktop cache file, the narrow model
+    endpoint, the bundled snapshot).
+    """
+    if realm not in ("intl", "cn") or POOL is None:
+        return None
+    account = POOL.representative(realm=realm)
+    if account is None or not account.access_token:
+        log("remote catalog: no usable %s account, skipping" % realm)
+        return None
+    cfg = wb_accounts.get_realm_config(realm)
+    url = cfg["chat_upstream"] + REMOTE_CONFIG_PATH
+    # The chat UA is the desktop identity the rest of the gateway uses; the
+    # plain app UA is the second try, for a build that answers only to it.
+    uas = [cfg["chat_ua"]]
+    if cfg.get("billing_ua") and cfg["billing_ua"] != cfg["chat_ua"]:
+        uas.append(cfg["billing_ua"])
+    last = None
+    for ua in uas:
+        headers = remote_config_headers(account, realm, ua)
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with wb_accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as exc:
+            last = exc
+            continue
+        parsed = parse_remote_catalog(payload)
+        if parsed:
+            return parsed
+        last = "empty catalogue"
+    log("remote catalog: %s fetch failed (%s)" % (realm, last))
+    return None
+
+
+def product_config_path(realm):
+    """The desktop cache file for a realm (the intl app writes its own)."""
+    home = os.path.expanduser("~")
+    cache_dir = ".workbuddy-ai" if realm == "intl" else ".workbuddy"
+    return os.path.join(home, cache_dir, "cache", "acc-product-config-v3.json")
+
+
+def read_cached_remote_catalog(realm):
+    """(ids, meta) from the desktop cache file, parsed like the remote."""
+    if realm == "all":
+        first = read_cached_remote_catalog("intl")
+        second = read_cached_remote_catalog("cn")
+        if not first:
+            return second
+        if not second:
+            return first
+        ids = list(first[0]) + [m for m in second[0] if m not in set(first[0])]
+        meta = dict(second[1])
+        meta.update(first[1])
+        return ids, meta
+    try:
+        with open(product_config_path(realm), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return None
+    return parse_remote_catalog(payload)
+
+
+def curated_live_sources(realm):
+    """(entries, extras) for the realm's live catalogue, already curated.
+
+    Remote first, then the desktop cache file - the cache is this very
+    response written to disk, so both go through the same parser and the same
+    rules. `extras` says the entries came from the desktop catalogue, whose
+    membership may add a model the curated tables have never seen; the legacy
+    readers keep the old whitelist behaviour.
+    """
+    remote = None
+    try:
+        remote = fetch_remote_product_config(realm)
+    except Exception as exc:
+        log("remote catalog: %s failed (%s)" % (realm, exc))
+    source = remote or read_cached_remote_catalog(realm)
+    if source:
+        ids, meta = source
+        return ([(mid, meta.get(mid) or {})
+                for mid in curate_remote_catalog(realm, ids, meta)], True)
+    legacy = read_product_config_models(realm=realm)
+    if legacy:
+        ids = [mid for mid, _ in legacy]
+        meta = dict((mid, m) for mid, m in legacy if isinstance(m, dict))
+        keep = set(curate_remote_catalog(realm, ids, meta))
+        return ([(mid, m) for mid, m in legacy if mid in keep], False)
+    return [], False
+
+
 def fetch_endpoint_models():
     account = POOL.pick(realm="intl") if POOL else None
     if account is None:
@@ -2455,16 +2856,34 @@ BACKGROUND_TRIGGER_KEYWORDS = (
 )
 
 
-def background_request_reason(payload):
-    """若這是 Codex 自己發的背景請求，回傳說明字串；否則回傳 ""。
+# Thread sources that belong to a job the client started on its own. A
+# compaction request carries one of these when the client triggered it, and the
+# user's own thread when the operator pressed "compact the context" - so the
+# source has to be read before the keyword list, where "compaction" matches
+# both and would otherwise refuse the button.
+BACKGROUND_THREAD_SOURCES = (
+    "memory_consolidation",
+    "memory",
+    "ambient",
+    "suggestion",
+    "auto_review",
+    "autoreview",
+    "title",
+)
 
-    只看 client_metadata，不碰訊息內容。
+
+def turn_metadata_fields(payload):
+    """Flatten the request_kind / turn_trigger / thread_source hints we get.
+
+    Codex sends them either as plain client_metadata keys or as a JSON string
+    under a metadata key of its own, so both shapes are read. Returns {} when
+    the payload carries none of them.
     """
     if not isinstance(payload, dict):
-        return ""
+        return {}
     meta = payload.get("client_metadata")
     if not isinstance(meta, dict):
-        return ""
+        return {}
 
     # 收集所有可能的來源/觸發欄位
     fields = {}
@@ -2480,8 +2899,35 @@ def background_request_reason(payload):
                         fields[k] = inner[k]
         if key in ("request_kind", "turn_trigger", "thread_source"):
             fields[key] = value
+    return fields
 
+
+def is_compaction_request(payload):
+    """True for the operator's own "compact the context" request.
+
+    request_kind=compaction carries the same word as the background keyword, but
+    this request is one the user asked for: the client sends it on the user's
+    thread, while a compaction the client started by itself names the job that
+    started it. Refusing this one takes the context-compaction button away.
+    """
+    fields = turn_metadata_fields(payload)
+    kind = str(fields.get("request_kind") or "").strip().lower()
+    if "compact" not in kind:
+        return False
+    source = str(fields.get("thread_source") or "").strip().lower()
+    return source not in BACKGROUND_THREAD_SOURCES
+
+
+def background_request_reason(payload):
+    """若這是 Codex 自己發的背景請求，回傳說明字串；否則回傳 ""。
+
+    只看 client_metadata，不碰訊息內容。
+    """
+    fields = turn_metadata_fields(payload)
     if not fields:
+        return ""
+
+    if is_compaction_request(payload):
         return ""
 
     blob = " ".join(str(v) for v in fields.values()).lower()
@@ -2508,6 +2954,15 @@ def banned_model_message(model):
             % (model, allowed))
 
 
+def key_model_message(entry, model):
+    """Explain a per-key model restriction the same way the global ban does."""
+    name = (entry or {}).get("name") or "未命名"
+    allowed = "、".join((entry or {}).get("models") or []) or "-"
+    return ("API Key「%s」的模型限制不允許 %s。該 Key 目前允許：%s。"
+            "請在看板「設置」頁修改這個 Key 的模型限制，或改用允許該模型的 Key。"
+            % (name, model, allowed))
+
+
 def build_upstream_body(payload):
     model = payload.get("model") or ""
     # Resolve the effective thinking state before the backfill below: while
@@ -2532,6 +2987,12 @@ def build_upstream_body(payload):
     if not messages or (messages[0].get("role") != "system"):
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
     body = dict(payload)
+    # Private request markers ride along on the chat body for the Responses
+    # path (the namespace map, the local-web-tools flag). They are not part of
+    # the upstream protocol, so drop them here rather than trusting the
+    # upstream to ignore unknown keys.
+    for _marker in [k for k in body if str(k).startswith("_")]:
+        body.pop(_marker, None)
     # dict(payload) 會把原始模型名一起帶過去，所以別名要在這裡覆蓋回去
     body["model"] = model
     body["messages"] = messages
@@ -2668,10 +3129,14 @@ class RateLimited(Exception):
     """Upstream throttled this model (429 / code 6004). Distinct from a dead
     pool: the credential is fine, only the model is cooling down for a while."""
 
-    def __init__(self, http_error=None, detail="", wait=60):
+    def __init__(self, http_error=None, detail="", wait=60, message=""):
         self.http_error = http_error
         self.detail = detail or ""
         self.wait = max(1, int(wait or 60))
+        # 429s answered without an upstream call (the pool is parked by the
+        # daily token guard) carry their own text instead of the upstream
+        # wording.
+        self.message = message or ""
         super().__init__("upstream rate limit: %s" % (self.detail[:200] or "429"))
 
 
@@ -2826,6 +3291,11 @@ def parse_rate_limit_reset(detail):
 
 
 def open_upstream(payload, session_key=None, target_realm=None):
+    # Refresh the daily token guard before picking. The scan underneath is
+    # incremental and TTL-cached, so this is a stat() plus a cached dict on
+    # the hot path, and an account parked by the guard is skipped like any
+    # other unusable one.
+    apply_daily_token_limit()
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     model = str(payload.get("model") or "")
     upstream_body = build_upstream_body(payload)
@@ -2973,7 +3443,16 @@ def open_upstream(payload, session_key=None, target_realm=None):
     throttled, wait = realm_model_throttled(realm, model)
     if throttled:
         raise RateLimited(None, "usage exceeds frequency limit", wait=wait)
-    raise RuntimeError(f"no usable account for realm '{realm}': all are disabled, cooling down, or expired")
+    enabled = [a for a in POOL.accounts
+               if a.realm == realm and a.enabled and a.access_token] if POOL else []
+    if enabled and all(a.daily_limit_blocked() for a in enabled):
+        reason = ("every usable account reached today's token limit (%s per "
+                  "account); the pool resumes after local midnight"
+                  % wb_settings.daily_token_limit(ACCOUNTS_DIR))
+        raise RateLimited(None, reason,
+                          wait=seconds_until_local_midnight(), message=reason)
+    raise RuntimeError(f"no usable account for realm '{realm}': all are disabled, "
+                       f"cooling down, expired or parked by the daily token limit")
 def extract_session_key(headers, payload):
     key = (
         headers.get("X-Conversation-Id") or
@@ -3915,6 +4394,201 @@ def _unwrap_custom_input(args):
         return parsed
     return args
 
+# The gateway can run web_search / web_fetch itself; the panel switch decides.
+#
+# Some clients (Codex App and similar harnesses) declare web_search as a
+# server-side tool, but the upstream has no executor for it: forwarding the
+# declaration leaves the model answering as if no tool had been offered. With
+# the switch on, the gateway swaps the declaration for a function of its own,
+# swallows the calls and runs them locally (wb_webtools), then feeds the
+# results back.
+#
+# Off by default: the declaration is forwarded untouched and a client that
+# declares its own search tool receives the call - the behaviour since v1.5.3.
+# Turning it on means the gateway itself fetches URLs a model asks for, so the
+# egress policy is the operator's call.
+def local_web_tools_enabled():
+    """Panel switch: does this gateway run web_search / web_fetch itself?
+
+    Read per request, so flipping the panel takes effect on the next one
+    without a restart.
+    """
+    try:
+        return wb_settings.local_web_tools(ACCOUNTS_DIR) is True
+    except Exception:
+        return False
+
+
+def web_tools_active(body):
+    """True when this request's tools were swapped for the gateway's own.
+
+    Interception only applies to a request whose definitions the gateway
+    injected: with the switch off, a client's own same-named function must be
+    forwarded instead of being swallowed here.
+    """
+    return isinstance(body, dict) and body.get("_web_tools") is True
+
+
+def sum_usage(total, part):
+    """把一輪的 token 用量累加起來。
+
+    代跑網路工具會多跑好幾次上游，那些 token 是真的花掉的，所以記帳要加總，
+    不能讓最後一輪蓋掉前面幾輪。
+    """
+    if not isinstance(part, dict):
+        return total
+    if not isinstance(total, dict):
+        total = {}
+    for key, value in part.items():
+        if isinstance(value, dict):
+            total[key] = sum_usage(total.get(key), value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            total[key] = (total.get(key) or 0) + value
+        elif key not in total:
+            total[key] = value
+    return total
+
+
+_CITATION_MD_RE = re.compile(r"\[([^\]\n]{1,200})\]\((https?://[^)\s]+)\)")
+
+
+def build_citations(text, sources):
+    """把模型實際引用到的來源轉成 url_citation annotations。
+
+    只標註真的有出現在工具輸出裡的網址 —— 模型自己編的連結不會被當成引用。
+    """
+    text = str(text or "")
+    if not text or not sources:
+        return []
+    by_url = {}
+    for s in sources or []:
+        if not isinstance(s, dict):
+            continue
+        url = str(s.get("url") or "").strip()
+        if not url:
+            continue
+        by_url.setdefault(url, s)
+        by_url.setdefault(url.rstrip("/"), s)
+
+    anns = []
+    seen = set()
+
+    def add(url, title, start, end):
+        key = (url, start, end)
+        if key in seen or start < 0 or end <= start:
+            return
+        seen.add(key)
+        anns.append({
+            "type": "url_citation",
+            "url": url,
+            "title": title or url,
+            "start_index": start,
+            "end_index": end,
+        })
+
+    md_spans = []
+    for m in _CITATION_MD_RE.finditer(text):
+        url = m.group(2)
+        src = by_url.get(url) or by_url.get(url.rstrip("/"))
+        if not src:
+            continue
+        md_spans.append((m.start(0), m.end(0)))
+        add(url, src.get("title") or m.group(1), m.start(0), m.end(0))
+
+    for m in re.finditer(r"https?://[^\s<>()\[\]]+", text):
+        if any(m.start(0) >= s and m.end(0) <= e for s, e in md_spans):
+            continue
+        url = m.group(0).rstrip(".,;:!?")
+        src = by_url.get(url) or by_url.get(url.rstrip("/"))
+        if not src:
+            continue
+        add(url, src.get("title"), m.start(0), m.start(0) + len(url))
+
+    anns.sort(key=lambda a: (a["start_index"], a["end_index"]))
+    return anns
+
+
+def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_start,
+                                drop_tools=False):
+    """執行反代自己代跑的網路工具，把結果餵回模型，回傳新的上游連線。
+
+    drop_tools=True 表示這是最後一輪：把網路工具從工具清單收回，模型沒有東西
+    可以再呼叫，只能用手上的結果把話講完。舊版在回合用盡時合成一個
+    resp_wrapup（status=completed、output=[]）收尾，那等於把失敗偽裝成正常
+    結束，客戶端看到的就是「講到一半斷掉」——issue #43。
+    """
+    convo = holder.get("convo_messages")
+    if convo is None:
+        convo = list(holder.get("base_messages") or [])
+        holder["convo_messages"] = convo
+
+    tool_calls = []
+    for i, c in enumerate(internal_calls):
+        tool_calls.append({
+            "id": "call_web_%d_%d" % (int(t_start * 1000) % 1000000, i),
+            "type": "function",
+            "function": {"name": c["name"], "arguments": c.get("arguments") or "{}"},
+        })
+    convo.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
+
+    for tc in tool_calls:
+        nm = tc["function"]["name"]
+        result = wb_webtools.execute(nm, tc["function"]["arguments"])
+        found = wb_webtools.sources_from_result(result)
+        if found:
+            holder.setdefault("web_sources", []).extend(found)
+        log("web tool %s -> %d chars, %d citeable source(s)"
+            % (nm, len(result or ""), len(found)), level="INFO")
+        convo.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "name": nm,
+            "content": result,
+        })
+
+    body = dict(holder.get("base_body") or {})
+    if drop_tools:
+        body["tools"] = [t for t in (body.get("tools") or [])
+                         if not wb_webtools.is_internal_tool(tool_name_of(t))]
+        convo.append({
+            "role": "system",
+            "content": ("The web tools are no longer available. Answer the user now with "
+                        "what you already have. Do not say that you are searching again."),
+        })
+    body["messages"] = convo
+    body["stream"] = True
+    return open_upstream(body, session_key=session_key,
+                         target_realm=holder.get("realm"))
+
+
+def internal_calls_from_chat(chat_obj, web_tools=False):
+    """Calls in an aggregated chat completion the gateway runs itself.
+
+    Only a request whose definitions the gateway injected can carry such a
+    call; with the switch off a client's own same-named function stays the
+    client's, so this answers empty.
+    """
+    message = ((chat_obj.get("choices") or [{}])[0] or {}).get("message") or {}
+    out = []
+    if not web_tools:
+        return out
+    for tc in message.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        if wb_webtools.is_internal_tool(name):
+            out.append({"name": name, "arguments": fn.get("arguments") or "{}"})
+    return out
+
+
+def tool_name_of(tool):
+    """Tool name, whichever of the two shapes the entry uses."""
+    if not isinstance(tool, dict):
+        return ""
+    if isinstance(tool.get("function"), dict):
+        return str((tool.get("function") or {}).get("name") or "")
+    return str(tool.get("name") or "")
+
+
 def _responses_input_to_messages(payload):
     """Turn the Responses input items into chat messages."""
     messages = []
@@ -4136,6 +4810,14 @@ def responses_to_chat(payload):
         flat_tools, ns_map = expand_namespace_tools(payload["tools"])
         chat["tools"] = _tools_for_chat(flat_tools)
         chat["_namespace_map"] = ns_map
+    # 客戶端宣告 web_search / web_fetch 時，把那份宣告換成我們的
+    # function（見 wb_webtools.install_tool_defs）。
+    # 看板开关关闭时原样透传，客户端自己的同名工具不受影响。
+    if local_web_tools_enabled():
+        wants = wb_webtools.client_wants_web(payload.get("tools"))
+        if wants["search"] or wants["fetch"]:
+            chat["tools"] = wb_webtools.install_tool_defs(chat.get("tools") or [], wants)
+            chat["_web_tools"] = True
     if payload.get("tool_choice"):
         chat["tool_choice"] = payload["tool_choice"]
     if payload.get("parallel_tool_calls") is not None:
@@ -4157,7 +4839,7 @@ def _responses_usage(u):
         "output_tokens_details": {"reasoning_tokens": det.get("reasoning_tokens") or 0},
         "total_tokens": u.get("total_tokens") or 0,
     }
-def chat_to_response(chat_obj, model, custom_names=None, request_meta=None, namespace_map=None):
+def chat_to_response(chat_obj, model, custom_names=None, request_meta=None, namespace_map=None, sources=None):
     """Fold a Chat Completions object into a Responses API response object.
 
     custom_names is the set of tool names the client declared as freeform
@@ -4224,7 +4906,8 @@ def chat_to_response(chat_obj, model, custom_names=None, request_meta=None, name
             "type": "message",
             "status": "completed",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": text, "annotations": []}] if text else [],
+            "content": [{"type": "output_text", "text": text,
+                         "annotations": build_citations(text, sources)}] if text else [],
         })
     finish = choice.get("finish_reason") or "stop"
     obj = {
@@ -4266,6 +4949,11 @@ def stream_responses_events(upstream, model, holder):
     dsml_tool_calls = []
     custom_names = set(holder.get("custom_names") or ())
     ns_map = holder.get("namespace_map") or {}
+    # 由反代代跑的網路工具呼叫，收集起來不轉發給客戶端
+    _internal_calls = {}
+    # Only reach for same-named calls when this request's definitions were the
+    # gateway's own (see web_tools_active); otherwise they belong to the client.
+    _own_web_tools = web_tools_active(holder.get("base_body"))
     # Echo the request capabilities the client actually sent, same as the
     # non-streaming path; these were hardcoded before.
     meta = holder.get("request_meta") or {}
@@ -4303,12 +4991,19 @@ def stream_responses_events(upstream, model, holder):
             "status": status,
             "summary": [{"type": "summary_text", "text": "".join(reason_parts)}],
         }
+    def _annotations():
+        """引用來源：只認工具真的回傳過的網址。"""
+        try:
+            return build_citations("".join(text_parts), holder.get("web_sources") or [])
+        except Exception:
+            return []
+
     def msg_item(status):
         item = {"id": msg_id, "type": "message", "status": status,
                 "role": "assistant", "content": []}
         if text_parts:
             item["content"] = [{"type": "output_text", "text": "".join(text_parts),
-                              "annotations": []}]
+                              "annotations": _annotations()}]
         return item
     def _finalize():
         # Close out the stream: reasoning item, structured tool calls,
@@ -4388,6 +5083,13 @@ def stream_responses_events(upstream, model, holder):
                 full_text = clean_text
         if dsml_calls and not tool_calls_map:
             for dc in dsml_calls:
+                # DSML 形狀的網路工具呼叫一樣由反代執行
+                if _own_web_tools and wb_webtools.is_internal_tool(dc.get("name")):
+                    entry = _internal_calls.setdefault(dc.get("id") or _new_id("call_"),
+                                                       {"name": dc.get("name"), "arguments": "{}"})
+                    entry["name"] = dc.get("name") or entry["name"]
+                    entry["arguments"] = dc.get("arguments") or entry.get("arguments") or "{}"
+                    continue
                 out_idx = len(outputs)
                 fc_item = {
                     "id": _new_id("fc_"),
@@ -4419,6 +5121,53 @@ def stream_responses_events(upstream, model, holder):
                     "output_index": out_idx,
                     "item": fc_item,
                 })
+        # 這一輪如果有代跑的網路工具呼叫，就把完成事件留給下一輪，
+        # 否則客戶端會以為整個回合已經結束（舊版是在回合用盡時補一個合成的
+        # resp_wrapup，那才是 issue #43 真正的病灶）。
+        if _internal_calls:
+            holder.setdefault("internal_calls", []).extend(
+                {"name": v["name"], "arguments": v["arguments"]}
+                for v in _internal_calls.values()
+            )
+            holder["suppress_completion"] = True
+            # 讓 App 畫出原生的「已搜尋網路」卡片：對每個代跑的呼叫送出
+            # web_search_call 項目與生命週期事件。
+            for _v in _internal_calls.values():
+                _nm = str(_v.get("name") or "")
+                try:
+                    _a = json.loads(_v.get("arguments") or "{}")
+                except Exception:
+                    _a = {}
+                if not isinstance(_a, dict):
+                    _a = {}
+                if _nm == wb_webtools.WEB_FETCH_NAME:
+                    _action = {"type": "open_page", "url": wb_webtools.url_arg(_a)}
+                else:
+                    _action = {"type": "search", "query": wb_webtools.query_args(_a)}
+                _ws_id = _new_id("ws_")
+                _ws_idx = len(outputs)
+                outputs.append(None)
+                yield ev("response.output_item.added", {
+                    "output_index": _ws_idx,
+                    "item": {"id": _ws_id, "type": "web_search_call",
+                             "status": "in_progress"},
+                })
+                yield ev("response.web_search_call.in_progress", {
+                    "output_index": _ws_idx, "item_id": _ws_id,
+                })
+                yield ev("response.web_search_call.searching", {
+                    "output_index": _ws_idx, "item_id": _ws_id,
+                })
+                _ws_item = {"id": _ws_id, "type": "web_search_call", "status": "completed"}
+                if _action.get("query") or _action.get("url"):
+                    _ws_item["action"] = _action
+                outputs[_ws_idx] = _ws_item
+                yield ev("response.output_item.done", {
+                    "output_index": _ws_idx, "item": _ws_item,
+                })
+                yield ev("response.web_search_call.completed", {
+                    "output_index": _ws_idx, "item_id": _ws_id,
+                })
         # 3. Emit message item only if text was emitted OR no other output item exists
         has_other_items = any(o for o in outputs if o)
         if msg_index is not None or full_text or not has_other_items:
@@ -4432,14 +5181,15 @@ def stream_responses_events(upstream, model, holder):
                 })
                 yield ev("response.content_part.added", {
                     "item_id": msg_id, "output_index": msg_index, "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []},
+                    "part": {"type": "output_text", "text": "", "annotations": _annotations()},
                 })
             yield ev("response.output_text.done", {
                 "item_id": msg_id, "output_index": msg_index, "content_index": 0, "text": full_text,
             })
             yield ev("response.content_part.done", {
                 "item_id": msg_id, "output_index": msg_index, "content_index": 0,
-                "part": {"type": "output_text", "text": full_text, "annotations": []},
+                "part": {"type": "output_text", "text": full_text,
+                         "annotations": _annotations()},
             })
             outputs[msg_index] = msg_item("completed")
             yield ev("response.output_item.done", {"output_index": msg_index, "item": outputs[msg_index]})
@@ -4462,10 +5212,14 @@ def stream_responses_events(upstream, model, holder):
         final = resp_obj(status)
         if finish == "length":
             final["incomplete_details"] = {"reason": "max_output_tokens"}
-        yield ev("response.completed", {"response": final})
+        if not holder.get("suppress_completion"):
+            yield ev("response.completed", {"response": final})
 
-    yield ev("response.created", {"response": resp_obj("in_progress")})
-    yield ev("response.in_progress", {"response": resp_obj("in_progress")})
+    # 只有第一輪開場。第二輪以後再送一次 response.created，客戶端會
+    # 看到同一則回應被開了兩次。
+    if not holder.get("suppress_lifecycle"):
+        yield ev("response.created", {"response": resp_obj("in_progress")})
+        yield ev("response.in_progress", {"response": resp_obj("in_progress")})
     for raw in upstream:
         data = strip_data_prefix(raw.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
@@ -4503,6 +5257,16 @@ def stream_responses_events(upstream, model, holder):
                 fn_name = fn.get("name") or ""
                 fn_args = fn.get("arguments") or ""
                 call_id = tc.get("id") or ""
+                # web_search / web_fetch 由反代執行，不轉發給客戶端
+                if idx in _internal_calls or (
+                        _own_web_tools and fn_name
+                        and wb_webtools.is_internal_tool(fn_name)):
+                    entry = _internal_calls.setdefault(idx, {"name": fn_name, "arguments": ""})
+                    if fn_name:
+                        entry["name"] = fn_name
+                    if fn_args:
+                        entry["arguments"] += fn_args
+                    continue
                 if idx not in tool_calls_map:
                     out_idx = len(outputs)
                     outputs.append(None)
@@ -4584,7 +5348,7 @@ def stream_responses_events(upstream, model, holder):
                     })
                     yield ev("response.content_part.added", {
                         "item_id": msg_id, "output_index": msg_index, "content_index": 0,
-                        "part": {"type": "output_text", "text": "", "annotations": []},
+                        "part": {"type": "output_text", "text": "", "annotations": _annotations()},
                     })
                 # DSML tool call buffering: do not stream raw DSML tags to client
                 text_buffer += piece
@@ -4716,7 +5480,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.6.5"
+    server_version = "wb-proxy/1.6.10"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -4927,14 +5691,24 @@ class Handler(BaseHTTPRequestHandler):
         the shortest model cooldown we know about.
         """
         wait = max(1, int(getattr(exc, "wait", 60) or 60))
+        # A 429 raised without an upstream call (the pool is parked by the
+        # daily token guard) carries its own text; everything else keeps the
+        # upstream wording.
+        custom = getattr(exc, "message", "")
+        text = custom or (
+            "upstream rate limit reached for this model; retry in %ds" % wait)
+        # The upstream detail only decorates the upstream wording; a local
+        # message would only repeat itself.
+        detail = ""
+        if exc.detail and not custom:
+            detail = " - " + exc.detail[:200]
         # 429 can be answered before the body is read (the model cooldown is
         # checked on the way in), so drain it exactly like _error does.
         self._handle_expect_continue()
         self._discard_body()
         body = json.dumps({
             "error": {
-                "message": ("upstream rate limit reached for this model; retry in %ds"
-                            % wait) + ((" - " + exc.detail[:200]) if exc.detail else ""),
+                "message": text + detail,
                 "type": "rate_limit_error",
                 "code": 429,
                 "retry_after": wait,
@@ -5043,6 +5817,19 @@ class Handler(BaseHTTPRequestHandler):
         if not is_model_banned(model):
             return ""
         return banned_model_message(model)
+
+    def _key_model_error(self, model):
+        """Per-key model restriction: reject before the request reaches upstream.
+
+        A key that lists no models stays unrestricted, so this is a no-op
+        unless the operator asked for a limit.
+        """
+        entry = self.key_entry
+        if not entry:
+            return ""
+        if wb_settings.key_allows_model(entry, model):
+            return ""
+        return key_model_message(entry, model)
     def _request_realm(self, explicit=None):
         """Pick the upstream exit for this request.
         Priority: an explicit ?realm= argument, then the realm bound to the
@@ -5320,6 +6107,9 @@ class Handler(BaseHTTPRequestHandler):
     def _get_accounts(self, query):
         if not self._authorized():
             return
+        # Fold the usage log before building the view, so the 日限额 badge and
+        # the parked count describe right now instead of the last request.
+        apply_daily_token_limit()
         return self._json(200, {
             "accounts": account_views(realm=query.get('realm', [None])[0] or CURRENT_REALM),
             "storage": ACCOUNTS_DIR,
@@ -5616,12 +6406,20 @@ class Handler(BaseHTTPRequestHandler):
                 if realm not in ("", "intl", "cn"):
                     return self._error(400, "realm must be intl, cn or empty",
                                        "invalid_request_error")
+                # An older cached panel does not know this field at all, so a
+                # row that omits it keeps whatever is stored instead of
+                # silently dropping the restriction.
+                if "models" in item:
+                    models = item.get("models")
+                else:
+                    models = existing.get(entry_id, {}).get("models")
                 created_at = item.get("created_at") or (existing.get(entry_id, {}).get("created_at") if entry_id in existing else None) or time.strftime("%Y/%m/%d %H:%M")
                 cleaned.append({
                     "id": entry_id,
                     "name": str(item.get("name") or "").strip(),
                     "key": value,
                     "realm": realm,
+                    "models": models,
                     "enabled": item.get("enabled", True) is not False,
                     "created_at": created_at,
                 })
@@ -5643,6 +6441,22 @@ class Handler(BaseHTTPRequestHandler):
             if POOL:
                 POOL.apply_reserve_credits(reserve)
             reply["reserve_credits"] = reserve
+        if "daily_token_limit" in payload:
+            raw = payload.get("daily_token_limit")
+            if isinstance(raw, bool) or raw is None:
+                return self._error(400, "daily_token_limit must be a whole number",
+                                   "invalid_request_error")
+            try:
+                limit = int(raw)
+            except (TypeError, ValueError):
+                return self._error(400, "daily_token_limit must be a whole number",
+                                   "invalid_request_error")
+            if limit < 0:
+                return self._error(400, "daily_token_limit cannot be negative",
+                                   "invalid_request_error")
+            wb_settings.set_daily_token_limit(ACCOUNTS_DIR, limit)
+            apply_daily_token_limit(refresh=True)
+            reply["daily_token_limit"] = limit
         if "auto_switch_product" in payload:
             # Strictly a JSON boolean: a string like "false" would be truthy and
             # silently switch the feature on, which is the one thing an operator
@@ -5660,6 +6474,13 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_daily_chat_web(ACCOUNTS_DIR, raw)
             reply["daily_chat_web"] = raw
+        if "local_web_tools" in payload:
+            raw = payload.get("local_web_tools")
+            if not isinstance(raw, bool):
+                return self._error(400, "local_web_tools must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_local_web_tools(ACCOUNTS_DIR, raw)
+            reply["local_web_tools"] = raw
         new_key = payload.get("api_key")
         if new_key is not None:
             new_key = str(new_key).strip()
@@ -6306,6 +7127,9 @@ class Handler(BaseHTTPRequestHandler):
             banned = self._banned_model_error(chat_req.get("model"))
             if banned:
                 return self._error(400, banned, "invalid_request_error")
+            key_blocked = self._key_model_error(chat_req.get("model"))
+            if key_blocked:
+                return self._error(400, key_blocked, "invalid_request_error")
             upstream, account = open_upstream(chat_req, session_key=session_key, target_realm=req_realm)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
@@ -6339,7 +7163,8 @@ class Handler(BaseHTTPRequestHandler):
                     upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
                     base_body=chat_req, session_key=session_key, realm=req_realm)
             return self._responses_nonstream_response(
-                upstream, model, custom_names, request_meta, fp, account, t_start, ns_map)
+                upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
+                base_body=chat_req, session_key=session_key, realm=req_realm)
 
     def _responses_stream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None):
         self.send_response(200)
@@ -6354,14 +7179,39 @@ class Handler(BaseHTTPRequestHandler):
                   "namespace_map": namespace_map,
                   "base_body": base_body,
                   "base_messages": (base_body or {}).get("messages"),
+                  "session_key": session_key,
                   "realm": realm}
         first_ms = None
         try:
-            for frame in stream_responses_events(upstream, model, holder):
-                if first_ms is None:
-                    first_ms = int((time.time() - t_start) * 1000)
-                self.wfile.write(clean_responses_frame(frame))
-                self.wfile.flush()
+            # 一輪跑完如果模型要的是 web_search / web_fetch，就由反代
+            # 執行、把結果餵回去再跑一輪。客戶端從頭到尾只看到一則連續的回應。
+            rounds = 0
+            total_usage = None
+            while True:
+                holder.pop("internal_calls", None)
+                holder.pop("suppress_completion", None)
+                holder["suppress_lifecycle"] = rounds > 0
+                for frame in stream_responses_events(upstream, model, holder):
+                    if first_ms is None:
+                        first_ms = int((time.time() - t_start) * 1000)
+                    self.wfile.write(clean_responses_frame(frame))
+                    self.wfile.flush()
+                # 每一輪的 token 都是真的花掉的，記帳要加總
+                total_usage = sum_usage(total_usage, holder.get("usage"))
+                internal = holder.get("internal_calls") or []
+                if not internal:
+                    break
+                rounds += 1
+                # 用完就收回工具，讓模型自己收尾；這裡不合成任何事件。
+                give_up = rounds > wb_webtools.MAX_WEB_ROUNDS
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
+                upstream, account = follow_up_with_tool_results(
+                    internal, holder, model, session_key, t_start, drop_tools=give_up)
+            if total_usage:
+                holder["usage"] = total_usage
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             wall = int((time.time() - t_start) * 1000)
             record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
@@ -6384,6 +7234,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return
+        finally:
+            # 代跑多輪時 upstream 會被換掉，外層的 with 只認得最開始那一條，
+            # 最後一條要在這裡收掉。
+            try:
+                upstream.close()
+            except Exception:
+                pass
         wall = int((time.time() - t_start) * 1000)
         record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
                      ttft_ms=first_ms,
@@ -6391,16 +7248,47 @@ class Handler(BaseHTTPRequestHandler):
                      fp=fp, account=account.uid)
         return
 
-    def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None):
-        try:
-            chat_obj = aggregate_stream(upstream, model, None)
-        except Exception as exc:
-            record_error(model, 502, str(exc),
-                         elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=account.uid)
-            return self._error(502, f"upstream stream error: {exc}")
+    def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None):
+        # 跟串流那條一樣：客戶端宣告 web_search / web_fetch 時由反代代跑。
+        # 中間那幾輪對客戶端不可見，最後才組成一個 Responses 物件回傳；不這樣
+        # 做的話 web_search 的 function_call 會直接漏給客戶端，客戶端只會回
+        # 一句 unsupported call。
+        sources = []
+        rounds = 0
+        # 開關關閉時不攔同名呼叫：那是客戶端自己的工具。
+        web_tools = web_tools_active(base_body)
+        while True:
+            try:
+                chat_obj = aggregate_stream(upstream, model, None)
+            except Exception as exc:
+                record_error(model, 502, str(exc),
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             account=account.uid)
+                return self._error(502, f"upstream stream error: {exc}")
+            calls = internal_calls_from_chat(chat_obj, web_tools=web_tools)
+            if not calls:
+                break
+            rounds += 1
+            give_up = rounds > wb_webtools.MAX_WEB_ROUNDS
+            try:
+                upstream.close()
+            except Exception:
+                pass
+            holder = {"base_messages": (base_body or {}).get("messages"),
+                      "base_body": base_body, "realm": realm,
+                      "web_sources": sources}
+            try:
+                upstream, account = follow_up_with_tool_results(
+                    calls, holder, model, session_key, t_start, drop_tools=give_up)
+            except Exception as exc:
+                record_error(model, 502, "web tool follow-up failed: %s" % exc,
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             account=account.uid)
+                return self._error(502, "web tool follow-up failed: %s" % exc)
+            sources = holder.get("web_sources") or sources
         wall = int((time.time() - t_start) * 1000)
-        result = chat_to_response(chat_obj, model, custom_names, request_meta, namespace_map)
+        result = chat_to_response(chat_obj, model, custom_names, request_meta, namespace_map,
+                                  sources=sources)
         record_usage(model, chat_obj.get("usage"), stream=False, elapsed_ms=wall, fp=fp,
                      account=account.uid)
         return self._json(200, result)
@@ -6865,6 +7753,9 @@ class Handler(BaseHTTPRequestHandler):
             banned = self._banned_model_error(payload.get("model"))
             if banned:
                 return self._error(400, banned, "invalid_request_error")
+            key_blocked = self._key_model_error(payload.get("model"))
+            if key_blocked:
+                return self._error(400, key_blocked, "invalid_request_error")
             upstream, account = open_upstream(payload, session_key=session_key, target_realm=req_realm)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
@@ -7129,6 +8020,7 @@ def _bootstrap_runtime(args):
     POOL.load()
     POOL.apply_proxy_slots()
     POOL.apply_reserve_credits()
+    apply_daily_token_limit()
     load_persisted_realm()
     global SCHEDULER
     from wb_scheduler import Scheduler

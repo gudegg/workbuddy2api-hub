@@ -7,6 +7,7 @@ password is never stored in clear text - only a PBKDF2-SHA256 digest.
 Only the Python standard library is required.
 """
 
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -147,6 +148,45 @@ def ensure_launcher_key(accounts_dir):
 REALMS = ("", "intl", "cn")
 
 
+def _clean_model_patterns(value):
+    """Normalize one key's model allow-list into a list of lowercase patterns.
+
+    The panel posts a list; a hand-edited settings.json tends to hold a
+    comma-separated string, so both shapes are accepted. Matching is done with
+    fnmatch, which makes an exact name (`gpt-6-astra`) and a wildcard
+    (`deepseek/*`) behave the same way. An empty result means "no restriction",
+    which is what every key written before this field existed reads back as -
+    an upgrade therefore keeps behaving exactly as before.
+    """
+    if isinstance(value, str):
+        raw = [part for part in re.split(r"[,;\n]", value)]
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        return []
+    out = []
+    for item in raw:
+        pattern = str(item or "").strip().lower()
+        if pattern and pattern not in out:
+            out.append(pattern)
+    return out
+
+
+def key_allows_model(entry, model):
+    """True when `entry` places no model restriction, or `model` matches it.
+
+    A key with an empty list stays unrestricted, so nothing changes for
+    installs that never touch this field.
+    """
+    patterns = _clean_model_patterns((entry or {}).get("models"))
+    if not patterns:
+        return True
+    name = str(model or "").strip().lower()
+    if not name:
+        return True
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable."""
     if not isinstance(entry, dict):
@@ -162,6 +202,7 @@ def _clean_key_entry(entry):
         "name": str(entry.get("name") or "").strip() or "未命名",
         "key": key,
         "realm": realm,
+        "models": _clean_model_patterns(entry.get("models")),
         "enabled": entry.get("enabled", True) is not False,
         "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
     }
@@ -225,6 +266,7 @@ def api_keys(accounts_dir):
                 "name": "默认（跟随面板切换）",
                 "key": legacy,
                 "realm": "",
+                "models": [],
                 "enabled": True,
             }]
     return []
@@ -275,6 +317,7 @@ def match_api_key(accounts_dir, supplied, extra_keys=()):
                 "name": "启动参数",
                 "key": candidate,
                 "realm": "",
+                "models": [],
                 "enabled": True,
                 "source": "launcher",
             }
@@ -320,6 +363,34 @@ def set_reserve_credits(accounts_dir, value):
     return value
 
 
+def daily_token_limit(accounts_dir):
+    """Global daily guard: an account that already burned this many tokens
+    today stays idle until local midnight.
+
+    Zero disables the guard, which keeps installs that predate the setting
+    behaving exactly as before.
+    """
+    try:
+        value = int(load(accounts_dir).get("daily_token_limit") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def set_daily_token_limit(accounts_dir, value):
+    """Persist the daily token threshold. Returns the stored value."""
+    try:
+        value = int(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    value = max(0, value)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_token_limit"] = value
+        save(accounts_dir, data)
+    return value
+
+
 def auto_switch_product(accounts_dir):
     """Whether an upstream 429 may rotate an account's outbound identity.
 
@@ -361,6 +432,28 @@ def set_daily_chat_web(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data["daily_chat_web"] = enabled
+        save(accounts_dir, data)
+    return enabled
+def local_web_tools(accounts_dir):
+    """Whether the gateway runs web_search / web_fetch calls itself.
+
+    Off unless the operator turns it on. Forwarding the client's declaration
+    untouched is what this gateway has done since v1.5.3, and it is what an
+    install that never touched the switch keeps doing: the upstream has no
+    server-side search tool, so a client declaring one runs it in its own
+    process. Turning the switch on swaps the declaration for the gateway's own
+    function and executes the calls locally (wb_webtools), which also means the
+    gateway itself fetches the URLs a model asks for - hence opt-in only.
+    """
+    return load(accounts_dir).get("local_web_tools") is True
+
+
+def set_local_web_tools(accounts_dir, enabled):
+    """Persist the local web-tools switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["local_web_tools"] = enabled
         save(accounts_dir, data)
     return enabled
 
