@@ -8276,7 +8276,7 @@ class Handler(BaseHTTPRequestHandler):
             banned = self._banned_model_error(model)
             if banned:
                 return self._anthropic_error(400, banned, "invalid_request_error")
-            upstream, account = open_upstream(chat_request,
+            upstream, account, _ = open_upstream(chat_request,
                                               session_key=session_key,
                                               target_realm=req_realm)
         except ContentRejected as exc:

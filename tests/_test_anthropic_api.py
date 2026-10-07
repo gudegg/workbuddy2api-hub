@@ -152,5 +152,36 @@ check("count_tokens accepts a request without max_tokens",
       "max_tokens" not in count_body and P._anthropic_input_tokens(count_body) > 0)
 
 print()
+print("[4] Messages handler accepts the upstream response, account and effort")
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import patch
+
+for streaming in (True, False):
+    handler = object.__new__(P.Handler)
+    handler.headers = {}
+    handler._request_realm = lambda: "intl"
+    handler._cross_realm_error = lambda *args: None
+    handler._banned_model_error = lambda *args: None
+    handler._anthropic_error = lambda *args: ("error", args)
+    handler._json = lambda status, body: (status, body)
+    handler._anthropic_stream_response = lambda *args: "streamed"
+    request = {
+        "model": "deepseek-v4.1-flash", "max_tokens": 16,
+        "stream": streaming,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    with patch.object(P, "open_upstream", return_value=(
+            nullcontext(object()), SimpleNamespace(uid="test-account"), "high")), \
+         patch.object(P, "aggregate_stream", return_value=chat_response), \
+         patch.object(P, "record_usage"), \
+         patch.object(P, "record_error") as errors:
+        result = handler._handle_anthropic_messages(request)
+    check("%s messages succeeds with the three-value upstream result" %
+          ("streaming" if streaming else "non-streaming"),
+          result == "streamed" if streaming else result[0] == 200, result)
+    check("successful messages records no error", not errors.called)
+
+print()
 print("%d passed, %d failed" % (PASS, FAIL))
 raise SystemExit(1 if FAIL else 0)
