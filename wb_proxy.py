@@ -4259,6 +4259,10 @@ class AnthropicRequestError(ValueError):
 ANTHROPIC_IMAGE_MEDIA_TYPES = {
     "image/jpeg", "image/png", "image/gif", "image/webp",
 }
+# count_tokens is a local approximation, not a model tokenizer.  Without
+# decoded image dimensions, use one fixed allowance rather than treating a
+# potentially huge base64 payload (or URL) as prompt text.
+ANTHROPIC_IMAGE_TOKEN_ESTIMATE = 1024
 
 
 def _anthropic_text_block_text(block):
@@ -4370,24 +4374,9 @@ def _anthropic_system_text(system):
                    if isinstance(part, dict) and part.get("type") == "text")
 
 
-def _anthropic_tool_result_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, dict):
-        content = [content]
-    if isinstance(content, list):
-        text = []
-        for block in content:
-            if isinstance(block, str):
-                text.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                text.append(str(block.get("text") or ""))
-            else:
-                text.append(json.dumps(block, ensure_ascii=False, separators=(",", ":")))
-        return "".join(text)
-    if content is None:
-        return ""
-    return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+def _anthropic_tool_result_content(content):
+    """Keep tool images structured; reject unsupported blocks like documents."""
+    return _anthropic_content_to_openai(content)
 
 
 def _anthropic_assistant_blocks(content):
@@ -4492,6 +4481,65 @@ def _anthropic_tool_choice_to_openai(choice):
     raise AnthropicRequestError("unsupported tool_choice type: %s" % (kind or "unknown"))
 
 
+def _anthropic_reasoning_effort(payload, model):
+    """Resolve explicit effort without silently ignoring conflicting controls."""
+    output_config = payload.get("output_config")
+    if output_config is not None and not isinstance(output_config, dict):
+        raise AnthropicRequestError("output_config must be an object")
+    output_config = output_config if output_config is not None else {}
+    for field, output_format in (("output_config.format", output_config.get("format")),
+                                 ("output_format", payload.get("output_format"))):
+        if output_format is not None:
+            # The upstream body's Chat shape alone does not prove support for
+            # constrained decoding.  Do not promise schema validation by dropping
+            # the field or by inventing a response_format mapping.
+            raise AnthropicRequestError(
+                "%s is not supported: WorkBuddy does not provide "
+                "validated JSON Schema output" % field
+            )
+
+    levels = ("low", "medium", "high", "xhigh", "max")
+    effort = None
+    if output_config.get("effort") is not None:
+        effort = output_config["effort"]
+        if not isinstance(effort, str) or effort not in levels:
+            raise AnthropicRequestError(
+                "output_config.effort must be low, medium, high, xhigh or max"
+            )
+    for key in ("reasoning_effort", "reasoningEffort"):
+        if payload.get(key) is None:
+            continue
+        given = payload[key]
+        if not isinstance(given, str) or given not in levels + ("none",):
+            raise AnthropicRequestError("%s has an unsupported effort value" % key)
+        if effort is not None and given != effort:
+            raise AnthropicRequestError("conflicting effort fields: %s" % key)
+        effort = given
+    if effort is None:
+        return None
+
+    thinking = payload.get("thinking")
+    thinking_type = str(thinking.get("type") or "").lower() if isinstance(thinking, dict) else ""
+    if ((thinking_type == "disabled" and effort != "none") or
+            (thinking_type in ("enabled", "adaptive") and effort == "none")):
+        raise AnthropicRequestError("effort conflicts with thinking.type")
+    meta = model_catalog_meta(model)
+    reasoning = meta.get("reasoning") or {}
+    fixed = reasoning.get("effort")
+    supported = reasoning.get("supportedEfforts")
+    if fixed and effort != fixed:
+        raise AnthropicRequestError("effort %s is not supported by model %s (fixed effort: %s)" % (
+            effort, model, fixed,
+        ))
+    if effort != "none" and isinstance(supported, list) and supported and effort not in supported:
+        raise AnthropicRequestError("effort %s is not supported by model %s (supported: %s)" % (
+            effort, model, ", ".join(str(value) for value in supported),
+        ))
+    if effort == "none" and reasoning.get("canDisableThinking") is False:
+        raise AnthropicRequestError("effort none is not supported by model %s" % model)
+    return effort
+
+
 def _anthropic_messages_to_chat(payload, require_max_tokens=True):
     """Validate and convert one Anthropic Messages request to Chat shape."""
     if not isinstance(payload, dict):
@@ -4499,6 +4547,7 @@ def _anthropic_messages_to_chat(payload, require_max_tokens=True):
     model = str(payload.get("model") or "").strip()
     if not model:
         raise AnthropicRequestError("model is required")
+    effort = _anthropic_reasoning_effort(payload, model)
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list) or not raw_messages:
         raise AnthropicRequestError("messages must be a non-empty array")
@@ -4565,9 +4614,12 @@ def _anthropic_messages_to_chat(payload, require_max_tokens=True):
                 tool_id = str(block.get("tool_use_id") or "").strip()
                 if not tool_id:
                     raise AnthropicRequestError("tool_result requires a tool_use_id")
-                result = _anthropic_tool_result_text(block.get("content"))
+                result = _anthropic_tool_result_content(block.get("content"))
                 if block.get("is_error"):
-                    result = "Tool error: " + result
+                    if isinstance(result, list):
+                        result = [{"type": "text", "text": "Tool error: "}] + result
+                    else:
+                        result = "Tool error: " + result
                 messages.append({"role": "tool", "tool_call_id": tool_id, "content": result})
                 saw_tool_result = True
             else:
@@ -4579,6 +4631,8 @@ def _anthropic_messages_to_chat(payload, require_max_tokens=True):
         messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
 
     body = {"model": model, "messages": messages}
+    if effort is not None:
+        body["reasoning_effort"] = effort
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
     for key in ("temperature", "top_p", "top_k", "stream", "thinking"):
@@ -4603,10 +4657,27 @@ def _anthropic_messages_to_chat(payload, require_max_tokens=True):
 
 
 def _anthropic_input_tokens(chat_payload):
+    """Approximate messages, tool schemas and a fixed allowance per image."""
     try:
-        raw = json.dumps(chat_payload.get("messages") or [], ensure_ascii=False,
+        messages = []
+        image_tokens = 0
+        for message in chat_payload.get("messages") or []:
+            estimated = dict(message)
+            content = message.get("content")
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        image_tokens += ANTHROPIC_IMAGE_TOKEN_ESTIMATE
+                        parts.append({"type": "image_url"})
+                    else:
+                        parts.append(part)
+                estimated["content"] = parts
+            messages.append(estimated)
+        raw = json.dumps({"messages": messages, "tools": chat_payload.get("tools") or []},
+                          ensure_ascii=False,
                           separators=(",", ":"))
-        return max(1, estimate_tokens(raw))
+        return max(1, estimate_tokens(raw) + image_tokens)
     except Exception:
         return 1
 
@@ -4624,30 +4695,42 @@ def _anthropic_stop_reason(finish_reason):
 
 
 def _anthropic_usage(chat_usage, input_tokens=0, output_text="", reasoning=""):
-    chat_usage = chat_usage or {}
+    chat_usage = dict(chat_usage or {})
+    # Share the gateway's field precedence while retaining this adapter's
+    # tolerance for malformed optional details from compatibility upstreams.
+    for key in ("completion_tokens_details", "prompt_tokens_details"):
+        if not isinstance(chat_usage.get(key), dict):
+            chat_usage[key] = {}
+    usage = _extract_usage(chat_usage)
+    # Read these raw fields so an absent counter stays distinct from a real
+    # zero; the canonical extractor defaults missing counters to zero.
     prompt = chat_usage.get("prompt_tokens")
     completion = chat_usage.get("completion_tokens")
     try:
         prompt = int(prompt)
     except (TypeError, ValueError):
-        prompt = 0
+        prompt = None
     try:
         completion = int(completion)
     except (TypeError, ValueError):
-        completion = 0
-    if prompt <= 0:
+        completion = None
+    if prompt is None or prompt < 0:
         prompt = max(1, int(input_tokens or 0))
-    if completion <= 0:
+    if completion is None or completion < 0:
         completion = estimate_tokens((reasoning or "") + (output_text or ""))
-    result = {"input_tokens": prompt, "output_tokens": max(0, completion)}
-    details = chat_usage.get("prompt_tokens_details") or {}
     try:
-        cached = int(details.get("cached_tokens") or 0)
+        cached = int(usage.get("cached_tokens") or 0)
     except (TypeError, ValueError):
         cached = 0
-    if cached > 0:
-        result["cache_read_input_tokens"] = cached
-    return result
+    cached = max(0, min(prompt, cached))
+    # OpenAI prompt_tokens includes cache hits; Anthropic input_tokens excludes
+    # them.  The upstream does not report Anthropic cache writes or TTLs.
+    return {
+        "input_tokens": max(0, prompt - cached),
+        "output_tokens": max(0, completion),
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cached,
+    }
 
 
 def _anthropic_response_from_chat(chat_obj, payload, input_tokens=0):
