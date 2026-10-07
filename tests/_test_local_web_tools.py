@@ -150,6 +150,11 @@ class FakeAccount(object):
 class FakeHandler(object):
     _responses_stream_response = proxy.Handler._responses_stream_response
 
+    def _key_id(self):
+        # These tests present no API key, so the usage row they produce is
+        # unattributed - exactly what the real handler records in that case.
+        return None
+
     def __init__(self):
         self.path = "/v1/responses"
         self.written = []
@@ -184,7 +189,9 @@ opened = []
 
 def fake_open_upstream(body, session_key=None, target_realm=None):
     opened.append(body)
-    return FakeUpstream(sse(ANSWER_CHUNKS)), FakeAccount()
+    # The real one returns (response, account, effort); the follow-up callers
+    # record the effort on the usage row and ignore it here.
+    return FakeUpstream(sse(ANSWER_CHUNKS)), FakeAccount(), body.get("reasoning_effort")
 
 
 chat_body = {
@@ -239,8 +246,8 @@ def always_tool_body(body, session_key=None, target_realm=None):
     if calls["n"] > W.MAX_WEB_ROUNDS:
         # out of rounds: the gateway must have taken the tools away, so this
         # answer is a real one and the stream can end normally.
-        return FakeUpstream(sse(ANSWER_CHUNKS)), FakeAccount()
-    return FakeUpstream(sse(TOOL_CHUNKS)), FakeAccount()
+        return FakeUpstream(sse(ANSWER_CHUNKS)), FakeAccount(), body.get("reasoning_effort")
+    return FakeUpstream(sse(TOOL_CHUNKS)), FakeAccount(), body.get("reasoning_effort")
 
 
 handler2 = FakeHandler()
@@ -323,7 +330,7 @@ def fake_aggregate(upstream, model, sink, *a, **k):
 
 def capture_open(body, session_key=None, target_realm=None):
     seen["bodies"].append(body)
-    return FakeUpstream(sse(ANSWER_CHUNKS)), FakeAccount()
+    return FakeUpstream(sse(ANSWER_CHUNKS)), FakeAccount(), body.get("reasoning_effort")
 
 
 class JsonHandler(FakeHandler):
@@ -374,7 +381,7 @@ passthrough = []
 
 def passthrough_open(body, session_key=None, target_realm=None):
     passthrough.append(body)
-    return FakeUpstream(sse(ANSWER_CHUNKS)), FakeAccount()
+    return FakeUpstream(sse(ANSWER_CHUNKS)), FakeAccount(), body.get("reasoning_effort")
 
 
 handler3 = FakeHandler()
