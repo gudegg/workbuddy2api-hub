@@ -300,6 +300,18 @@ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 ### Anthropic Messages API
 兼容 Anthropic SDK 的 `POST /v1/messages`、`POST /v1/messages/count_tokens` 和 `GET /v1/models`。请求使用 `x-api-key` 与 `anthropic-version: 2023-06-01`，流式请求设置 `stream: true`；图片、工具调用、工具结果和 Anthropic SSE 事件会在网关与 WorkBuddy Chat 协议之间转换。
 
+支持普通文本、system 指令、图片、客户端工具调用与结果、思考内容和流式响应。该接口使用与其他聊天协议相同的账号池、Key 模型限制和限额；请求流水记录实际使用的 Key 与推理强度。上游空响应、错误或未正常结束的流会作为失败处理。
+
+兼容范围与限制：
+
+- `output_config.effort` 映射为上游推理强度；合法值还需符合当前模型的能力，冲突或不支持的值返回 400。
+- `output_config.format` 和旧版 `output_format` 的结构化输出目前不支持，返回明确的 400 错误。PDF/document、Anthropic 原生服务器工具也未实现。
+- 工具结果中的图片保留为结构化图片内容；实际识图能力取决于所选上游模型。思考块的签名为空，不提供 Claude 原生签名验证。
+- `count_tokens` 为本地估算，包含工具定义；图片暂按每张约 1024 tokens 估算，不按 base64 字符长度计数。它不调用上游，也不占用聊天并发槽。
+- 缓存来自上游自动缓存，不提供 Anthropic `cache_control` 的断点或 TTL 语义。响应的 `input_tokens` 不含缓存命中，`cache_read_input_tokens` 单独计数，`cache_creation_input_tokens` 为 0；流式结束时会用上游实际用量更新开始时的估算值。
+
+修改或合并共享请求代码后，可运行 `python tests/run_all.py anthropic` 检查转换、HTTP 流式行为、鉴权和用量归属，再运行 `python tests/run_all.py` 检查全部协议。`update.sh` 的健康检查只确认服务就绪，不替代接口测试。
+
 ---
 
 ## 五、看板与接口一览

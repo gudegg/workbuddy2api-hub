@@ -160,6 +160,7 @@ from unittest.mock import patch
 for streaming in (True, False):
     handler = object.__new__(P.Handler)
     handler.headers = {}
+    handler.key_entry = None
     handler._request_realm = lambda: "intl"
     handler._cross_realm_error = lambda *args: None
     handler._banned_model_error = lambda *args: None

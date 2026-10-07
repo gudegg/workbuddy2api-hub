@@ -8319,6 +8319,36 @@ class Handler(BaseHTTPRequestHandler):
                      account=account.uid, key=self._key_id(), effort=effort)
         return self._json(200, result)
 
+    @staticmethod
+    def _anthropic_upstream_lines(upstream):
+        """Reject an empty/error/truncated chat stream in either response mode."""
+        saw_choice = completed = False
+        for line in upstream:
+            raw = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+            data = strip_data_prefix(raw)
+            if data == "[DONE]":
+                completed = True
+                break
+            if not data or data.startswith(":"):
+                continue
+            try:
+                chunk = json.loads(data)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                error = chunk["error"]
+                message = error.get("message") if isinstance(error, dict) else str(error)
+                raise RuntimeError("upstream stream error: %s" % (message or "unknown error"))
+            for choice in chunk.get("choices") or []:
+                if isinstance(choice, dict):
+                    saw_choice = True
+                    completed = completed or bool(choice.get("finish_reason"))
+            yield line
+        if not saw_choice or not completed:
+            raise RuntimeError("upstream stream ended before completion")
+
     def _handle_anthropic_count_tokens(self, payload):
         try:
             chat_request = _anthropic_messages_to_chat(payload, require_max_tokens=False)
@@ -8359,33 +8389,43 @@ class Handler(BaseHTTPRequestHandler):
             banned = self._banned_model_error(model)
             if banned:
                 return self._anthropic_error(400, banned, "invalid_request_error")
-            upstream, account, _ = open_upstream(chat_request,
-                                              session_key=session_key,
-                                              target_realm=req_realm)
+            key_blocked = self._key_model_error(model)
+            if key_blocked:
+                record_error(model, 400, key_blocked,
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             key=self._key_id(), stream=want_stream)
+                return self._anthropic_error(400, key_blocked, "invalid_request_error")
+            upstream, account, effort = open_upstream(chat_request,
+                                                   session_key=session_key,
+                                                   target_realm=req_realm)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         key=self._key_id(), stream=want_stream)
             return self._anthropic_error(403,
                                          "upstream 403: %s" % (exc.detail or "content rejected"),
                                          "invalid_request_error")
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         key=self._key_id(), stream=want_stream)
             return self._anthropic_rate_limited(exc)
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         key=self._key_id(), stream=want_stream)
             return self._anthropic_error(exc.code,
                                          "upstream %s: %s" % (exc.code, detail))
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         key=self._key_id(), stream=want_stream)
             if message.startswith("no usable account"):
                 return self._anthropic_error(
                     503, message + " - add or enable one at the dashboard (/)" )
@@ -8394,13 +8434,13 @@ class Handler(BaseHTTPRequestHandler):
         with upstream:
             if want_stream:
                 return self._anthropic_stream_response(
-                    upstream, model, fp, account, t_start, input_tokens)
+                    upstream, model, fp, account, t_start, input_tokens, effort)
             try:
-                chat_obj = aggregate_stream(upstream, model, None)
+                chat_obj = aggregate_stream(self._anthropic_upstream_lines(upstream), model, None)
             except Exception as exc:
                 record_error(model, 502, str(exc),
                              elapsed_ms=int((time.time() - t_start) * 1000),
-                             account=account.uid)
+                             account=account.uid, key=self._key_id(), stream=False)
                 return self._anthropic_error(502,
                                              "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
@@ -8409,251 +8449,68 @@ class Handler(BaseHTTPRequestHandler):
             record_usage(model, chat_obj.get("usage"), stream=False,
                          elapsed_ms=wall, ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid)
+                         fp=fp, account=account.uid, key=self._key_id(), effort=effort)
             return self._json(200, _anthropic_response_from_chat(
                 chat_obj, payload, input_tokens=input_tokens))
 
     def _anthropic_stream_response(self, upstream, model, fp, account,
-                                   t_start, input_tokens):
-        """Translate WorkBuddy's Chat SSE into Anthropic Messages SSE."""
-        message_id = _new_id("msg_")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        if cors_origin_allowed(self.path):
-            self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
+                                   t_start, input_tokens, effort=None):
+        """Translate chat SSE into consecutive Anthropic content blocks."""
         def emit(event_type, data):
             self.wfile.write(_anthropic_sse_event(event_type, data))
             self.wfile.flush()
 
-        start_message = {
-            "id": message_id,
-            "type": "message",
-            "role": "assistant",
-            "model": model,
-            "content": [],
-            "stop_reason": None,
-            "stop_sequence": None,
-            "usage": {"input_tokens": max(1, input_tokens), "output_tokens": 0},
-        }
-        try:
-            emit("message_start", {"message": start_message})
-            emit("ping", {})
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            return
-
+        active = None
         next_index = 0
-        blocks = {}
-        pending_tools = {}
-        text_parts = []
-        reasoning_parts = []
+        tools = {}
+        text_parts, reasoning_parts = [], []
         finish_reason = "stop"
         last_usage = None
         first_ms = None
+        outcome = "completed"
 
-        def start_block(key, block_type, block):
-            nonlocal next_index
-            state = {
-                "index": next_index,
-                "type": block_type,
-                "id": block.get("id"),
-                "name": block.get("name") or "",
-                "args": [],
-            }
+        def close_block():
+            nonlocal active
+            if active is None:
+                return
+            if active["type"] == "thinking":
+                # This translated trace has no verifiable Claude signature.
+                emit("content_block_delta", {
+                    "index": active["index"],
+                    "delta": {"type": "signature_delta", "signature": ""},
+                })
+            emit("content_block_stop", {"index": active["index"]})
+            active = None
+
+        def start_block(content):
+            nonlocal active, next_index
+            close_block()
+            active = {"index": next_index, "type": content["type"]}
             next_index += 1
-            blocks[key] = state
-            if block_type == "text":
-                content_block = {"type": "text", "text": ""}
-            elif block_type == "thinking":
-                content_block = {"type": "thinking", "thinking": ""}
-            else:
-                content_block = {
-                    "type": "tool_use",
-                    "id": state["id"] or _new_id("call_"),
-                    "name": state["name"],
-                    "input": {},
-                }
-                state["id"] = content_block["id"]
             emit("content_block_start", {
-                "index": state["index"], "content_block": content_block,
+                "index": active["index"], "content_block": content,
             })
-            return state
+            return active["index"]
 
-        def ensure_simple_block(key, block_type):
-            return blocks.get(key) or start_block(key, block_type, {})
-
-        def ensure_tool_block(key, tool_id, tool_name):
-            state = blocks.get(key)
-            if state:
-                return state
-            pending = pending_tools.setdefault(key, {
-                "id": tool_id or _new_id("call_"),
-                "name": tool_name or "",
-                "args": [],
+        def simple_delta(kind, value):
+            if not isinstance(value, str):
+                value = str(value)
+            if active is None or active["type"] != kind:
+                start_block({"type": kind, kind: ""})
+            emit("content_block_delta", {
+                "index": active["index"],
+                "delta": {"type": kind + "_delta", kind: value},
             })
-            if tool_name:
-                pending["name"] = tool_name
-            # Normally the upstream sends the function name in the first
-            # delta.  Delay the block only for an unusual split-name stream.
-            if pending.get("name"):
-                state = start_block(key, "tool_use", pending)
-                prior_args = list(pending.get("args") or [])
-                state["args"].extend(prior_args)
-                for argument in prior_args:
-                    emit("content_block_delta", {
-                        "index": state["index"],
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": argument,
-                        },
-                    })
-                return state
-            return None
 
-        def flush_pending_tool(key):
-            pending = pending_tools.get(key)
-            if not pending or key in blocks:
-                return blocks.get(key)
-            state = start_block(key, "tool_use", pending)
-            state["args"].extend(pending.get("args") or [])
-            return state
+        def tool_arguments():
+            return "".join(arg for tool in tools.values() for arg in tool["args"])
 
-        try:
-            for line in upstream:
-                raw = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
-                data = strip_data_prefix(raw)
-                if not data or data == "[DONE]" or data.startswith(":"):
-                    continue
-                try:
-                    chunk = json.loads(data)
-                except Exception:
-                    continue
-                if first_ms is None:
-                    first_ms = int((time.time() - t_start) * 1000)
-                usage = chunk.get("usage")
-                if usage:
-                    if (last_usage is None or
-                            (usage.get("total_tokens") or 0) >=
-                            (last_usage.get("total_tokens") or 0)):
-                        last_usage = usage
-                for choice in chunk.get("choices") or []:
-                    delta = choice.get("delta") or {}
-                    if choice.get("finish_reason"):
-                        finish_reason = choice.get("finish_reason")
-                    reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                    if reasoning:
-                        reasoning_state = ensure_simple_block("thinking", "thinking")
-                        reasoning_parts.append(reasoning)
-                        emit("content_block_delta", {
-                            "index": reasoning_state["index"],
-                            "delta": {"type": "thinking_delta", "thinking": reasoning},
-                        })
-                    text = delta.get("content") or ""
-                    if text:
-                        if not isinstance(text, str):
-                            text = str(text)
-                        text_state = ensure_simple_block("text", "text")
-                        text_parts.append(text)
-                        emit("content_block_delta", {
-                            "index": text_state["index"],
-                            "delta": {"type": "text_delta", "text": text},
-                        })
-                    tool_deltas = list(delta.get("tool_calls") or [])
-                    function_call = delta.get("function_call")
-                    if isinstance(function_call, dict) and (
-                            function_call.get("name") or function_call.get("arguments")):
-                        tool_deltas.append({
-                            "index": 0,
-                            "id": "",
-                            "function": function_call,
-                        })
-                    for tool_delta in tool_deltas:
-                        if not isinstance(tool_delta, dict):
-                            continue
-                        idx = tool_delta.get("index")
-                        key = ("tool", idx if idx is not None else 0)
-                        fn = tool_delta.get("function") or {}
-                        tool_id = tool_delta.get("id")
-                        tool_name = fn.get("name") or ""
-                        state = ensure_tool_block(key, tool_id, tool_name)
-                        arguments = fn.get("arguments") or ""
-                        if arguments:
-                            if state is None:
-                                pending_tools.setdefault(key, {
-                                    "id": tool_id or _new_id("call_"),
-                                    "name": tool_name or "",
-                                    "args": [],
-                                })["args"].append(arguments)
-                                state = ensure_tool_block(key, tool_id, tool_name)
-                            if state is not None:
-                                state["args"].append(arguments)
-                                emit("content_block_delta", {
-                                    "index": state["index"],
-                                    "delta": {
-                                        "type": "input_json_delta",
-                                        "partial_json": arguments,
-                                    },
-                                })
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            wall = int((time.time() - t_start) * 1000)
-            record_usage(model, last_usage, stream=True, elapsed_ms=wall,
-                         ttft_ms=first_ms,
-                         gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid, outcome="client_aborted")
-            return
-        except Exception as exc:
-            wall = int((time.time() - t_start) * 1000)
-            record_error(model, 502, "stream aborted: %s" % exc,
-                         elapsed_ms=wall, account=account.uid, usage=last_usage,
-                         stream=True, ttft_ms=first_ms,
-                         gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, outcome="upstream_aborted")
-            try:
-                emit("error", {"error": {"type": "api_error",
-                                          "message": "stream aborted: %s" % exc}})
-            except Exception:
-                pass
-            return
-
-        for key in list(pending_tools):
-            flush_pending_tool(key)
-        try:
-            for state in sorted(blocks.values(), key=lambda item: item["index"]):
-                if state["type"] == "thinking":
-                    # No upstream signature exists to verify this translated
-                    # reasoning block; an empty signature keeps the block
-                    # shape accepted by Anthropic SDKs.
-                    emit("content_block_delta", {
-                        "index": state["index"],
-                        "delta": {"type": "signature_delta", "signature": ""},
-                    })
-                emit("content_block_stop", {"index": state["index"]})
-            output_text = "".join(text_parts)
-            reasoning_text = "".join(reasoning_parts)
-            usage = _anthropic_usage(last_usage, input_tokens,
-                                     output_text, reasoning_text)
-            emit("message_delta", {
-                "delta": {
-                    "stop_reason": _anthropic_stop_reason(finish_reason),
-                    "stop_sequence": None,
-                },
-                "usage": {"output_tokens": usage["output_tokens"]},
-            })
-            emit("message_stop", {})
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
-        wall = int((time.time() - t_start) * 1000)
-        usage_for_record = last_usage
-        if usage_for_record is None or (usage_for_record.get("total_tokens") or 0) == 0:
-            tool_args = "".join(
-                arg for state in blocks.values() for arg in state.get("args") or []
-            )
-            generated = "".join(text_parts) + "".join(reasoning_parts) + tool_args
+        def recorded_usage():
+            if (_extract_usage(last_usage) or {}).get("total_tokens", 0) > 0:
+                return last_usage
+            generated = "".join(text_parts) + "".join(reasoning_parts) + tool_arguments()
             completion = estimate_tokens(generated)
-            usage_for_record = {
+            return {
                 "prompt_tokens": max(1, input_tokens),
                 "completion_tokens": completion,
                 "total_tokens": max(1, input_tokens) + completion,
@@ -8662,10 +8519,117 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "prompt_tokens_details": {"cached_tokens": 0},
             }
-        record_usage(model, usage_for_record, stream=True, elapsed_ms=wall,
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            if cors_origin_allowed(self.path):
+                self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            emit("message_start", {"message": {
+                "id": _new_id("msg_"), "type": "message", "role": "assistant",
+                "model": model, "content": [], "stop_reason": None,
+                "stop_sequence": None, "usage": _anthropic_usage(None, input_tokens),
+            }})
+            emit("ping", {})
+            for line in self._anthropic_upstream_lines(upstream):
+                raw = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+                chunk = json.loads(strip_data_prefix(raw))
+                if first_ms is None:
+                    first_ms = int((time.time() - t_start) * 1000)
+                usage = chunk.get("usage")
+                if usage and (last_usage is None or
+                              (usage.get("total_tokens") or 0) >=
+                              (last_usage.get("total_tokens") or 0)):
+                    last_usage = usage
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                    if reasoning:
+                        reasoning = str(reasoning)
+                        reasoning_parts.append(reasoning)
+                        simple_delta("thinking", reasoning)
+                    text = delta.get("content")
+                    if text:
+                        text = str(text)
+                        text_parts.append(text)
+                        simple_delta("text", text)
+                    tool_deltas = list(delta.get("tool_calls") or [])
+                    function_call = delta.get("function_call")
+                    if isinstance(function_call, dict) and (
+                            function_call.get("name") or function_call.get("arguments")):
+                        tool_deltas.append({"index": 0, "function": function_call})
+                    # Parallel chat tool calls may interleave. Buffer them so
+                    # each Anthropic block is emitted completely before the next.
+                    for position, tool_delta in enumerate(tool_deltas):
+                        index = tool_delta.get("index")
+                        key = index if index is not None else position
+                        tool = tools.setdefault(key, {"id": "", "name": "", "args": []})
+                        if tool_delta.get("id"):
+                            tool["id"] = tool_delta["id"]
+                        function = tool_delta.get("function") or {}
+                        if function.get("name"):
+                            tool["name"] += function["name"]
+                        if function.get("arguments"):
+                            tool["args"].append(function["arguments"])
+
+            close_block()
+            for tool in tools.values():
+                if not tool["name"]:
+                    if tool["args"]:
+                        raise RuntimeError("upstream tool call is missing its name")
+                    continue
+                index = start_block({
+                    "type": "tool_use", "id": tool["id"] or _new_id("call_"),
+                    "name": tool["name"], "input": {},
+                })
+                for argument in tool["args"] or ["{}"]:
+                    emit("content_block_delta", {
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": argument},
+                    })
+                close_block()
+            has_tools = any(tool["name"] for tool in tools.values())
+            if has_tools and finish_reason == "stop":
+                finish_reason = "tool_calls"
+            elif not has_tools and finish_reason in ("tool_calls", "function_call"):
+                finish_reason = "stop"
+            usage = _anthropic_usage(last_usage, input_tokens,
+                                     "".join(text_parts) + tool_arguments(),
+                                     "".join(reasoning_parts))
+            emit("message_delta", {
+                "delta": {"stop_reason": _anthropic_stop_reason(finish_reason),
+                          "stop_sequence": None},
+                # Replace provisional counts with the upstream totals, including
+                # cache reads. Official SDKs merge these into message_start usage.
+                "usage": usage,
+            })
+            emit("message_stop", {})
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            outcome = "client_aborted"
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "stream aborted: %s" % exc,
+                         elapsed_ms=wall, account=account.uid, usage=last_usage,
+                         stream=True, ttft_ms=first_ms,
+                         gen_ms=(wall - first_ms) if first_ms is not None else None,
+                         fp=fp, outcome="upstream_aborted", key=self._key_id())
+            try:
+                emit("error", {"error": {"type": "api_error",
+                                        "message": "stream aborted: %s" % exc}})
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            return
+        wall = int((time.time() - t_start) * 1000)
+        record_usage(model, recorded_usage(), stream=True, elapsed_ms=wall,
                      ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid)
+                     fp=fp, account=account.uid, outcome=outcome,
+                     key=self._key_id(), effort=effort)
         return
 
     def do_POST(self):
@@ -8731,12 +8695,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if is_account_route:
             return self._handle_accounts(path, payload)
-        # Both OpenAI-shaped routes below can hold a thread for up to 600s.
+        if path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
+            return self._dispatch_chat_post(path, payload)
+        # Upstream chat routes can hold a thread for up to 600s.
         # Take a slot for the duration; release it in finally so every early
         # return (including client disconnects) gives the slot back.
         if not _chat_slots.acquire(timeout=CHAT_SLOT_WAIT_SECONDS):
-            return self._error(503, "gateway is at its concurrent chat limit "
-                                    "(%d in flight); retry shortly" % MAX_CONCURRENT_CHAT)
+            fail = self._anthropic_error if is_anthropic_route else self._error
+            return fail(503, "gateway is at its concurrent chat limit "
+                             "(%d in flight); retry shortly" % MAX_CONCURRENT_CHAT)
         try:
             return self._dispatch_chat_post(path, payload)
         finally:
