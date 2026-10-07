@@ -30,3 +30,6 @@ desktop.ini
 
 # Local Docker Compose override
 docker-compose.override.yml
+
+# 本地部署变量（可能含密钥，不入库；用 .env.example 作模板）
+.env
