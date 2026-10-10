@@ -144,7 +144,7 @@ try:
     valid_max_tokens = False
 except P.AnthropicRequestError:
     valid_max_tokens = True
-check("messages requires positive max_tokens", valid_max_tokens)
+check("messages requires max_tokens", valid_max_tokens)
 count_body = P.messages_to_chat({
     "model": "m", "messages": [{"role": "user", "content": "hello"}]
 }, require_max_tokens=False)

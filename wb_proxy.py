@@ -10471,24 +10471,23 @@ def messages_to_chat(payload, require_max_tokens=True):
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list) or not raw_messages:
         raise AnthropicRequestError("messages must be a non-empty array")
-    if require_max_tokens:
-        try:
-            max_tokens = int(payload.get("max_tokens"))
-        except (TypeError, ValueError):
-            raise AnthropicRequestError("max_tokens is required and must be a positive integer")
-        if max_tokens <= 0:
-            raise AnthropicRequestError("max_tokens must be a positive integer")
-    else:
-        raw_max_tokens = payload.get("max_tokens")
-        if raw_max_tokens is None:
-            max_tokens = None
-        else:
-            try:
-                max_tokens = int(raw_max_tokens)
-            except (TypeError, ValueError):
-                raise AnthropicRequestError("max_tokens must be a positive integer")
-            if max_tokens <= 0:
-                raise AnthropicRequestError("max_tokens must be a positive integer")
+    max_tokens = payload.get("max_tokens")
+    if max_tokens is None:
+        if require_max_tokens:
+            raise AnthropicRequestError("max_tokens is required and must be a non-negative integer")
+    elif isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 0:
+        raise AnthropicRequestError("max_tokens must be a non-negative integer")
+    if require_max_tokens and max_tokens == 0:
+        # Official zero-token requests pre-warm the prompt without output.
+        # count_tokens only estimates input and does not run this mode.
+        if payload.get("stream"):
+            raise AnthropicRequestError("max_tokens=0 does not support stream=true")
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict) and str(thinking.get("type") or "").strip().lower() == "enabled":
+            raise AnthropicRequestError("max_tokens=0 does not support thinking.type=enabled")
+        choice = payload.get("tool_choice")
+        if isinstance(choice, dict) and str(choice.get("type") or "").strip().lower() in ("any", "tool"):
+            raise AnthropicRequestError("max_tokens=0 does not support forced tool_choice")
 
     messages = []
     system_parts = []
@@ -10697,13 +10696,18 @@ def chat_to_messages(chat_obj, payload=None, input_tokens=0):
         })
     usage = _anthropic_usage(chat_obj.get("usage"), input_tokens,
                              text, reasoning)
+    stop_reason = _anthropic_stop_reason(choice.get("finish_reason"))
+    if payload.get("max_tokens") == 0:
+        if content or usage["output_tokens"]:
+            raise RuntimeError("upstream generated output for max_tokens=0")
+        stop_reason = "max_tokens"
     return {
         "id": _new_id("msg_"),
         "type": "message",
         "role": "assistant",
         "model": chat_obj.get("model") or payload.get("model"),
         "content": content,
-        "stop_reason": _anthropic_stop_reason(choice.get("finish_reason")),
+        "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": usage,
     }
@@ -14475,12 +14479,15 @@ class Handler(BaseHTTPRequestHandler):
             if want_stream:
                 return self._messages_stream_response(
                     upstream, model, fp, account, t_start, input_tokens, effort)
+            chat_obj = None
             try:
                 chat_obj = aggregate_stream(_anthropic_upstream_lines(upstream), model, None)
+                result = chat_to_messages(chat_obj, payload, input_tokens=input_tokens)
             except Exception as exc:
                 record_error(model, 502, str(exc),
                              elapsed_ms=int((time.time() - t_start) * 1000),
-                             account=account.uid, key=self._key_id(), stream=False)
+                             account=account.uid, key=self._key_id(), stream=False,
+                             usage=(chat_obj or {}).get("usage"))
                 return self._anthropic_error(502,
                                              "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
@@ -14490,8 +14497,7 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=wall, ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
                          fp=fp, account=account.uid, key=self._key_id(), effort=effort)
-            return self._json(200, chat_to_messages(
-                chat_obj, payload, input_tokens=input_tokens))
+            return self._json(200, result)
 
 
     def _messages_stream_response(self, upstream, model, fp, account,

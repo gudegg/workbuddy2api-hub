@@ -64,6 +64,55 @@ class AnthropicConversionTests(unittest.TestCase):
                 self.assertEqual(body.get("reasoning_effort"), effort)
                 self.assertEqual(P.build_upstream_body(body).get("reasoning_effort"), effort)
 
+    def test_zero_token_budget_survives_conversion_and_model_defaults(self):
+        payload = request(model="deepseek-v4.1-flash", max_tokens=0)
+        original = copy.deepcopy(payload)
+        for required in (True, False):
+            with self.subTest(required=required):
+                chat = P.messages_to_chat(payload, require_max_tokens=required)
+                self.assertEqual(chat["max_tokens"], 0)
+                self.assertEqual(P.build_upstream_body(chat)["max_tokens"], 0)
+        self.assertEqual(payload, original)
+
+    def test_token_budget_rejects_negative_and_noninteger_values(self):
+        for value in (-1, False, True, 0.5, "0", [], {}):
+            for required in (True, False):
+                with self.subTest(value=value, required=required):
+                    with self.assertRaisesRegex(P.AnthropicRequestError, "max_tokens"):
+                        P.messages_to_chat(request(max_tokens=value), require_max_tokens=required)
+        with self.assertRaisesRegex(P.AnthropicRequestError, "max_tokens"):
+            P.messages_to_chat(request(max_tokens=None))
+
+    def test_zero_token_budget_rejects_options_that_require_output(self):
+        for extra in (
+            {"stream": True},
+            {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+            {"tool_choice": {"type": "any"}},
+            {"tool_choice": {"type": "tool", "name": "lookup"}},
+            {"output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}}},
+        ):
+            with self.subTest(extra=extra):
+                with self.assertRaises(P.AnthropicRequestError):
+                    P.messages_to_chat(request(max_tokens=0, **extra))
+
+    def test_zero_token_budget_accepts_nonforcing_tool_choices(self):
+        for choice in (None, {"type": "auto"}, {"type": "none"}):
+            with self.subTest(choice=choice):
+                chat = P.messages_to_chat(request(max_tokens=0, tool_choice=choice))
+                self.assertEqual(chat["max_tokens"], 0)
+
+    def test_zero_token_response_uses_the_native_empty_response_shape(self):
+        obj = {
+            "model": "synthetic-model",
+            "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 0, "total_tokens": 12},
+        }
+        message = P.chat_to_messages(obj, request(max_tokens=0))
+        self.assertEqual(message["content"], [])
+        self.assertEqual(message["stop_reason"], "max_tokens")
+        self.assertEqual(message["usage"]["input_tokens"], 12)
+        self.assertEqual(message["usage"]["output_tokens"], 0)
+
     def test_explicit_effort_respects_supported_and_fixed_catalog_values(self):
         for effort in ("low", "high", "max"):
             body = P.messages_to_chat(request(

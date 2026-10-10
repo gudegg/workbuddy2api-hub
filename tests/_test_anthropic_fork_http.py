@@ -382,6 +382,76 @@ class AnthropicHTTPTests(unittest.TestCase):
         self.assertEqual(self.forwarded, [])
         self.assertEqual(self.usage_rows(), [])
 
+    def test_zero_token_requests_forward_zero_and_record_input_only_usage(self):
+        chunk = {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 0, "total_tokens": 12,
+                      "prompt_tokens_details": {"cached_tokens": 6}},
+        }
+        self.upstream_data = ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode()
+        raw = json.dumps({
+            "model": "deepseek-v4.1-flash", "max_tokens": 0,
+            "messages": [{"role": "user", "content": "warmup"}],
+        }).encode()
+        for path in ("/v1/messages", "/messages"):
+            with self.subTest(path=path):
+                status, _, body = self.post(path=path, raw=raw)
+                self.assertEqual(status, 200, body)
+                result = json.loads(body)
+                self.assertEqual(result["content"], [])
+                self.assertEqual(result["stop_reason"], "max_tokens")
+                self.assertEqual(result["usage"]["output_tokens"], 0)
+                self.assertEqual(result["usage"]["input_tokens"], 6)
+                self.assertEqual(result["usage"]["cache_read_input_tokens"], 6)
+                self.assertEqual(self.forwarded[-1]["max_tokens"], 0)
+                row = self.usage_rows()[-1]
+                self.assertEqual(row["outcome"], "completed")
+                self.assertEqual(row["total_tokens"], 12)
+                self.assertEqual(row["completion_tokens"], 0)
+
+    def test_zero_token_request_cannot_succeed_when_upstream_generates_output(self):
+        raw = json.dumps({
+            "model": "deepseek-v4.1-flash", "max_tokens": 0,
+            "messages": [{"role": "user", "content": "warmup"}],
+        }).encode()
+        status, _, body = self.post(raw=raw)
+        self.assertEqual(status, 502, body)
+        self.assertEqual(json.loads(body)["error"]["type"], "api_error")
+        self.assertEqual(self.forwarded[0]["max_tokens"], 0)
+        rows = self.usage_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["outcome"], "failed")
+        self.assertEqual(rows[0]["total_tokens"], 20)
+
+    def test_zero_token_incompatible_options_fail_before_upstream(self):
+        for extra in (
+            {"stream": True},
+            {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+            {"tool_choice": {"type": "any"}},
+            {"tool_choice": {"type": "tool", "name": "weather"}},
+        ):
+            with self.subTest(extra=extra):
+                payload = {
+                    "model": "deepseek-v4.1-flash", "max_tokens": 0,
+                    "messages": [{"role": "user", "content": "warmup"}],
+                }
+                payload.update(extra)
+                status, _, body = self.post(raw=json.dumps(payload).encode())
+                self.assertEqual(status, 400, body)
+                self.assertEqual(json.loads(body)["error"]["type"], "invalid_request_error")
+        self.assertEqual(self.forwarded, [])
+
+    def test_count_tokens_accepts_an_explicit_zero_budget_without_upstream(self):
+        raw = json.dumps({
+            "model": "deepseek-v4.1-flash", "max_tokens": 0,
+            "messages": [{"role": "user", "content": "warmup"}],
+        }).encode()
+        status, _, body = self.post(path="/v1/messages/count_tokens", raw=raw)
+        self.assertEqual(status, 200, body)
+        self.assertGreater(json.loads(body)["input_tokens"], 0)
+        self.assertEqual(self.forwarded, [])
+        self.assertEqual(self.usage_rows(), [])
+
     def test_invalid_payload_has_anthropic_error_shape(self):
         for raw in (b"not json", b"[]", b'{"model":"deepseek-v4.1-flash","messages":[]}'):
             with self.subTest(raw=raw):

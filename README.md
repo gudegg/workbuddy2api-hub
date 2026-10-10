@@ -292,6 +292,8 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 网关原生实现 `/v1/messages`（流式与非流式）：`system`（字符串或文本块数组）、`text` / `image` / `document` / `tool_use` / `tool_result` 内容块双向转换，`tools` + `tool_choice`、`stop_sequences`、`metadata.user_id`、`thinking` / `output_config.effort` 全部映射到上游；流式输出是原生事件序列（`message_start` → `content_block_start` / `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop`）；鉴权接受 `x-api-key` 或 `Authorization: Bearer`，错误一律用 Anthropic 的错误信封。
 
+`max_tokens` 必填，接受非负整数，包括 `0`。按[官方预热规则](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)，`0` 请求不能同时设置 `stream: true`、`thinking.type: enabled` 或强制工具调用（`tool_choice.type: any/tool`）；结构化输出仍按下述边界拒绝。网关将 `0` 原样传给 WorkBuddy，成功响应为 `content: []`、`stop_reason: max_tokens`、`output_tokens: 0`，保留上游实际输入用量；上游拒绝会正常报错，若上游仍生成内容则返回 502 并记录真实消耗。缓存是否写入取决于 WorkBuddy，不提供 Anthropic 的缓存断点或 TTL 保证。
+
 边界：服务端工具（`web_search` 等）上游不支持，会被丢弃并在 system 里注明，不会伪造调用；`document` 仅支持文本来源，PDF/base64 文档与结构化输出（`output_config.format` / `output_format`）返回明确的 400 错误；思考内容保留在 reasoning 字段，响应的 thinking 签名为空，上游不提供可验证的 Claude 签名，`redacted_thinking` 不回放；`top_k`、`cache_control`、`context_management` 与 `betas` 忽略。
 
 `/v1/messages/count_tokens` 返回网关的 CJK 感知估算值，包含工具定义，图片暂按每张约 1024 tokens 估算，不按 base64 长度计数；它不调用上游，也不占用聊天并发槽。响应中的 `input_tokens` 不含缓存命中，`cache_read_input_tokens` 单独计数，`cache_creation_input_tokens` 为 0；流式结束时使用上游实际用量更新估算值，空流、上游错误或未完成的流会作为失败记录。
