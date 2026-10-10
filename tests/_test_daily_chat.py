@@ -4,11 +4,15 @@ Two channels are covered: the desktop-identity chat completion (always sent)
 and the web conversation added for issue #75/#59, whose request shape is
 pinned here so it cannot drift from what the web app actually sends.
 """
-import json, os, sys, unittest, tempfile, time
+import json, os, sys, unittest, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("ACCOUNTS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "_acc_test"))
-os.environ.setdefault("USAGE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "_use_test"))
+from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
+# Its own directories, removed when this process exits. This suite used to share
+# tests/_acc_test and tests/_use_test with _test_sanitize_fingerprint.py and
+# _test_tasks_cache.py, which made them unsafe to run at the same time and left
+# directories in the repo after a run.
+_TMP = isolated_data_dirs("wb-daily-chat-")
 
 import wb_accounts, wb_settings
 
@@ -214,7 +218,7 @@ class WebChannelTests(unittest.TestCase):
                          [r.full_url for r in calls])
 
     def test_the_web_toggle_defaults_on_and_round_trips(self):
-        directory = tempfile.mkdtemp(prefix="daily-web-")
+        directory = os.path.join(_TMP.name, "web-toggle")
         self.assertTrue(wb_settings.daily_chat_web(directory))
         self.assertFalse(wb_settings.set_daily_chat_web(directory, False))
         self.assertFalse(wb_settings.daily_chat_web(directory))

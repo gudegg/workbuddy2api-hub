@@ -1,52 +1,37 @@
 /* Drive the dashboard's per-API-key table in Node.
  *
  * The key table is the only place where the new axis meets the browser, and
- * the two things that break silently there are (a) a <td> that loses its
+ * the things that break silently there are (a) a <td> that loses its
  * data-label, which makes the row unreadable on a phone because the header
- * row is hidden at that breakpoint, and (b) a key name that reaches innerHTML
- * unescaped - names are free text typed into the panel. Neither shows up in
- * a Python test, so this drives the real functions out of dashboard.html.
+ * row is hidden at that breakpoint, (b) a key name that reaches innerHTML
+ * unescaped - names are free text typed into the panel - and (c) a per-key
+ * label that drifts onto another key's row, which a table-wide substring check
+ * cannot see because the string is still somewhere in the table. None of those
+ * shows up in a Python test, so this drives the real functions out of
+ * dashboard.html.
  *
  * Requires node (no other dependency); the rest of the suite is Python only.
  *
  *   node _test_analytics_by_key.js
  */
-const path = require('path');
-const fs = require('fs');
-const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8');
-const blocks = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-const code = blocks.join('\n');
+const {dashboardScript} = require('./_dashboard_source.js');
+const code = dashboardScript();
 
-const els = {};
-const mk = (id) => (els[id] = els[id] || {
-  id, innerHTML: '', textContent: '', value: '',
-  classList: { add(){}, remove(){}, contains(){ return false; }, toggle(){} },
-  style: {}, children: [], focus(){}, blur(){}, click(){},
-  appendChild(c){ this.children.push(c); },
-  querySelectorAll(){ return []; }, querySelector(){ return null; },
-  addEventListener(){}, setAttribute(){}, getAttribute(){ return ''; },
-  insertAdjacentHTML(){}, removeChild(){}, remove(){},
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js.
+const dom = require('./_dom_stub.js');
+const fetchCalls = [];
+dom.installDom({
+  fetch: (url, options) => {
+    fetchCalls.push({url: String(url), body: options && options.body});
+    return Promise.resolve({ ok:true, status:200, json: () => Promise.resolve({}) });
+  },
 });
-global.document = {
-  getElementById: (id) => (id ? mk(id) : null),
-  querySelectorAll: () => [], querySelector: () => null,
-  addEventListener: () => {}, createElement: (t) => mk(t + Math.random()),
-  body: mk('body'), head: mk('head'), documentElement: mk('html'),
-};
-global.window = { addEventListener(){}, location:{ href:'' }, matchMedia: () => ({ matches:false, addEventListener(){} }) };
-global.localStorage = { getItem(){return null;}, setItem(){}, removeItem(){} };
-global.sessionStorage = global.localStorage;
-global.fetch = () => Promise.resolve({ ok:true, status:200, json: () => Promise.resolve({}) });
-global.navigator = { userAgent: 'node' };
-global.setInterval = () => 0; global.clearInterval = () => {};
-global.setTimeout = () => 0; global.clearTimeout = () => {};
-global.location = { href: '', search: '', hash: '' };
-global.alert = () => {}; global.confirm = () => false;
 
 let api;
 try {
   api = new Function(code + `
-    ; return { renderKeyTable, keyRealmCell, keyModelPills };`)();
+    ; return { renderKeyTable, keyRealmCell, keyModelPills,
+               onKeyBeforeToggle, applyKeyBeforeHidden };`)();
 } catch (e) {
   console.log('LOAD ERROR:', e.message);
   process.exit(1);
@@ -93,17 +78,82 @@ check('every cell carries a data-label (the phone layout depends on it)',
       (out.match(/<td/g) || []).length === (out.match(/data-label=/g) || []).length,
       (out.match(/<td/g) || []).length + ' vs ' + (out.match(/data-label=/g) || []).length);
 check('a named key shows its name', out.includes('甲 · 生产'));
-check('a cn-bound key is labelled', out.includes('国内版'));
-check('an intl-bound key is labelled', out.includes('国际版'));
-check('a key that used both exits is flagged as mixed', out.includes('跟随 · 混合'));
-check('a key that merely follows the model is labelled plainly',
-      out.includes('>跟随<'));
-check('a disabled key says so', out.includes('已禁用'));
-check('the launcher key is attributed to the start-up argument', out.includes('启动参数'));
-check('panel keys are marked as panel keys', out.includes('面板 Key'));
-check('failures are surfaced next to the request count', out.includes('失败 1'));
-check('the credit column is fixed to two decimals', out.includes('3.50'));
-check('cache hit is rendered as a percentage', out.includes('12.5%'));
+
+// --- row-bound helpers -------------------------------------------------
+// The rendered table is the contract: "the CN key is labelled 国内版" only
+// means something if that badge sits on the CN key's row. These helpers are
+// deliberately tiny - split the rows, read one labelled cell out of one row -
+// and they match on data-label and text only, never on classes, styles or
+// attribute order, so a markup-only change stays tolerated.
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const rowsOf = (html) => html.split(/<tr[^>]*>/).slice(1).map(r => r.split(/<\/tr>/)[0]);
+const cellOf = (row, label) => {
+  const m = row.match(new RegExp('<td[^>]*data-label="' + escapeRe(label) + '"[^>]*>([\\s\\S]*?)</td>'));
+  return m ? m[1] : null;
+};
+const rowFor = (html, name) => {
+  const hits = rowsOf(html).filter(r => (cellOf(r, 'API Key') || '').includes(name));
+  return hits.length === 1 ? hits[0] : null;
+};
+const show = (row, label) => row === null ? '(no single row)' : JSON.stringify(cellOf(row, label));
+
+console.log();
+console.log('[1b] every per-key label is bound to the row it describes');
+// k2 is both cross-exit and disabled, which is why one row answers two of
+// these; the point is that each answer is read from that row and no other.
+const cnRow = rowFor(out, '甲 · 生产');
+const crossRow = rowFor(out, '乙');
+const intlRow = rowFor(out, '启动参数');
+const followRow = rowFor(out, '&lt;img');
+const beforeRow = rowFor(out, '(切换前)');
+const noKeyRow = rowFor(out, '(无 key)');
+
+check('the cn-bound key is labelled 国内版 on its own row',
+      cnRow !== null && cellOf(cnRow, '出口').includes('国内版'),
+      show(cnRow, '出口'));
+check('the intl-bound key is labelled 国际版 on its own row',
+      intlRow !== null && cellOf(intlRow, '出口').includes('国际版'),
+      show(intlRow, '出口'));
+check('the key that used both exits is flagged 跟随 · 混合 on its own row',
+      crossRow !== null && cellOf(crossRow, '出口').includes('跟随 · 混合'),
+      show(crossRow, '出口'));
+check('a key that only follows the model says 跟随 and not 混合, on its own row',
+      followRow !== null && cellOf(followRow, '出口').includes('跟随')
+      && !cellOf(followRow, '出口').includes('混合'),
+      show(followRow, '出口'));
+check('the disabled marker sits on the disabled key row',
+      crossRow !== null && cellOf(crossRow, 'API Key').includes('已禁用'),
+      show(crossRow, 'API Key'));
+check('no other key row carries the disabled marker',
+      rowsOf(out).filter(r => (cellOf(r, 'API Key') || '').includes('已禁用')).length === 1,
+      rowsOf(out).filter(r => (cellOf(r, 'API Key') || '').includes('已禁用')).length + ' row(s)');
+check('the pre-upgrade bucket row shows no exit instead of guessing one',
+      beforeRow !== null && cellOf(beforeRow, '出口').includes('—'),
+      show(beforeRow, '出口'));
+check('the no-key bucket row shows no exit either',
+      noKeyRow !== null && cellOf(noKeyRow, '出口').includes('—'),
+      show(noKeyRow, '出口'));
+// The five below used to be whole-table `includes()`, which only proved the
+// string existed somewhere in the table. Each one is a property of one key's
+// row, so each one is read out of that row's own cell: a value moved to another
+// key still leaves every string in the table, and only the row binding sees it.
+check('the launcher key is attributed to the start-up argument',
+      intlRow !== null && cellOf(intlRow, 'API Key').includes('启动参数'),
+      show(intlRow, 'API Key'));
+check('panel keys are marked as panel keys',
+      cnRow !== null && cellOf(cnRow, 'API Key').includes('面板 Key')
+      && intlRow !== null && !cellOf(intlRow, 'API Key').includes('面板 Key')
+      && noKeyRow !== null && !cellOf(noKeyRow, 'API Key').includes('面板 Key'),
+      show(cnRow, 'API Key'));
+check('failures are surfaced next to the request count',
+      cnRow !== null && cellOf(cnRow, '请求次数').includes('失败 1'),
+      show(cnRow, '请求次数'));
+check('the credit column is fixed to two decimals',
+      cnRow !== null && cellOf(cnRow, '消耗积分').includes('3.50'),
+      show(cnRow, '消耗积分'));
+check('cache hit is rendered as a percentage',
+      cnRow !== null && cellOf(cnRow, '缓存命中').includes('12.5%'),
+      show(cnRow, '缓存命中'));
 
 console.log();
 console.log('[2] the unattributed rows stay distinguishable');
@@ -112,7 +162,9 @@ check('(无 key) is rendered separately', out.includes('(无 key)'));
 check('bucket rows show no exit instead of guessing one',
       (out.match(/—<\/span><\/td>/g) || []).length === 2,
       (out.match(/—<\/span><\/td>/g) || []).length);
-check('a bucket row is never badged as disabled', !/\(切换前\)[\s\S]{0,400}?已禁用/.test(out));
+// "a bucket row is never badged as disabled" used to live here as a
+// (切换前)-then-within-400-chars regex. [1b] now states it as a property of the
+// rows themselves, which is both stronger and not dependent on a magic width.
 
 console.log();
 console.log('[3] model pills');
@@ -145,6 +197,48 @@ check('the empty state does not claim a count',
 check('a panel with no keys is told so', document.getElementById('analyticsKeyNote').innerHTML.includes('还没有任何 API Key'));
 api.renderKeyTable({});
 check('a payload without the axis at all does not throw', document.getElementById('analyticsKeyTbody').innerHTML.includes('colspan="8"'));
+
+console.log();
+console.log('[7] the (切换前) legacy row folds away on demand');
+api.renderKeyTable({ keys: keys });
+const wrap = document.getElementById('keyBeforeSwitch');
+const box = document.getElementById('keyBeforeToggle');
+check('the row is shown by default',
+      document.getElementById('analyticsKeyTbody').innerHTML.includes('(切换前)'));
+check('the switch starts off', box.checked === false);
+box.checked = true; api.onKeyBeforeToggle(box);
+out = document.getElementById('analyticsKeyTbody').innerHTML;
+check('flipping it on removes exactly that one row',
+      !out.includes('(切换前)') && (out.match(/<tr>/g) || []).length === 5,
+      (out.match(/<tr>/g) || []).length);
+check('the other unattributed buckets are left alone', out.includes('(无 key)'));
+check('the row count follows the visible rows',
+      document.getElementById('analyticsKeyCount').textContent === '(5 把)');
+check('the footer stops explaining a row that is no longer there',
+      !document.getElementById('analyticsKeyNote').innerHTML.includes('(切换前)'));
+check('the checkbox stays in sync with the state', box.checked === true);
+const saved = fetchCalls[fetchCalls.length - 1];
+check('the choice is saved server-side through the settings channel',
+      !!saved && /\/settings\/save$/.test(saved.url)
+      && JSON.parse(saved.body).key_before_hidden === true,
+      saved && (saved.url + ' ' + saved.body));
+check('nothing is written to the browser store',
+      localStorage.getItem('wb-key-hide-before') === null);
+box.checked = false; api.onKeyBeforeToggle(box);
+check('flipping it back restores the row',
+      document.getElementById('analyticsKeyTbody').innerHTML.includes('(切换前)'));
+check('the off choice is saved too, not just applied',
+      JSON.parse(fetchCalls[fetchCalls.length - 1].body).key_before_hidden === false);
+check('a payload with no such row hides the switch entirely',
+      (api.renderKeyTable({ keys: [key({ name: 'x', realm: 'cn' })] }),
+       wrap.style.display === 'none'));
+// The restore path reads the same single boolean: only a real true folds the
+// row, so a hand-edited "true" or a 1 cannot hide it by accident.
+check('only a stored boolean true folds the row',
+      api.applyKeyBeforeHidden('true') === false
+      && api.applyKeyBeforeHidden(1) === false
+      && api.applyKeyBeforeHidden(true) === true);
+api.applyKeyBeforeHidden(false);
 
 console.log();
 console.log('PASS=' + pass + ' FAIL=' + fail);

@@ -103,7 +103,51 @@ check("startIndex past the end is an error, not an empty page",
       isinstance(W.fetch("http://127.0.0.1/"), str))
 
 print()
-print("[4] the streaming path: one created frame, a real completed frame")
+print("[4] redirects cannot bypass the URL guard")
+
+redirect_handler = W._SafeRedirectHandler()
+public_request = W.urllib.request.Request("https://example.com/start")
+headers = {"Location": "/next"}
+safe_redirect = redirect_handler.redirect_request(
+    public_request, None, 302, "Found", headers, "/next")
+check("relative public redirects are resolved and allowed",
+      safe_redirect.full_url == "https://example.com/next", safe_redirect.full_url)
+
+blocked = []
+for destination in (
+        "http://127.0.0.1/admin", "http://10.0.0.5/", "http://192.168.1.1/",
+        "http://169.254.169.254/", "http://172.16.0.1/", "http://localhost/"):
+    try:
+        redirect_handler.redirect_request(
+            public_request, None, 302, "Found", {"Location": destination}, destination)
+    except W._UnsafeRedirectError:
+        blocked.append(True)
+    else:
+        blocked.append(False)
+check("loopback, private, link-local and local-name redirect targets are refused",
+      all(blocked), blocked)
+
+class RedirectingOpener(object):
+    def __init__(self, handler):
+        self.handler = handler
+
+    def open(self, req, timeout=None):
+        return self.handler.redirect_request(
+            req, None, 302, "Found", {"Location": "http://127.0.0.1/admin"},
+            "http://127.0.0.1/admin")
+
+def build_redirecting_opener(*handlers):
+    safe_handlers = [h for h in handlers if isinstance(h, W._SafeRedirectHandler)]
+    check("HTTP requests install the safe redirect handler", len(safe_handlers) == 1)
+    return RedirectingOpener(safe_handlers[0])
+
+with mock.patch.object(W.urllib.request, "build_opener", side_effect=build_redirecting_opener):
+    redirect_result = W.fetch("https://example.com/start")
+check("fetch reports a blocked redirect without opening its target",
+      "redirect blocked" in redirect_result, redirect_result)
+
+print()
+print("[5] the streaming path: one created frame, a real completed frame")
 
 TOOL_CHUNKS = [
     {"choices": [{"index": 0, "delta": {"tool_calls": [
@@ -235,7 +279,7 @@ check("the tool result was fed back",
       any(m.get("role") == "tool" for m in (opened[0].get("messages") or [])) if opened else False)
 
 print()
-print("[5] when the rounds run out the tools are withdrawn, not faked")
+print("[6] when the rounds run out the tools are withdrawn, not faked")
 
 calls = {"n": 0}
 
@@ -274,7 +318,7 @@ check("the earlier calls still carried them",
       [t.get("name") for t in (calls["bodies"][0].get("tools") or [])])
 
 print()
-print("[6] the search is visible as a card, and cited as a source")
+print("[7] the search is visible as a card, and cited as a source")
 
 SAMPLE = ("Search results for: cats" + chr(10) + chr(10)
           + "1. All About Cats" + chr(10)
@@ -300,7 +344,7 @@ check("annotations are url_citation with a span",
       all(a["type"] == "url_citation" and a["end_index"] > a["start_index"] for a in anns), anns)
 
 print()
-print("[7] the streaming answer carries the web_search_call card")
+print("[8] the streaming answer carries the web_search_call card")
 
 card = [e for e in body.split("event: ") if e.startswith("response.output_item.done")]
 check("a completed web_search_call item was emitted",
@@ -311,7 +355,7 @@ check("the three lifecycle events were sent",
       all(("event: response.web_search_call." + s) in body for s in ("in_progress", "searching", "completed")))
 
 print()
-print("[8] the non-streaming path runs the tools too, instead of leaking the call")
+print("[9] the non-streaming path runs the tools too, instead of leaking the call")
 
 CHAT_CALL = {"choices": [{"message": {"content": "", "tool_calls": [
     {"id": "call_1", "type": "function",
@@ -374,7 +418,7 @@ check("the tool result was fed back before the second call",
       seen["bodies"][0].get("messages"))
 
 print()
-print("[9] with the switch off the client's own call is forwarded, not run")
+print("[10] with the switch off the client's own call is forwarded, not run")
 
 passthrough = []
 
@@ -406,7 +450,7 @@ check("no extra upstream round was opened", passthrough == [], len(passthrough))
 check("the stream still completes", "event: response.completed" in body3, body3[-200:])
 
 print()
-print("[10] the switch: settings, injection, and no private marker upstream")
+print("[11] the switch: settings, injection, and no private marker upstream")
 
 _tmpdir = tempfile.mkdtemp(prefix="wb-webtools-")
 check("the switch is off on a fresh install",

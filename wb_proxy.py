@@ -5,8 +5,6 @@ Reuses the credentials the WorkBuddy desktop app already stored on this machine
 login is needed. Exposes:
     GET  /v1/models
     POST /v1/chat/completions     (stream=true and stream=false)
-    POST /v1/messages             (Anthropic Messages compatibility)
-    POST /v1/messages/count_tokens
     GET  /health
 Only the Python standard library is required.
     python3 wb_proxy.py                    # bind 127.0.0.1:8788
@@ -16,19 +14,40 @@ Launchers: start-wb-proxy.bat / start-wb-proxy-lan.bat on Windows,
 start-wb-proxy.command (or ./start-wb-proxy.sh) on macOS/Linux.
 """
 import argparse
+import bisect
 import hashlib
+import ipaddress
 from collections import deque
 import re
 import json
 import os
-MAX_PAYLOAD_BYTES = int(os.environ.get("WB_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
+# 单请求体上限。默认值从 50MB 收紧到 16MB，是「内存护栏」：body 先整体读成 bytes、
+# 再 decode 成 str、再 json.loads 成对象，实测 50MB body 的 decode+parse 峰值约
+# 109MB、单请求峰值约 160MB；而读 body 发生在 chat 信号量 acquire 之前、线程数又
+# 没有上限，路由器（可用内存约 480MB）上几个并发大 body 就能把机器打穿。
+# 权衡：另一条路是把 body 读取也纳入 chat 信号量，但那会改动 401/404/413 早退与
+# 503 的先后语义、并让慢客户端占着 slot 拖住信号量；只收紧默认值保守得多——16MB
+# 对正常客户端绰绰有余（Codex 1M token 上下文的 JSON 也只有几 MB），确需更大可
+# 显式设 WB_MAX_PAYLOAD_BYTES，内存代价由运维者自己拍板。
+MAX_PAYLOAD_BYTES = int(os.environ.get("WB_MAX_PAYLOAD_BYTES", 16 * 1024 * 1024))  # 16MB limit
 # Upstream chat calls may hold a handler thread for up to 600s, and every
 # request gets its own thread, so an unbounded pool lets a handful of slow
 # clients pin hundreds of threads and the memory behind them. Bound the number
 # of chat/responses requests in flight; dashboard and management calls are not
 # affected. Excess callers wait briefly, then get a 503 instead of queueing
 # forever.
-MAX_CONCURRENT_CHAT = int(os.environ.get("WB_MAX_CONCURRENT_CHAT", 32))
+#
+# The ceiling is a fixed 32 by default, which has nothing to do with how many
+# accounts the pool holds: a 200-account gateway and a 5-account gateway share
+# it. Set WB_MAX_CONCURRENT_CHAT=auto to size it from the pool instead - one
+# slot per ready account, never below 32. See resize_chat_slots().
+_CHAT_SLOTS_ENV = os.environ.get("WB_MAX_CONCURRENT_CHAT", "32").strip().lower()
+CHAT_SLOTS_AUTO = _CHAT_SLOTS_ENV in ("auto", "pool", "dynamic")
+CHAT_SLOTS_FLOOR = 32
+try:
+    MAX_CONCURRENT_CHAT = CHAT_SLOTS_FLOOR if CHAT_SLOTS_AUTO else int(_CHAT_SLOTS_ENV)
+except ValueError:
+    MAX_CONCURRENT_CHAT = CHAT_SLOTS_FLOOR
 CHAT_SLOT_WAIT_SECONDS = float(os.environ.get("WB_CHAT_SLOT_WAIT", 30))
 import socket
 import sys
@@ -38,6 +57,7 @@ import urllib.error
 import urllib.request
 import uuid
 import wb_accounts
+import wb_activity
 import wb_atrest
 import wb_catalog
 import wb_ipintel
@@ -45,7 +65,76 @@ import wb_pricing
 import wb_settings
 import wb_webtools
 import wb_identity
+import wb_prompt
+import wb_modelsdev
+import wb_probes
+import wb_updates
 IS_WINDOWS = os.name == "nt"
+
+# ---- 一键配置客户端（wb_agents）的可用性判定（issue #246）----
+# 这个功能写的是「网关进程所在机器」的客户端配置，所以只有在浏览器和网关
+# 同一台机器上打开看板时才成立。服务端 / Docker / OpenWrt 部署下看板都是
+# 远程打开的，改了也到不了用户自己的电脑，还会白白付出探测与常驻的开销。
+# 因此 wb_agents 改成懒加载：只有下面这道闸门放行、路由真的命中才 import。
+_AGENTS_MODULE = None
+_SERVER_DEPLOYMENT = None
+
+
+def agents_module():
+    """按需 import wb_agents；用不到它的部署连模块都不载入。"""
+    global _AGENTS_MODULE
+    if _AGENTS_MODULE is None:
+        import wb_agents
+        _AGENTS_MODULE = wb_agents
+    return _AGENTS_MODULE
+
+
+def server_deployment_form():
+    """进程是否明显跑在服务端形态（容器 / OpenWrt）。
+
+    只认环境标记；「看板是不是本机打开的」由 agents_client_allowed 按请求
+    来源地址判断。结果缓存——进程活着期间答案不会变。
+    """
+    global _SERVER_DEPLOYMENT
+    if _SERVER_DEPLOYMENT is None:
+        blocked = False
+        try:
+            if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+                blocked = True
+            elif os.path.exists("/proc/1/cgroup"):
+                with open("/proc/1/cgroup", encoding="utf-8", errors="replace") as fh:
+                    cgroup = fh.read().lower()
+                blocked = any(m in cgroup for m in ("docker", "containerd", "kubepods"))
+        except Exception:
+            blocked = False
+        if not blocked:
+            try:
+                if os.path.exists("/etc/openwrt_release"):
+                    blocked = True
+                elif os.path.exists("/etc/os-release"):
+                    with open("/etc/os-release", encoding="utf-8", errors="replace") as fh:
+                        blocked = "id=openwrt" in fh.read().lower()
+            except Exception:
+                blocked = False
+        _SERVER_DEPLOYMENT = blocked
+    return _SERVER_DEPLOYMENT
+
+
+def agents_client_allowed(client_address):
+    """这个来源地址能不能用一键配置：只认回环。
+
+    非回环说明看板是远程打开的（手机、另一台电脑、容器端口映射），此时
+    apply 改的是容器 / 服务器里的配置目录，需求不成立，直接按不可用处理。
+    """
+    if server_deployment_form():
+        return False
+    try:
+        addr = str(client_address[0])
+    except Exception:
+        return False
+    return addr in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+
 def launcher_hint(port):
     """Platform-appropriate launcher command for starting on another port."""
     if IS_WINDOWS:
@@ -178,6 +267,36 @@ def cors_origin_allowed(path):
 _lock = threading.Lock()
 _login_lock = threading.Lock()
 _chat_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CHAT)
+def resize_chat_slots(ready_accounts):
+    """Size the chat concurrency ceiling from the pool, when asked to.
+
+    With WB_MAX_CONCURRENT_CHAT=auto the ceiling becomes one slot per ready
+    account (never below CHAT_SLOTS_FLOOR), so the gateway scales with the pool
+    it actually has instead of a constant that fits neither a 5-account nor a
+    200-account deployment. A fixed numeric WB_MAX_CONCURRENT_CHAT keeps the
+    1.6.x behaviour and makes this a no-op.
+
+    Only ever grows the ceiling. Requests already holding a slot keep theirs -
+    replacing the semaphore cannot revoke a permit - so a shrink would let the
+    in-flight count exceed the new ceiling and the surplus releases would raise
+    ValueError from BoundedSemaphore. Growing is the direction that matters:
+    the pool is loaded once at startup, so in practice this runs before the
+    listener accepts anything.
+    """
+    global _chat_slots, MAX_CONCURRENT_CHAT
+    if not CHAT_SLOTS_AUTO:
+        return MAX_CONCURRENT_CHAT
+    try:
+        wanted = max(CHAT_SLOTS_FLOOR, int(ready_accounts or 0))
+    except (TypeError, ValueError):
+        return MAX_CONCURRENT_CHAT
+    if wanted <= MAX_CONCURRENT_CHAT:
+        return MAX_CONCURRENT_CHAT
+    MAX_CONCURRENT_CHAT = wanted
+    _chat_slots = threading.BoundedSemaphore(wanted)
+    log("chat slots : %d (one per ready account; WB_MAX_CONCURRENT_CHAT=auto)"
+        % wanted)
+    return wanted
 _login_attempts = {}  # ip -> list of timestamp
 def _prune_login_attempts(now=None, window=60):
     """Drop stale per-IP entries so the dict cannot grow without bound.
@@ -190,6 +309,85 @@ def _prune_login_attempts(now=None, window=60):
             _login_attempts[ip] = recent
         else:
             del _login_attempts[ip]
+# --------------------------------------------------- 面板登录限流的来源判定
+# 限流按「客户端 IP」分桶（每 IP 5 次失败 / 60 秒），但反代部署下 socket 对端
+# 永远不是真实客户端：路由器上 nginx 把 ai.home 转给 127.0.0.1:8788，所有请求
+# 的对端都是 127.0.0.1。若照旧拿对端地址当键，任意一个人连错 5 次密码，就会把
+# 所有经反代的用户、连同跑在同一台机器上的缓存预热器一起锁死 60 秒——实测里
+# 预热器被 429 打掉后直接打印"登录失败（http=429），跳过本轮"，缓存转冷，
+# 用户点开统计页要付一次全表扫描。所以键要取「真实来源」，且只在对端可信时
+# 才读代理头：对端是回环地址（本机代理）或显式列进 WB_TRUSTED_PROXIES 的代理
+# 时，按 X-Real-IP（优先）或 X-Forwarded-For 的第一个地址分桶；其余对端一律
+# 忽略这两个头、仍按对端地址分桶——公网客户端不能靠伪造头换个桶绕过限流。
+def parse_trusted_proxies(raw):
+    """解析 WB_TRUSTED_PROXIES：逗号分隔的 IP 或 CIDR（如 10.0.0.1,fd00::/8）。
+    解析不了的条目直接丢弃：一个笔误不该让网关起不来。
+    """
+    entries = []
+    for item in str(raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            entries.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            continue
+    return tuple(entries)
+TRUSTED_PROXIES = parse_trusted_proxies(os.environ.get("WB_TRUSTED_PROXIES", ""))
+def peer_is_trusted(peer_ip):
+    """对端是否有资格代表它的客户端说话：回环（本机反代）或显式配置的代理。"""
+    try:
+        addr = ipaddress.ip_address(str(peer_ip))
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+    for net in TRUSTED_PROXIES:
+        if addr.version == net.version and addr in net:
+            return True
+    return False
+_PROXY_HEADER_IP_MAX = 64  # 最长的 IPv6 文本也到不了 46 字符，再长就是垃圾
+def _proxy_header_ip(value):
+    """从代理头里取一个合法 IP 的规范文本；取不到返回 None（绝不抛异常）。
+
+    接受裸 IPv4/IPv6，也接受 nginx 变体可能写出的 host:port / [v6]:port；
+    多值（含逗号）、超长、其余畸形串一律判为不可用，由调用方决定回退。
+    """
+    text = str(value or "").strip()
+    if not text or len(text) > _PROXY_HEADER_IP_MAX or "," in text:
+        return None
+    if text.startswith("["):
+        end = text.find("]")
+        if end == -1:
+            return None
+        text = text[1:end]
+    elif text.count(":") == 1:
+        # v4:port 形式；裸 IPv6 至少两个冒号，不会被这里截断
+        host, _, port = text.partition(":")
+        if port.isdigit():
+            text = host
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return None
+def login_rate_limit_key(peer_ip, headers):
+    """限流键：对端可信时取代理头里的真实客户端 IP，否则取对端地址。
+
+    X-Real-IP 优先（nginx 里放的就是真实来源），其次 X-Forwarded-For 的
+    第一个（链上最左是最初的客户端）。头不可用就退回对端地址：宁可让经
+    反代的客户端共用一个桶（退化为旧行为），也不能拿解析不出来的串当键。
+    """
+    if not peer_is_trusted(peer_ip):
+        return peer_ip
+    real = _proxy_header_ip(headers.get("X-Real-IP") if headers else None)
+    if real:
+        return real
+    forwarded = (headers.get("X-Forwarded-For") if headers else None) or ""
+    first = forwarded.split(",")[0]
+    via_chain = _proxy_header_ip(first)
+    if via_chain:
+        return via_chain
+    return peer_ip
 _models_cache = {"intl": {"at": 0.0, "data": None}, "cn": {"at": 0.0, "data": None}}
 # Usage accounting: every upstream response carries a usage block, and the
 # proxy also records one JSONL line per request. Defaults to a folder next to
@@ -243,18 +441,42 @@ def _empty_stats():
             "gen_ms_sum": 0, "gen_samples": 0,
             "wall_ms_sum": 0, "wall_samples": 0}
 _usage = _empty_stats()
+def normalize_usage_cache_aliases(usage):
+    """Write the best cache-hit value into every alias.
+
+    Some responses carry the real hit in prompt_tokens_details.cached_tokens
+    while also emitting cache_read_input_tokens: 0 / cached_tokens: 0
+    compatibility aliases; strict downstream parsers may prefer the zero
+    aliases and lose the hit. Mutates and returns the usage dict.
+    """
+    if not isinstance(usage, dict):
+        return usage
+    best = _best_cached_tokens(usage)
+    if best <= 0:
+        return usage
+    usage["cache_read_input_tokens"] = best
+    usage["cached_tokens"] = best
+    usage["prompt_cache_hit_tokens"] = best
+    prompt_details = dict(usage.get("prompt_tokens_details") or {})
+    prompt_details["cached_tokens"] = best
+    usage["prompt_tokens_details"] = prompt_details
+    if isinstance(usage.get("input_tokens_details"), dict):
+        input_details = dict(usage["input_tokens_details"])
+        input_details["cached_tokens"] = best
+        usage["input_tokens_details"] = input_details
+    return usage
+
+
 def _extract_usage(usage):
     """Normalize the upstream usage block into the fields we track."""
     if not usage:
         return {}
     details = usage.get("completion_tokens_details") or {}
-    prompt_details = usage.get("prompt_tokens_details") or {}
     return {
         "prompt_tokens": usage.get("prompt_tokens") or 0,
         "completion_tokens": usage.get("completion_tokens") or 0,
         "reasoning_tokens": details.get("reasoning_tokens") or 0,
-        "cached_tokens": usage.get("prompt_cache_hit_tokens") or details.get("cached_tokens") \
-            or prompt_details.get("cached_tokens") or 0,
+        "cached_tokens": _best_cached_tokens(usage),
         "total_tokens": usage.get("total_tokens") or 0,
         "credit": usage.get("credit") or 0,
     }
@@ -388,6 +610,36 @@ def row_outcome(row):
     if o:
         return o
     return "failed" if row.get("error") else "completed"
+def _best_cached_tokens(usage):
+    """Best cache-hit value across every alias the upstreams emit (E3).
+
+    Order mirrors the panel: prompt_tokens_details.cached_tokens >
+    prompt_cache_hit_tokens > cache_read_input_tokens > cached_tokens >
+    input_tokens_details.cached_tokens > completion_tokens_details.
+    First positive value wins; zero aliases never shadow a real hit.
+    """
+    if not isinstance(usage, dict):
+        return 0
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    input_details = usage.get("input_tokens_details") or {}
+    details = usage.get("completion_tokens_details") or {}
+    for value in (prompt_details.get("cached_tokens"),
+                  usage.get("prompt_cache_hit_tokens"),
+                  usage.get("cache_read_input_tokens"),
+                  usage.get("cached_tokens"),
+                  input_details.get("cached_tokens"),
+                  details.get("cached_tokens")):
+        try:
+            number = float(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            # Token counts must stay integers: the Codex client parses
+            # response.completed strictly and rejects 123.0 (invalid number).
+            return int(number)
+    return 0
+
+
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
                 account=None, outcome="completed", key=None, effort=None):
     """Record one finished request as exactly one JSONL row.
@@ -568,13 +820,13 @@ _perf_cache = {}
 _perf_lock = threading.Lock()
 
 
-def perf_stats(sample=5000, realm=None, ttl=None, range=None, since=None, until=None):
-    """Cached wrapper: parsing thousands of rows is CPU-heavy, and the
-    dashboard polls this endpoint every few seconds.
+def _perf_stats_scope(sample, realm, range, since, until):
+    """(过滤用的 realm, since, until, 缓存键) —— perf_stats() 与它的 ETag 共用。
 
-    Rebuilds under the lock so a burst of pollers cannot each start their own
-    scan of the log."""
-    ttl = _STATS_TTL if ttl is None else ttl
+    抽出来只为一件事：取数和派生 ETag 必须走**同一套**键。两边各写一份的话，
+    只要有一处不同（比如一处 realm_scope、一处原始 realm），tag 就会落到另一条
+    缓存条目上，客户端拿到的是一个不描述当前响应体的校验符。
+    """
     r = realm_scope(realm, CURRENT_REALM)
     lo, hi = range_window(range, since, until)
     try:
@@ -586,6 +838,17 @@ def perf_stats(sample=5000, realm=None, ttl=None, range=None, since=None, until=
     except Exception:
         key = (5000, r or "all",
                lo if lo is not None else -1, hi if hi is not None else -1)
+    return r, lo, hi, key
+
+
+def perf_stats(sample=5000, realm=None, ttl=None, range=None, since=None, until=None):
+    """Cached wrapper: parsing thousands of rows is CPU-heavy, and the
+    dashboard polls this endpoint every few seconds.
+
+    Rebuilds under the lock so a burst of pollers cannot each start their own
+    scan of the log."""
+    ttl = _STATS_TTL if ttl is None else ttl
+    r, lo, hi, key = _perf_stats_scope(sample, realm, range, since, until)
     now = time.time()
     with _perf_lock:
         hit = _perf_cache.get(key)
@@ -594,6 +857,21 @@ def perf_stats(sample=5000, realm=None, ttl=None, range=None, since=None, until=
         data = _perf_stats_uncached(sample, r, since=lo, until=hi)
         _perf_cache[key] = (time.time(), data)
     return data
+
+
+def perf_stats_etag(sample=5000, realm=None, range=None, since=None, until=None):
+    """perf_stats() 当前缓存条目的 ETag；条目还不存在时返回 None。
+
+    _json_cached() 会在取数前后各调用一次并比对，两次一致才把 tag 发出去
+    （见那里的注释）。所以这里只回答"此刻这条缓存条目的戳是什么"，调用方不需要
+    自己安排调用顺序。
+    """
+    _r, _lo, _hi, key = _perf_stats_scope(sample, realm, range, since, until)
+    with _perf_lock:
+        hit = _perf_cache.get(key)
+    if hit is None:
+        return None
+    return _cache_etag("perf", repr(key), hit[0])
 
 
 def _perf_stats_uncached(sample=5000, realm=None, since=None, until=None):
@@ -619,6 +897,15 @@ def _perf_stats_uncached(sample=5000, realm=None, since=None, until=None):
     for line in rows:
         line = line.strip()
         if not line:
+            continue
+        # 廉价窗口预过滤（复用 _line_outside_window）：解析前的子串检查就能
+        # 证明落在窗口外的行不再付 json.loads 的钱。它只丢「下面的窗口判断
+        # 本来也会丢」的行，聚合口径一个数都不变；无窗口的调用（since/until
+        # 全空）连检查都不做，因此一分钱都不多花。sample_from 还没定下来的
+        # 时候也不过滤——第一行解析出来的 at 就是 sample_from 的值，跳过解析
+        # 会让它变成窗口内第一行的时间戳，报告的范围就跟着变了。
+        if (since or until) and sample_from is not None and \
+                _line_outside_window(line, since or None, until or None):
             continue
         try:
             r = json.loads(line)
@@ -973,6 +1260,1103 @@ def apply_model_daily_token_limit(refresh=False):
     return POOL.apply_model_daily_token_limit(limits, per_model)
 
 
+def apply_daily_guards(refresh=False):
+    """Push all three daily guards into the pool in one pass.
+
+    The guards share their inputs - one settings file and the same folded day
+    counters - and the request path used to call them back to back, so each
+    one re-read the settings, re-scanned (and re-copied) the same counters and
+    re-walked the pool. Here it is one settings read, one fold, three
+    publishes; each guard's own semantics are untouched: per-realm limits, the
+    free-model exemption on the credit guard, and the "no limit configured ->
+    unknown count, never park" rule (an unreadable log leaves the counts None
+    for all three, exactly as the separate calls did).
+
+    `refresh` forces the counter fold to bypass its TTL (the settings-save
+    path uses it so a limit change is visible immediately). The three
+    individual entry points stay for callers that only want one guard.
+    """
+    if POOL is None:
+        return 0
+    ttl = 0 if refresh else None
+    guards = wb_settings.limit_values_many(
+        ACCOUNTS_DIR, ("daily_token_limit", "daily_credit_limit",
+                       "model_daily_token_limit"))
+    token_limits = guards["daily_token_limit"]
+    credit_limits = guards["daily_credit_limit"]
+    model_limits = guards["model_daily_token_limit"]
+    wants = (any(v > 0 for v in token_limits.values())
+             or any(v > 0 for v in credit_limits.values())
+             or any(v > 0 for v in model_limits.values()))
+    stats = daily_usage_stats(ttl=ttl) if wants else None
+    # 池上这三个 apply_* 的返回值是它们各自的 limits 字典（不是计数），调用方
+    # 谁也没用过；这里数的是「推了几条护栏」，别拿返回值做算术。
+    published = 0
+    if any(v > 0 for v in token_limits.values()):
+        POOL.apply_daily_token_limit(
+            token_limits, stats["tokens"] if stats is not None else None)
+        published += 1
+    if any(v > 0 for v in credit_limits.values()):
+        POOL.apply_daily_credit_limit(
+            credit_limits, stats["credits"] if stats is not None else None,
+            free_models_by_realm())
+        published += 1
+    if any(v > 0 for v in model_limits.values()):
+        POOL.apply_model_daily_token_limit(
+            model_limits, stats["models"] if stats is not None else None)
+        published += 1
+    return published
+
+
+# ---------------------------------------------------------------------------
+# Remaining usage estimate
+#
+# 上游给「账号 × 模型」的免费额度是一个 24 小时窗口：窗口被用满时 429（code
+# 6004）会带上重置墙钟（intl「usage will reset at …」/ cn「将在 … 重置」），
+# 到点计数归零、额度回满。实测（2026-10-10 的 34k 行日志）：重置时刻过后几秒
+# 就又开始整额消耗（f793acc1 在 00:50:16 重置，00:50:26 起正常出流），所以
+# 「窗口起点 = 重置时刻」；把 429 那一刻往前 24h 的用量加总，跨账号得到高度
+# 一致的数字（deepseek-v4.1-flash 7 个样本 179.7M~201.0M，hy4-preview-f 两个
+# intl 样本 20.5M/22.1M），也就是该模型窗口预算的估计值——这个数字上游不给，
+# 只能在账号真的撞线时反推。
+#
+# 数据有两个来源，合并去重（键 = 账号 + 模型 + 重置时刻）：
+#   - usage/limit-events.jsonl：撞线发生的那一刻由请求路径记下（note_limit_
+#     event），带账号、模型、重置时刻与样本。**必须实时记**：一次请求的重试
+#     循环可能接连撞好几个账号，但只有最后那个账号会留下一条带账号归属的
+#     429 用量行，其余账号的撞线只在 syslog 里出现过；
+#   - usage.jsonl 里带账号的 429 行：本功能上线前就存在的历史由它补出预算，
+#     新部署时也能兜住事件文件写失败的场合。
+# 样本 = 重置前 24h 内该账号在该模型上的成功用量（429 行自身不算用量）；
+# 查询时按区域聚合（先按账号平均、再跨账号平均）得预算，再对每个账号算
+# 「自窗口起点以来的用量」：剩余 = 预算 − 已用。
+# 还在冷却（重置时刻在未来）的组合窗口已用满，剩余记 0；没有撞线记录（或记录
+# 已过期、锚不住当前窗口）的组合没有已知的重置时刻，按最近 24h 用量保守估计
+# （窗口起点必然落在最近 24h 内，所以这是剩余量的下界），并在载荷里标 estimated
+# 供面板区分。
+#
+# 分段记账：撞线后，那个窗口的记账在撞线处截断（撞线时刻之后的行不再计入——
+# 上游已经拒收，残留的行不算这个窗口的消耗）；恢复时刻起新窗口重新记账，旧
+# 窗口的用量不得计进新窗口的已用。窗口起点优先取链上上一个重置时刻（两个重置
+# 时刻相隔不到 24h 时才是同一个窗口链），否则取重置时刻 − 24h——实测窗口锚定
+# 比「固定 24h 链」复杂（有 48h+ 的空档），所以只用上游给的重置时刻这一个事实。
+# 载荷里每行带 segments（每段 start/end/used，截断段标 capped），面板按
+# 「上段 + 本段」呈现；预算样本同样按段截断（链式撞线时样本从上一个重置时刻
+# 起算，旧窗口的用量不进新窗口的样本）。
+#
+# 锚点来源除事件日志外还有凭证档的 model_caps（持久化，见 wb_accounts）：本次
+# 进程没撞过线（日志丢失/被裁）但磁盘上有记录时，冷却、窗口起点与截断点照它算。
+#
+# 按需过滤：昨天或今天没消耗过的模型不参与剩余用量计算（判定见
+# _remaining_activity_floor；撞线锚点本身算消耗证据，冷却中的组合不因旧行被裁
+# 掉就消失）。预算样本不因过滤而丢弃——它要撞线才学得到，载荷里标 active=False
+# 让面板把它标成「未参与」而不是整条消失（否则每次跨零点面板都抖）。
+# 按模型的总剩余 = 可用组的剩余之和：跨账号按 (区域, 模型) 汇总，冷却/已满的
+# 组记 0（不参与减法、不把别的组拉低），没有预算的组计入 unknown 不计数。
+#
+# 按天持久化 + 近 3 天加权（estimate-daily.json）：样本按撞线当天的本地日期
+# 分桶，估算是最近 3 天的加权平均（今天 6 / 昨天 3 / 前天 1，就近高权重，只在
+# 有样本的天之间归一；某组合 3 天内没有样本就没有预算）。今天用内存里的事件
+# 现算；更早的天在跨天时归档进文件、之后直接读——「调昨天的数据不重新计算」。
+# 归档发生在构建载荷时发现本地日期变了（或重启后第一次构建）的那一刻：把刚
+# 过去的那天算成 {预算, 分段} 合并进文件（该天已在文件里就不覆盖，幂等）。
+# 文件里每天的预算是当天样本「先按账号平均、再跨账号平均」的 {avg,min,max,n}；
+# 分段是每个 (账号, 模型) 的 pre（当天截断前用量）/ post（当天截断后用量），
+# 满足 pre + post == 当天该组合的用量（用户要的「今日截断前 / 截断后」两个数，
+# 调昨天的数据不用再算）。保留：预算留最近 3 天（与估算窗口一致），分段只留
+# 最近 2 天（用户要求「仅保留到第二天」，多留一天防跨天边界）。
+# 归档的计算在状态锁内做（要读事件表与用量缓冲），文件写盘在锁外（与
+# checkpoint 同款理由：写盘在状态锁里会构成锁序环）。
+#
+# 查询侧不做重复计算：
+#   - 每个 (账号, 模型) 的用量缓冲是**时间戳 + 累计和**两个列表，窗口
+#     求和是两次二分 + 一次相减（O(log n)），不是每次查询把上万行重新加一遍；
+#     每行只留时间戳与累计值（旧的 deque-of-tuple 是 tuple + 两个装箱数字），
+#     弱设备上省下的是实实在在的内存与遍历；
+#   - 载荷挂一个短 TTL（WB_REMAINING_TTL，默认 15 秒）——面板每 5 秒轮询一次，
+#     而数字只在用量或撞线发生时变，逐次重建是纯浪费。TTL 内直接返回上次算好的
+#     载荷，连日志尾部都不再扫；面板带 If-None-Match 轮询时命中 304，连那点
+#     JSON 也不再重传（校验符派生自缓存条目的构建时刻，与其它统计接口同款）。
+# ---------------------------------------------------------------------------
+LIMIT_WINDOW_SECONDS = 24 * 3600
+LIMIT_EVENTS_FILE = os.path.join(USAGE_DIR, "limit-events.jsonl")
+# 按天持久化的估算数据（每天的预算口径 + 每个组合的截断前后分段）。与事件
+# 日志一样必须跟随 --usage-dir：常量在 import 时按默认目录算过，漏掉它真机上
+# 会一直写 ENOENT（2026-10-10 实测 limit-events.jsonl 踩过同一个坑）。
+ESTIMATE_DAILY_FILE = os.path.join(USAGE_DIR, "estimate-daily.json")
+_ESTIMATE_SCHEMA = 1
+# 估算窗口的权重：今天 6 / 昨天 3 / 前天 1，就近高；只在有样本的天之间归一
+# （某天没样本就跳过）。
+_ESTIMATE_WEIGHTS = (6, 3, 1)
+# 保留：预算留最近这么多天（与估算窗口一致，多留无用——估算读不到）；分段
+# 只留最近 _ESTIMATE_SEGMENT_DAYS 天（用户要求「仅保留到第二天」，多留一天
+# 防跨天边界），更早的天删掉 segments 字段、预算保留到窗口外一天才整条删。
+_ESTIMATE_KEEP_DAYS = len(_ESTIMATE_WEIGHTS)
+_ESTIMATE_SEGMENT_DAYS = 2
+# 缓冲多留 2h：查询侧的窗口起点最远只能到 now-24h，留出余量避免边界丢行。
+_REMAINING_KEEP_SECONDS = 26 * 3600
+# 事件只留最近这么多条：预算估计吃的是近期样本，几十条足够，封顶防日志异常
+# 时无界增长（每条只记数字与 uid/model，一千条不到 200KB）。文件本身不裁剪，
+# 冷启动全读一遍也就几十毫秒。
+_REMAINING_MAX_EVENTS = 1000
+# 载荷缓存时长（秒）。比面板的 5 秒轮询长、远短于其它统计接口的 900 秒统计 TTL：
+# 数字最多滞后这么久，但一轮重建能服务好几轮轮询。
+_REMAINING_TTL = float(os.environ.get("WB_REMAINING_TTL", 15))
+
+_remaining_state = {
+    "events": [],          # 事件列表，src 标来源（file / log）
+    "keys": set(),         # (账号, 模型, 重置时刻) 去重
+    "usage": {},           # (uid, model) -> _pair_buffer() 的 {at,cum,head,base}
+    "log": {"offset": 0, "key": None, "tail": b""},      # usage.jsonl 的续读位
+    "file": {"offset": 0, "key": None, "tail": b""},     # limit-events.jsonl 的
+    # 内存字段（不进 checkpoint，schema 不动）：事件表当前覆盖到哪个本地日，
+    # 跨天归档的触发依据。重启后为空 -> 第一次构建按「刚过去的那天」试归档
+    # 一次（幂等；数据不在就跳过），再置为今天。
+    "day": "",
+}
+_remaining_state_lock = threading.Lock()
+# 载荷缓存（与上面的折叠状态分开两把锁：重建要持状态锁做扫描，命中缓存不该等它）。
+_remaining_cache = {"at": 0.0, "built_at": 0.0, "data": None}
+_remaining_cache_lock = threading.Lock()
+# estimate-daily.json 的解析缓存：单键元组一次赋值（(路径, mtime_ns, size),
+# days），读侧不加锁也不会看到半份缓存；写盘路径主动换掉它，外部改动靠 stat
+# 变化发现。路径也在戳里：--usage-dir 换目录后不会被旧目录的戳骗过去。
+_estimate_daily_cache = {"entry": ((None, None, None), {})}
+# 文件读-改-写串行锁：只在 _estimate_daily_sync() 里拿一次，且永远在状态锁
+# 之外（归档计算在状态锁内、写盘在锁外，同 checkpoint 的理由）。
+_estimate_daily_lock = threading.Lock()
+
+
+def _pair_buffer(state, key):
+    """The (at, cum) buffers of one (account, model), created on demand.
+
+    Two parallel lists instead of a deque of (at, tokens) tuples: window sums
+    then cost two bisections plus one subtraction over `cum`, and appends stay
+    O(1). Only the timestamps and the running sum are kept - a row's token
+    count is never read again once it is folded into `cum`, so a third list
+    would be pure memory. No new stdlib import either: the packaged runtime's
+    trim contract (portable_runtime.REQUIRED_FILES) already vouches for
+    bisect, while `array` is not in it (builtin on Windows, a shared extension
+    elsewhere) - see tests/_test_release_assets.py.
+    `head` is the first live index, `base` the token sum of everything trimmed
+    away so far - `cum` keeps counting from the very first row ever buffered,
+    so a range whose left edge falls on the first live entry has to subtract
+    `base` instead of a predecessor.
+    """
+    buf = state["usage"].get(key)
+    if buf is None:
+        buf = state["usage"][key] = {"at": [], "cum": [], "head": 0, "base": 0}
+    return buf
+
+
+def _pair_append(buf, at, tokens):
+    # coerce: a log row is free text, and these buffers only ever hold numbers
+    tokens = int(tokens)
+    buf["at"].append(float(at))
+    buf["cum"].append((buf["cum"][-1] if buf["cum"] else 0) + tokens)
+
+
+def _pair_trim(buf, cutoff):
+    """Drop entries older than `cutoff` (batched: the lists are compacted only
+    when the dead prefix is big enough to pay for the memmove)."""
+    at = buf["at"]
+    while buf["head"] < len(at) and at[buf["head"]] < cutoff:
+        buf["head"] += 1
+    if buf["head"] > 512 and buf["head"] * 2 > len(at):
+        # base 是「被裁掉前缀的累计和」的**绝对值**，不是增量：cum 从最早的一行
+        # 累计、切片不重置，所以 cum[head-1] 已经把之前裁掉的都算进去了。写成
+        # += 会让第二次压缩起把前缀重复计入，之后任何左端落在保留区之前的
+        # 区间求和都会变成负数（真机上「上段」显示过 -1293.5M）。
+        buf["base"] = buf["cum"][buf["head"] - 1]
+        del at[:buf["head"]]
+        del buf["cum"][:buf["head"]]
+        buf["head"] = 0
+
+
+def _range_sum(buf, lo, hi):
+    """Tokens of one (account, model) with lo <= at <= hi. O(log n)."""
+    if buf is None or buf["head"] >= len(buf["at"]):
+        return 0
+    at = buf["at"]
+    j = bisect.bisect_left(at, lo, buf["head"])
+    k = bisect.bisect_right(at, hi, buf["head"])
+    if k <= j:
+        return 0
+    # cum 自最早的缓冲行累计；左端落到第一个存活条目时（j 在列表头），
+    # 前面的累计值已被裁掉，只能拿 base 补回那段前缀。
+    low = buf["cum"][j - 1] if j > 0 else buf["base"]
+    return buf["cum"][k - 1] - low
+
+
+def _range_sum_open(buf, lo, hi):
+    """Tokens of one (account, model) with lo <= at < hi. O(log n).
+
+    与 _range_sum 只差右端：日界用左闭右开（恰好落在午夜那一刻的行属于后一
+    天），归档的当天用量与分段都按这个口径算，pre + post 的不变式在整秒边界
+    上也不会多算一行。
+    """
+    if buf is None or buf["head"] >= len(buf["at"]):
+        return 0
+    at = buf["at"]
+    j = bisect.bisect_left(at, lo, buf["head"])
+    k = bisect.bisect_left(at, hi, buf["head"])
+    if k <= j:
+        return 0
+    low = buf["cum"][j - 1] if j > 0 else buf["base"]
+    return buf["cum"][k - 1] - low
+
+
+
+def _merge_event(state, event, source):
+    """Add one cap event, deduplicated by (account, model, reset).
+
+    The first source to record a given cap wins: the request path's event is
+    written the moment the 429 is handled, the log-derived one only appears
+    when a scan reaches that row.
+    """
+    uid = str(event.get("account") or "")
+    model = str(event.get("model") or "")
+    try:
+        reset = float(event.get("reset") or 0)
+    except (TypeError, ValueError):
+        return
+    if not uid or not model or reset <= 0:
+        return
+    key = (uid, model, reset)
+    if key in state["keys"]:
+        return
+    state["keys"].add(key)
+    state["events"].append({
+        "at": float(event.get("at") or 0), "reset": reset, "account": uid,
+        "model": model, "realm": str(event.get("realm") or ""),
+        "sample": int(event.get("sample") or 0), "src": source,
+    })
+    if len(state["events"]) > _REMAINING_MAX_EVENTS:
+        # 从头部丢弃时同步清去重键：丢掉的键将来重新出现（重放日志）会再被
+        # 收进来，不会因为键还留着而被静默跳过。
+        dropped = state["events"][: len(state["events"]) - _REMAINING_MAX_EVENTS]
+        del state["events"][: len(dropped)]
+        for old in dropped:
+            state["keys"].discard((old["account"], old["model"], old["reset"]))
+
+
+def _drop_events(state, source):
+    """Forget the events one source contributed (its file was rewritten)."""
+    kept = [event for event in state["events"] if event["src"] != source]
+    for event in state["events"]:
+        if event["src"] == source:
+            state["keys"].discard((event["account"], event["model"], event["reset"]))
+    state["events"] = kept
+
+
+def _window_sample(usage, uid, model, reset_at, at, start=None):
+    """Usage of (uid, model) inside the window ending at `reset_at`.
+
+    `start` 覆盖默认的窗口起点（重置时刻 − 24h）：链式撞线（上一个重置时刻
+    落在 24h 之内）时窗口从上一个重置时刻起算，旧窗口的用量不进这个样本。
+    """
+    lo = reset_at - LIMIT_WINDOW_SECONDS if start is None else start
+    return _range_sum(usage.get((uid, model)), lo, at)
+
+
+def _cap_anchor(entries, at, reset):
+    """把一个撞线锚点（撞线时刻 at + 恢复时刻 reset）并进 entries。
+
+    entries 以 reset 为键去重：同一个重置时刻从事件日志与凭证档各来一份时
+    只算一个锚点；at 取两者中较晚的（这个窗口最后被观测到还在消耗的时刻，
+    截断点宁晚勿早——截早了会漏掉真实计过量的行）。
+    """
+    try:
+        at = float(at or 0)
+        reset = float(reset or 0)
+    except (TypeError, ValueError):
+        return
+    if reset <= 0:
+        return
+    old = entries.get(reset)
+    if old is None or at > old["at"]:
+        entries[reset] = {"at": at, "reset": reset}
+
+
+def _cap_anchors(events, uid, model):
+    """(账号, 模型) 的锚点表，来自事件日志里该组合的全部事件。"""
+    entries = {}
+    for event in events:
+        if event["account"] == uid and event["model"] == model:
+            _cap_anchor(entries, event["at"], event["reset"])
+    return entries
+
+
+def _cap_window_start(entries, reset):
+    """窗口起点：链上上一个重置时刻（落在 24h 内时），否则重置时刻 − 24h。
+
+    上游的窗口锚定比「固定 24h 链」复杂（实测同组合的重置时刻有 48h+ 的空
+    档），所以只用上游给的重置时刻这一个事实：上一个重置时刻落在 24h 窗口
+    之内时它就是本窗口的起点（链式撞线，旧窗口的用量不得计进新窗口）；之
+    外时窗口不超过 24h，起点取重置时刻 − 24h。
+    """
+    prev = 0.0
+    for other in entries:
+        if other < reset and other > prev:
+            prev = other
+    return max(prev, reset - LIMIT_WINDOW_SECONDS)
+
+
+def _remaining_activity_floor(now):
+    """「昨日 00:00」：本地时区里 now 所在日的前一天零点。
+
+    参与剩余用量计算的判定下界（昨天或今天有消耗才算在用）。取整天边界而
+    不是 now − 24h，因为需求写的是「昨日或当日」；同一天里这个下界不变，
+    面板因此不会在轮询之间来回抖动。
+    """
+    lt = time.localtime(now)
+    midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    return midnight - LIMIT_WINDOW_SECONDS
+
+
+def _save_account_caps(account, model, reset_at):
+    """把一个 6004 的恢复时刻写进凭证档（best-effort）。
+
+    写盘失败只影响「重启后是否记得」，不影响本次请求——真正的停用由内存里的
+    模型冷却负责，重启后的补挂交给 AccountPool.restore_model_caps()。
+    """
+    try:
+        account.save(os.path.dirname(account.path) if account.path else ACCOUNTS_DIR)
+    except Exception as exc:
+        log("account %s: model cap write failed: %s" % (account.uid[:8], exc))
+
+
+def note_limit_event(account, model, reset_at):
+    """Record a model-scoped upstream cap as it happens (429 / code 6004).
+
+    Called from the request path the moment the 429 is classified: the sample
+    is computed against the usage fold refreshed right here, because the rows
+    that led to the cap are already in the log but may not have been scanned
+    yet. Everything is best-effort - a failure to record must never break the
+    request that is already failing.
+    """
+    try:
+        uid = getattr(account, "uid", "") or ""
+        if not uid or not model or not reset_at:
+            return
+        at = time.time()
+        with _remaining_state_lock:
+            _remaining_refresh(_remaining_state)
+            anchors = _cap_anchors(_remaining_state["events"], uid, model)
+            # 凭证档里的最近一次撞线（note_model_cap 还没记这次）也能锚住窗口
+            # 起点：日志里没有上一个重置时刻时它是唯一的分段依据。
+            cap = (getattr(account, "model_caps", None) or {}).get(model)
+            if isinstance(cap, dict):
+                _cap_anchor(anchors, cap.get("at"), cap.get("reset"))
+            sample = _window_sample(_remaining_state["usage"], uid, model,
+                                    reset_at, at,
+                                    _cap_window_start(anchors, reset_at))
+        event = {
+            "at": at, "account": uid, "model": model,
+            "realm": getattr(account, "realm", "") or "",
+            "reset": float(reset_at), "sample": sample,
+        }
+        try:
+            os.makedirs(USAGE_DIR, exist_ok=True)
+            with open(LIMIT_EVENTS_FILE, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            log("limit event not persisted: %s" % exc)
+        with _remaining_state_lock:
+            _merge_event(_remaining_state, event, "file")
+    except Exception as exc:
+        log("limit event not recorded: %s" % exc)
+
+
+def _fold_remaining(row, state):
+    """Fold one usage.jsonl row into the remaining-usage state.
+
+    The row order is the log's append order, so the trim below can use each
+    row's own `at` as "now": rows only ever get newer, and a row older than
+    the retention window can never be needed again.
+    """
+    uid = row.get("account")
+    model = row.get("model")
+    if not uid or not model:
+        return
+    at = row.get("at") or 0
+    if not at:
+        return
+    key = (uid, model)
+    if row.get("status") == 429:
+        reset = parse_rate_limit_reset(str(row.get("message") or ""))
+        if reset is None:
+            return
+        # 样本按段截断：链式撞线时从上一个重置时刻起算（旧窗口的用量不进
+        # 新窗口的样本），没撞过线时就是默认的重置时刻 − 24h。
+        anchors = _cap_anchors(state["events"], uid, model)
+        _merge_event(state, {
+            "at": at, "reset": reset, "account": uid, "model": model,
+            "realm": row.get("realm") or "",
+            "sample": _window_sample(state["usage"], uid, model, reset, at,
+                                     _cap_window_start(anchors, reset)),
+        }, "log")
+        return
+    if row.get("error") or row.get("usage_missing"):
+        return
+    if row_outcome(row) == "client_aborted":
+        return
+    buf = _pair_buffer(state, key)
+    _pair_append(buf, at, row.get("total_tokens") or 0)
+    _pair_trim(buf, at - _REMAINING_KEEP_SECONDS)
+
+
+def _remaining_refresh(state):
+    """Fold both files' new rows into `state`; caller holds the state lock.
+
+    Same pass rules as the other folds: an unreadable or rewritten file resets
+    the contributions it fed instead of publishing a half-folded one. The
+    usage log is folded first so the event journal's samples (computed against
+    it at cap time) and the log-derived events describe the same buffers.
+
+    A brand-new process asks the checkpoint first: the cold scan is the only
+    cost here that grows with the log (a few MB a day), so restarting should
+    not pay it again. Missing or stale -> fold from zero, as before.
+    """
+    if state["log"].get("key") is None:
+        _usage_cache_adopt_remaining(state, _usage_log_key())
+    for source, path in (("log", USAGE_LOG), ("file", LIMIT_EVENTS_FILE)):
+        slot = state[source]
+        log_key = _usage_log_key(path)
+        if not _log_resume_ok(slot, log_key, path):
+            # 文件被换掉/截短：这个来源的贡献全部作废，从零重折。
+            state[source] = {"offset": 0, "key": log_key, "tail": b""}
+            if source == "log":
+                state["usage"].clear()
+            _drop_events(state, source)
+        fold = (lambda row: _fold_remaining(row, state)) if source == "log" \
+            else (lambda row: _merge_event(state, row, "file"))
+        offset, error = _scan_usage_from(state[source]["offset"], fold, path=path)
+        if error is None:
+            state[source]["offset"] = offset
+            state[source]["tail"] = _log_tail_signature(offset, path)
+        else:
+            log("remaining usage fold failed (%s): %s" % (source, error))
+            state[source] = {"offset": 0, "key": log_key, "tail": b""}
+            if source == "log":
+                state["usage"].clear()
+            _drop_events(state, source)
+
+
+def _budget_means(per_account):
+    """{账号: [样本]} -> {avg, min, max, n}：先按账号平均、再跨账号平均。
+
+    一个账号反复撞线只算一个样本（它自己样本的均值），所以跨账号平均称的是
+    账号而不是事件；min/max/n 都是账号均值的极值与个数（沿用既有口径）。
+    """
+    means = [int(round(sum(v) / float(len(v)))) for v in per_account.values()]
+    return {"avg": int(round(sum(means) / float(len(means)))),
+            "min": min(means), "max": max(means), "n": len(means)}
+
+
+def _estimate_budget_entry_ok(entry):
+    """归档文件里一天的口径：{avg,min,max,n} 都是数字且 n > 0 才算数。
+
+    文件在数据目录里、可能被手改或半写坏：任何一项不合形状就跳过这一天，
+    估算退化成「那天没样本」，绝不因此让载荷构建报错。
+    """
+    if not isinstance(entry, dict):
+        return False
+    if not _usage_cache_int(entry.get("n")) or entry["n"] <= 0:
+        return False
+    return all(_usage_cache_number(entry.get(field))
+               for field in ("avg", "min", "max"))
+
+
+def _estimate_day_keys(now):
+    """估算窗口的日键，就近在前：[今天, 昨天, 前天]。"""
+    return [_local_day_key(_local_midnight(now, days_back=back))
+            for back in range(_ESTIMATE_KEEP_DAYS)]
+
+
+def _estimate_daily_stamp():
+    """estimate-daily.json 的 (路径, mtime_ns, size)；文件不在时后两项为 None。
+
+    路径也在戳里：--usage-dir 换目录后，不会被旧目录的戳骗过去（两个目录里
+    恰好有 mtime/大小相同的文件几乎不可能，但也没必要赌）。
+    """
+    try:
+        st = os.stat(ESTIMATE_DAILY_FILE)
+        return (ESTIMATE_DAILY_FILE, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (ESTIMATE_DAILY_FILE, None, None)
+
+
+def _estimate_daily_read():
+    """estimate-daily.json 的 days 表；坏文件/读不到按空表处理。
+
+    按戳记忆解析结果：写盘路径主动刷新缓存，外部改动（手改、另一个进程）靠
+    stat 变化发现。这是估算的加速件，任何一步不成立都只是回到「没有归档」
+    （今天现算、更早的天跳过），绝不能因此报错。
+    """
+    stamp = _estimate_daily_stamp()
+    cached_stamp, cached_days = _estimate_daily_cache["entry"]
+    if cached_stamp == stamp:
+        return cached_days
+    days = {}
+    if stamp[1] is not None:
+        try:
+            with open(ESTIMATE_DAILY_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError, UnicodeDecodeError):
+            data = None
+        if isinstance(data, dict) and data.get("schema") == _ESTIMATE_SCHEMA \
+                and isinstance(data.get("days"), dict):
+            days = {day: record for day, record in data["days"].items()
+                    if _usage_cache_day_key_ok(day) and isinstance(record, dict)}
+    _estimate_daily_cache["entry"] = (stamp, days)
+    return days
+
+
+def _estimate_daily_write(days):
+    """原子写 estimate-daily.json（同目录 .tmp + os.replace，同 checkpoint）。"""
+    os.makedirs(USAGE_DIR, exist_ok=True)
+    tmp = ESTIMATE_DAILY_FILE + ".tmp"
+    text = json.dumps({"schema": _ESTIMATE_SCHEMA, "days": days},
+                      ensure_ascii=False, separators=(",", ":"))
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        os.replace(tmp, ESTIMATE_DAILY_FILE)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _estimate_daily_view(daily, archived):
+    """文件表 + 本次归档的内存视图：该天已在文件里就用文件里的（幂等口径）。
+
+    本次构建的估算直接读这份视图，跨天那一轮的载荷不用等下一轮才看到昨天；
+    已被持久化下来的那天不会被这次重算的值盖掉（「调昨天的数据不重新计算」）。
+    """
+    if not archived:
+        return daily
+    view = dict(daily)
+    for day, record in archived.items():
+        view.setdefault(day, record)
+    return view
+
+
+def _estimate_daily_sync(archived, now):
+    """把归档记录合并进文件、按保留策略裁剪；内容不变就不写盘。
+
+    幂等：该天已在文件里就不覆盖（重启/重复构建不会写第二遍、也不会用重算的
+    值盖掉持久化下来的值）。保留：只留估算窗口内的最近 3 天，更早的天整条
+    删掉；分段只留最近 2 天（用户要求「仅保留到第二天」，多留一天防跨天
+    边界），更早的天删掉 segments 字段、预算保留到 3 天。
+
+    写盘在状态锁外做（与 checkpoint 同款理由：写盘在状态锁里会构成锁序环），
+    用写锁串行、原子替换；失败只记日志——这是估算的加速件，不影响请求。
+    """
+    with _estimate_daily_lock:
+        days = dict(_estimate_daily_read())
+        changed = False
+        for day, record in (archived or {}).items():
+            if day not in days:
+                days[day] = record
+                changed = True
+        keep = _estimate_day_keys(now)
+        segment_days = set(keep[:_ESTIMATE_SEGMENT_DAYS])
+        pruned = {}
+        for day, record in days.items():
+            if day not in keep:
+                changed = True
+                continue
+            if day not in segment_days and record.get("segments"):
+                record = dict(record)
+                record.pop("segments", None)
+                changed = True
+            pruned[day] = record
+        if changed:
+            try:
+                _estimate_daily_write(pruned)
+            except Exception as exc:
+                log("estimate daily write failed: %s" % exc)
+        # 缓存换成刚算好的表（含本次归档与裁剪）：写失败也不重试——这份表就是
+        # 「本进程认为文件里有什么」，与 checkpoint 的「记尝试不记成功」同款。
+        _estimate_daily_cache["entry"] = (_estimate_daily_stamp(), pruned)
+
+
+def _remaining_archive_due(state, now, realm_of):
+    """跨天（或重启后第一次构建）时归档刚过去的那天。
+
+    调用方持有状态锁（归档要读事件表与用量缓冲）。返回 {日键: 记录}，没跨天
+    或没有可归档的数据返回 None。state["day"] 是内存字段、不进 checkpoint：
+    重启后为空，第一次构建按「刚过去的那天」试一次——幂等，数据不在就跳过，
+    再置为今天（无论归档成没成）。
+    """
+    today = _local_day_key(now)
+    stale = state.get("day") or ""
+    if stale == today:
+        return None
+    state["day"] = today
+    if not stale or stale >= today:
+        # 重启后为空（或时钟回拨、stale 落在未来）：按「刚过去的那天」= 昨天。
+        stale = _local_day_key(_local_midnight(now, days_back=1))
+    if stale == today:
+        return None
+    record = _remaining_archive_day(state, stale, realm_of)
+    return {stale: record} if record else None
+
+
+def _remaining_archive_day(state, day, realm_of):
+    """一天的量归档：当天样本的预算口径 + 每个组合的截断前后分段。
+
+    budgets：撞线时刻 event["at"] 落在那天的样本，先按账号平均、再跨账号
+    平均（沿用查询侧口径）。segments：那天每个 (uid, model) 的 pre/post。
+    两样都空（数据不在缓冲里 / 当天没有样本）返回 None——调用方跳过不写。
+    """
+    start = _day_key_start(day)
+    end = start + 86400
+    events = [event for event in state["events"]
+              if _local_day_key(event["at"]) == day]
+    samples = {}
+    for event in events:
+        if event["sample"] <= 0:
+            continue
+        realm = event["realm"] or realm_of.get(event["account"], "")
+        samples.setdefault((realm, event["model"]), {}) \
+               .setdefault(event["account"], []).append(event["sample"])
+    budgets = {"%s\x1f%s" % key: _budget_means(per_account)
+               for key, per_account in samples.items()}
+    segments = _remaining_archive_segments(state, events, start, end)
+    if not budgets and not segments:
+        return None
+    return {"budgets": budgets, "segments": segments}
+
+
+def _remaining_archive_segments(state, events, start, end):
+    """那天每个 (uid, model) 的截断前 / 截断后用量。
+
+    post = 恢复时刻落在当天的窗口在当天内的用量之和（从恢复时刻到「下一个
+    撞线时刻或当天结束」）；pre = 当天该组合总用量 − post（不变式：pre + post
+    == 当天该组合的用量，用缓冲的区间求和算）。两个都是 0 的组合不写。
+    """
+    caps = {}
+    for event in events:
+        caps.setdefault((event["account"], event["model"]), []).append(
+            (event["at"], event["reset"]))
+    segments = {}
+    for (uid, model), buf in state["usage"].items():
+        total = _range_sum_open(buf, start, end)
+        pair_caps = caps.get((uid, model)) or ()
+        post = 0
+        for _at, reset in pair_caps:
+            if not start <= reset < end:
+                continue
+            nxt = end
+            for other_at, _other_reset in pair_caps:
+                if reset < other_at < nxt:
+                    nxt = other_at
+            post += _range_sum_open(buf, reset, min(nxt, end))
+        if total <= 0 and post <= 0:
+            continue
+        segments["%s\x1f%s" % (uid, model)] = {"pre": total - post, "post": post}
+    return segments
+
+
+def _remaining_budgets(events, realm_of, now, daily):
+    """(realm, model) -> 近 3 天加权的窗口预算估计。
+
+    样本按撞线当天的本地日期分桶，取最近 3 天（今天/昨天/前天）：今天用内存
+    里的事件现算，更早的天直接读 estimate-daily.json 里归档好的当天口径（不
+    再重算——这就是持久化的意义）。权重就近高（今天 6 / 昨天 3 / 前天 1，见
+    _ESTIMATE_WEIGHTS），只在有样本的天之间归一，某天没样本就跳过。只有撞过
+    6004 的窗口才有样本（天然成立），某组合 3 天内没有样本就没有预算。
+
+    载荷里保留 avg/min/max/n（min/max 取各天账号均值的极值，n 为各天账号数
+    之和），并新增 days 列出各天构成（{day, w, avg, n}）供面板/排查用。
+    """
+    keys = _estimate_day_keys(now)
+    per_day = {}
+    samples = {}
+    for event in events:
+        if event["sample"] <= 0 or _local_day_key(event["at"]) != keys[0]:
+            continue
+        realm = event["realm"] or realm_of.get(event["account"], "")
+        samples.setdefault((realm, event["model"]), {}) \
+               .setdefault(event["account"], []).append(event["sample"])
+    for key, per_account in samples.items():
+        per_day.setdefault(key, {})[keys[0]] = _budget_means(per_account)
+    # 昨天/前天：直接读归档文件里当天的口径（avg/min/max/n 都是现成的）。
+    for day in keys[1:]:
+        record = (daily or {}).get(day) or {}
+        for pair_key, entry in (record.get("budgets") or {}).items():
+            if not _estimate_budget_entry_ok(entry):
+                continue
+            realm, _, model = pair_key.partition("\x1f")
+            if not model:
+                continue
+            per_day.setdefault((realm, model), {})[day] = entry
+    budgets = {}
+    for key, days in per_day.items():
+        rows = []
+        for index, day in enumerate(keys):
+            entry = days.get(day)
+            if not entry or entry.get("n", 0) <= 0:
+                continue
+            rows.append({"day": day, "w": _ESTIMATE_WEIGHTS[index],
+                         "avg": int(round(entry["avg"])), "n": int(entry["n"])})
+        if not rows:
+            continue
+        weight = sum(row["w"] for row in rows)
+        budgets[key] = {
+            "avg": int(round(sum(row["w"] * row["avg"] for row in rows)
+                             / float(weight))),
+            "min": min(int(round(days[row["day"]]["min"])) for row in rows),
+            "max": max(int(round(days[row["day"]]["max"])) for row in rows),
+            "n": sum(row["n"] for row in rows),
+            "days": rows,
+        }
+    return budgets
+
+
+def _remaining_payload(now=None, accounts=None):
+    """Per-account remaining usage against the estimated per-model budget.
+
+    Refreshes the fold and builds the payload in one pass under the state
+    lock: nothing is copied out (the buffers stay put and are read through
+    their cumulative sums), so a rebuild costs what the new rows cost plus
+    O(pairs * log n), not a re-sum of every buffered row.
+
+    Every enabled account is reported for every model that has a budget in its
+    realm, plus every model it actually used inside the retention window - an
+    account at 0 usage is the honest "full budget" answer, not noise. A pair
+    still cooling on a spent window reports remaining 0 and the reset clock
+    that hands the quota back.
+
+    Models nobody burned since yesterday 00:00 do not take part at all
+    (activity is judged per realm + model, see _remaining_activity_floor);
+    their budget samples stay in the payload marked inactive so the panel can
+    say "not counted" instead of dropping a budget it would take another cap
+    to relearn.
+
+    跨天归档：本地日期与 state["day"] 不同（或重启后为空）时，在状态锁内把
+    刚过去的那天算成 {预算, 分段}，本次构建的估算立刻把它并进视图；文件写盘
+    在锁外（见 _estimate_daily_sync）。
+    """
+    now = time.time() if now is None else now
+    if accounts is None:
+        accounts = list(POOL.accounts) if POOL else []
+    accounts = [a for a in accounts
+                if getattr(a, "enabled", True) and getattr(a, "uid", "")]
+    with _remaining_state_lock:
+        state = _remaining_state
+        _remaining_refresh(state)
+        realm_of = {a.uid: (getattr(a, "realm", "") or "") for a in accounts}
+        archived = _remaining_archive_due(state, now, realm_of)
+        daily = _estimate_daily_view(_estimate_daily_read(), archived)
+        payload = _remaining_payload_locked(state, now, accounts, realm_of, daily)
+        offset = state["log"].get("offset") or 0
+    # 归档与 checkpoint 的写盘都在锁外做（见 checkpoint 一节）：写盘要逐把读
+    # 各份状态，在状态锁里再取别的状态锁会构成锁序环。折叠失败的那次 offset
+    # 已归零，落盘函数会跳过。
+    _estimate_daily_sync(archived, now)
+    _usage_cache_maybe_save("remaining", offset)
+    return payload
+
+
+def _remaining_payload_locked(state, now, accounts, realm_of, daily):
+    """The payload itself; caller holds the state lock and has refreshed."""
+    budgets = _remaining_budgets(state["events"], realm_of, now, daily)
+    # strftime/localtime is one of the few per-row costs left (30 rows ≈ 0.12ms,
+    # 74% of the build) and rows overwhelmingly share their window start / reset
+    # clock - so format each distinct second once per payload.
+    iso_cache = {}
+
+    def iso_at(ts):
+        key = int(ts)
+        out = iso_cache.get(key)
+        if out is None:
+            out = iso_cache[key] = time.strftime("%Y-%m-%d %H:%M:%S",
+                                                 time.localtime(ts))
+        return out
+
+    # 撞线锚点：事件日志 + 凭证档里的 model_caps，按 (账号, 模型, 重置时刻)
+    # 去重——重启后日志可能丢失/被裁，凭证档里持久化的记录是那时唯一的依据；
+    # 反之凭证档写失败时日志还在。锚点决定冷却、窗口起点与截断点。
+    anchors = {}
+    for event in state["events"]:
+        _cap_anchor(anchors.setdefault((event["account"], event["model"]), {}),
+                    event["at"], event["reset"])
+    for acct in accounts:
+        caps = getattr(acct, "model_caps", None)
+        if not isinstance(caps, dict):
+            continue
+        try:
+            items = list(caps.items())
+        except RuntimeError:
+            # 恰好并发在记新撞线（note_model_cap 在另一把锁下改这张表）：
+            # 这轮少一个锚点，下一轮重建就补上，不值得为它拿别人的锁。
+            continue
+        for model, entry in items:
+            if isinstance(entry, dict):
+                _cap_anchor(anchors.setdefault((acct.uid, str(model)), {}),
+                            entry.get("at"), entry.get("reset"))
+
+    # 按需过滤：昨天或今天没消耗过的模型不参与（判定见 _remaining_activity_floor）。
+    # 消耗 = 缓冲里有行（最后一行的时间戳就是该组合最后一次用量），或撞线锚点
+    # 落在下界之后——撞线是「把窗口用满」的证据，冷却中的组合不能因为旧行被裁
+    # 掉就从面板上消失。
+    floor = _remaining_activity_floor(now)
+    active = set()
+    for (uid, model), buf in state["usage"].items():
+        realm = realm_of.get(uid)
+        if realm is None or not buf["at"]:
+            continue
+        if buf["at"][-1] >= floor:
+            active.add((realm, model))
+    for (uid, model), entries in anchors.items():
+        realm = realm_of.get(uid)
+        if realm is None:
+            continue
+        if any(max(entry["at"], entry["reset"]) >= floor
+               for entry in entries.values()):
+            active.add((realm, model))
+
+    rows = []
+    totals = {}
+    for acct in accounts:
+        uid = acct.uid
+        realm = realm_of.get(uid, "")
+        models = set(model for (r, model) in budgets
+                     if r == realm and (r, model) in active)
+        models.update(model for (u, model) in state["usage"]
+                      if u == uid and (realm, model) in active)
+        for model in sorted(models):
+            entries = anchors.get((uid, model)) or {}
+            buf = state["usage"].get((uid, model))
+            past = [e for e in entries.values() if e["reset"] <= now]
+            future = [e for e in entries.values() if e["reset"] > now]
+            last = max(past, key=lambda e: e["reset"]) if past else None
+            upcoming = min(future, key=lambda e: e["reset"]) if future else None
+            segments = []
+            if upcoming is not None:
+                # 窗口已用满：正在冷却，额度到恢复时刻才回来。这个窗口的记账
+                # 在撞线处截断——已用到撞线时刻为止（上游已经拒收，撞线之后
+                # 残留的行不算这个窗口的消耗），所以已用量≈预算，与剩余 0 对
+                # 得上。窗口起点是链上上一个重置时刻（链式撞线时），否则重
+                # 置时刻 − 24h。
+                reset_at = upcoming["reset"]
+                window_start = _cap_window_start(entries, reset_at)
+                end = min(now, upcoming["at"] or reset_at)
+                used = _range_sum(buf, window_start, end)
+                segments.append({"start": window_start, "end": end, "used": used,
+                                 "capped": True, "current": True,
+                                 "start_iso": iso_at(window_start),
+                                 "end_iso": iso_at(end)})
+                cooling = True
+                estimated = False
+            elif last is not None:
+                reset_at = last["reset"]
+                window_start = max(reset_at, now - LIMIT_WINDOW_SECONDS)
+                used = _range_sum(buf, window_start, now)
+                cooling = False
+                # 重置时刻超过 24h 的组合锚不住当前窗口：它那个窗口早已到期，
+                # 现在这个窗口的起点未知，落在最近 24h 内的用量只是下界，与
+                # 从没撞过线的组合同样标 estimated。
+                estimated = reset_at < now - LIMIT_WINDOW_SECONDS
+                if not estimated:
+                    # 分段相加：上一段（上一个窗口，在它的撞线处截断）+ 本段
+                    # （自恢复时刻起重新记账，旧窗口的用量不计进本段的已用）。
+                    if last["at"] > 0:
+                        prev_end = min(last["at"], reset_at)
+                        prev_start = _cap_window_start(entries, reset_at)
+                        segments.append({
+                            "start": prev_start, "end": prev_end,
+                            "used": _range_sum(buf, prev_start, prev_end),
+                            "capped": True, "current": False,
+                            "start_iso": iso_at(prev_start),
+                            "end_iso": iso_at(prev_end)})
+                    segments.append({"start": reset_at, "end": now, "used": used,
+                                     "capped": False, "current": True,
+                                     "start_iso": iso_at(reset_at),
+                                     "end_iso": iso_at(now)})
+            else:
+                window_start = now - LIMIT_WINDOW_SECONDS
+                used = _range_sum(buf, window_start, now)
+                reset_at = None
+                cooling = False
+                estimated = True
+            budget = budgets.get((realm, model))
+            remaining = None
+            pct = None
+            if cooling:
+                # 冷却中的组剩余记 0（没有预算也照记）：额度到恢复时刻才回来。
+                remaining = 0
+                pct = round(used * 100.0 / budget["avg"], 1) \
+                    if budget and budget["avg"] else None
+            elif budget:
+                remaining = max(0, budget["avg"] - used)
+                pct = round(used * 100.0 / budget["avg"], 1) if budget["avg"] else None
+            rows.append({
+                "uid": uid,
+                "nickname": getattr(acct, "nickname", "") or "",
+                "realm": realm,
+                "model": model,
+                "used": used,
+                "budget": budget["avg"] if budget else None,
+                "budget_min": budget["min"] if budget else None,
+                "budget_max": budget["max"] if budget else None,
+                "samples": budget["n"] if budget else 0,
+                "remaining": remaining,
+                "used_pct": pct,
+                "window_start": window_start,
+                "window_iso": iso_at(window_start),
+                "reset_at": reset_at,
+                "reset_iso": iso_at(reset_at) if reset_at else None,
+                "cooling": cooling,
+                "estimated": estimated,
+                "segments": segments,
+            })
+            # 按模型总剩余 = 可用组的剩余之和：冷却/已满的组 remaining 本身就是
+            # 0（只加不减，绝不把别的组拉低），没有预算的组计入 unknown 不计数。
+            total = totals.get((realm, model))
+            if total is None:
+                total = totals[(realm, model)] = {
+                    "realm": realm, "model": model, "total_remaining": None,
+                    "budget": budget["avg"] if budget else None,
+                    "pairs": 0, "available": 0, "cooling": 0,
+                    "unknown": 0, "estimated": 0,
+                }
+            total["pairs"] += 1
+            if cooling:
+                total["cooling"] += 1
+            if estimated:
+                total["estimated"] += 1
+            if remaining is None:
+                total["unknown"] += 1
+            else:
+                total["total_remaining"] = (total["total_remaining"] or 0) + remaining
+                if not cooling:
+                    total["available"] += 1
+    rows.sort(key=lambda r: (r["remaining"] is None,
+                             r["remaining"] if r["remaining"] is not None else 0,
+                             r["realm"], r["nickname"], r["model"]))
+    return {
+        "window_seconds": LIMIT_WINDOW_SECONDS,
+        "generated_at": now,
+        "generated_iso": iso_at(now),
+        "activity_floor": floor,
+        "activity_floor_iso": iso_at(floor),
+        "budgets": [dict(budget, realm=realm, model=model,
+                         active=(realm, model) in active)
+                    for (realm, model), budget in sorted(budgets.items())],
+        "models": sorted(totals.values(),
+                         key=lambda m: (m["total_remaining"] is None,
+                                        -(m["total_remaining"] or 0),
+                                        m["realm"], m["model"])),
+        "rows": rows,
+    }
+
+
+def remaining_usage(ttl=None):
+    """Cached payload: the panel polls every 5s, the numbers change far slower.
+
+    Within the TTL the last payload is returned as is - no rescan of either
+    file, no rebuild - which is what makes the 5s polling cost nothing between
+    rebuilds. The TTL is deliberately short (WB_REMAINING_TTL, 15s default):
+    long enough to serve several polls per rebuild, short enough that a cap or
+    a burst of usage shows up while the operator is looking at the panel.
+    """
+    ttl = _REMAINING_TTL if ttl is None else ttl
+    now = time.time()
+    with _remaining_cache_lock:
+        entry = _remaining_cache
+        if entry["data"] is not None and (now - entry["at"]) < ttl:
+            return entry["data"]
+    # 重建在缓存锁外：它自己会拿状态锁扫描，命中等它的调用不该被拖住。
+    data = _remaining_payload()
+    with _remaining_cache_lock:
+        _remaining_cache.update({"at": time.time(), "built_at": time.time(),
+                                 "data": data})
+    return data
+
+
+def remaining_usage_etag():
+    """ETag of the current /usage/remaining cache entry, or None.
+
+    与 usage_by_account_etag() 同款：键是常量（这个视图只有一条缓存），配对
+    调用由 _json_cached() 保证。轮询在 TTL 内命中同一份载荷 → 同一枚校验符
+    → 304；重建后自动换戳。
+    """
+    with _remaining_cache_lock:
+        entry = _remaining_cache
+        if entry["data"] is None:
+            return None
+        built_at = entry["built_at"]
+    return _cache_etag("remaining", "all", built_at)
+
+
+# ---------------------------------------------------------------------------
+# 剩余用量优先调度（开关默认关，见 wb_settings.remaining_priority_enabled）
+#
+# 「快达到估计限额的 (账号, 模型) 先被交出」：估计剩余占预算的比例越小权重
+# 越高，分派侧（AccountPool._pick_remaining_first）只对权重 > 1 的组合做平滑
+# 加权轮询。分档而不是线性：面板上说得清（剩不到 30% 开始加权、5% 以内最重），
+# 测试里也钉得住确切数字。权重表由请求路径每请求推给池——数据方向与
+# apply_daily_* 一致，池不反向依赖本模块。
+# ---------------------------------------------------------------------------
+_REMAINING_PRIORITY_BANDS = ((0.05, 4), (0.15, 3), (0.30, 2))
+
+
+def _remaining_schedule_weight(remaining, budget):
+    """估计剩余对应的调度权重：1 = 不加权，2..4 = 越接近耗尽越重。
+
+    没有可比较的尺度时不猜：预算样本缺失（budget 为 None/0）或剩余未知
+    （remaining 为 None）一律不加权。剩余 <= 0 也不加权——它没有「先用掉」
+    的意义（真正用满的组合正在冷却，本来就不可用；estimated 口径下它只是
+    下界，不值得把流量往一个可能已经耗尽的组合上压）。
+    """
+    try:
+        remaining = float(remaining)
+        budget = float(budget)
+    except (TypeError, ValueError):
+        return 1
+    if remaining <= 0 or budget <= 0:
+        return 1
+    ratio = remaining / budget
+    for ceiling, weight in _REMAINING_PRIORITY_BANDS:
+        if ratio <= ceiling:
+            return weight
+    return 1
+
+
+def remaining_priority_enabled():
+    """优先调度开关（默认关）。"""
+    return wb_settings.remaining_priority_enabled(ACCOUNTS_DIR) is True
+
+
+def remaining_schedule_weights():
+    """{(uid, model): 权重}：估计剩余接近耗尽的组合，权重 > 1。
+
+    只读剩余估算载荷的既有字段（rows 的 uid / model / remaining / budget），
+    不碰折叠与预算的实现。载荷自带短 TTL：面板在轮询时本来就维持着它，请求
+    路径这里拿到的基本都是缓存，重建只发生在 TTL 到点时（与面板同款成本）。
+    best-effort：任何失败都只意味着这一次不加权，绝不能连累请求本身。
+    """
+    try:
+        payload = remaining_usage()
+        weights = {}
+        for row in payload.get("rows") or []:
+            weight = _remaining_schedule_weight(row.get("remaining"),
+                                                row.get("budget"))
+            if weight > 1:
+                weights[(row.get("uid") or "", row.get("model") or "")] = weight
+        return weights
+    except Exception as exc:
+        log("remaining priority weights unavailable: %s" % exc)
+        return {}
+
+
 _free_models_cache = {"at": 0.0, "data": None}
 _FREE_MODELS_TTL = 60.0
 
@@ -1020,6 +2404,20 @@ def free_models_by_realm():
     return out
 
 
+def _usage_snapshot_scope(realm, range, since, until):
+    """(过滤用的 realm, since, until, 缓存键) —— usage_snapshot() 与它的 ETag 共用。
+
+    同 _perf_stats_scope()：键只允许有一个来源，否则 ETag 可能指向另一条缓存。
+    """
+    r = realm_scope(realm, CURRENT_REALM)
+    lo, hi = range_window(range, since, until)
+    # Bounds, not a today/all flag: this week and this month overlap, so a
+    # flag would let one window serve the other's totals from the cache.
+    key = "%s|%s|%s" % (r or "all",
+                        lo if lo is not None else "", hi if hi is not None else "")
+    return r, lo, hi, key
+
+
 def usage_snapshot(realm=None, ttl=None, range=None, since=None, until=None):
     """Cached wrapper: the dashboard polls this every few seconds.
 
@@ -1029,20 +2427,28 @@ def usage_snapshot(realm=None, ttl=None, range=None, since=None, until=None):
     of the same file.
     """
     ttl = _STATS_TTL if ttl is None else ttl
-    r = realm_scope(realm, CURRENT_REALM)
-    lo, hi = range_window(range, since, until)
+    r, lo, hi, key = _usage_snapshot_scope(realm, range, since, until)
     now = time.time()
     with _snap_lock:
-        # Bounds, not a today/all flag: this week and this month overlap, so a
-        # flag would let one window serve the other's totals from the cache.
-        key = "%s|%s|%s" % (r or "all",
-                            lo if lo is not None else "", hi if hi is not None else "")
         hit = _snap_cache.get(key)
         if hit is not None and (now - hit[0]) < ttl:
             return hit[1]
         data = _usage_snapshot_uncached(r, since=lo, until=hi)
         _snap_cache[key] = (time.time(), data)
     return data
+
+
+def usage_snapshot_etag(realm=None, range=None, since=None, until=None):
+    """usage_snapshot() 当前缓存条目的 ETag；条目不存在时返回 None。
+
+    配对调用（取数前后各一次、一致才发）由 _json_cached() 负责，理由见那里。
+    """
+    _r, _lo, _hi, key = _usage_snapshot_scope(realm, range, since, until)
+    with _snap_lock:
+        hit = _snap_cache.get(key)
+    if hit is None:
+        return None
+    return _cache_etag("usage", key, hit[0])
 
 
 def _fold_cost(bucket, cost, model):
@@ -1061,80 +2467,587 @@ def _fold_cost(bucket, cost, model):
         missing[mid] = missing.get(mid, 0) + 1
 
 
+# ---------------------------------------------------------------------------
+# Incremental all-time aggregates
+#
+# The dashboard's all-time panels used to re-read the whole usage.jsonl on
+# every cache miss, and the log grows by thousands of rows a day. Those totals
+# only change when a row is appended, so each aggregate keeps the byte offset
+# it has already folded and a refresh reads just the rows past it - the shape
+# daily_usage_stats() already uses for today's counters, truncation guard
+# included. A windowed query still walks the file, but the pre-filter above
+# drops out-of-window lines before the parse, so it pays only for the rows it
+# keeps.
+#
+# A carried-over total is only valid while everything the fold read is
+# unchanged, so a state also carries a fingerprint of its other inputs: the
+# price tables (a new policy can re-price a row that has no reference of its
+# own) and the realm a row without a realm field is attributed to. When one of
+# those moves, the fold starts over - an offset alone would happily keep
+# yesterday's prices forever.
+#
+# One state per realm and per aggregate: each holds a few models and a few
+# accounts, so keeping one around costs nothing next to the scan it replaces.
+# ---------------------------------------------------------------------------
+
+# What wb_pricing hands back while its file is missing. Without these, every
+# call would get a fresh empty dict, the identity test below would never
+# match, and a deployment with no price files would rescan on every refresh.
+_EMPTY_POLICIES = {}
+_EMPTY_TIMELINE = []
+
+
+def _usage_log_key(path=None):
+    """(size, device, inode) of the usage log, or a zero key when it is gone.
+
+    One stat answers both questions an incremental fold has to ask. The size
+    says whether the bytes the cached offset counted are still there: a
+    shorter file was truncated, or replaced by a shorter one. The device and
+    inode say whether it is still the same file at all - a log copied over in
+    place keeps its inode and is caught by the size test, while one moved into
+    position is a different file and a stale offset would point into the
+    middle of unrelated rows.
+
+    `path` defaults to the usage log; the remaining-usage fold keys its own
+    event journal with the same rule.
+    """
+    try:
+        info = os.stat(path or USAGE_LOG)
+        return (info.st_size, info.st_dev, info.st_ino)
+    except OSError:
+        return (0, 0, 0)
+
+
+def _log_offset_holds(previous, current, offset):
+    """True when `offset` still sits inside the file `previous` described.
+
+    False means the cached fold counted bytes that are gone or belong to a
+    different file now, so it has to start over.
+    """
+    return (previous is not None
+            and previous[1] == current[1] and previous[2] == current[2]
+            and current[0] >= offset)
+
+
+# How many bytes of the already-counted prefix are read back on every
+# refresh to prove that prefix still holds the same bytes. Long enough
+# that a rewrite cannot match it by accident, short enough to cost
+# nothing on the poll path.
+_TAIL_SIGNATURE = 64
+
+
+def _log_tail_signature(offset, path=None):
+    """The last bytes before `offset`, or None when they cannot be read.
+
+    An incremental fold assumes the bytes it has already counted are still
+    there. Size and inode catch a log that was replaced or cut short, but
+    not one that was emptied in place and has since grown past the old
+    offset: same file, only longer, which is what truncating the log - or
+    a log rotation with copytruncate - leaves behind. Reading the seam back
+    is what tells those apart, because an append leaves it alone and a
+    rewrite does not.
+    """
+    if offset <= 0:
+        return b""
+    try:
+        with open(path or USAGE_LOG, "rb") as fh:
+            start = max(0, offset - _TAIL_SIGNATURE)
+            fh.seek(start)
+            return fh.read(offset - start)
+    except OSError:
+        return None
+
+
+def _log_resume_ok(state, log_key, path=None):
+    """True when the cached offset still sits on the log's current prefix.
+
+    False means the fold cannot be carried over: the file shrank, it is a
+    different file, or the bytes it counted were rewritten under it.
+    """
+    if not _log_offset_holds(state["key"], log_key, state["offset"]):
+        return False
+    return _log_tail_signature(state["offset"], path) == state["tail"]
+
+
+def _pricing_inputs(pricing_on=None):
+    """Everything cost_for_row() reads besides the row itself.
+
+    Identity, not equality: wb_pricing caches each of these behind its own
+    file key, so an edited file hands back a different object, and comparing
+    identities keeps the check off the refresh path - walking the whole price
+    table to notice a change would cost more than the change does. Holding the
+    objects here is also what makes the test sound: a live object cannot have
+    its id handed to a replacement.
+
+    With the master switch off cost_for_row() never opens a table at all, so
+    the flag is the whole input. It is read through the same no-argument
+    call cost_for_row() makes - passing a directory here would answer from
+    a different settings file whenever the two disagree, and the fingerprint
+    would then watch an input the fold never read.
+    """
+    # pricing_on 由调用方传入时不再自己问一次总开关：一次扫描里它只该被问一次
+    # （见 _usage_snapshot_uncached / _compute_usage_analytics_uncached），指纹
+    # 与折叠读到的因此是同一个值。
+    try:
+        if not (wb_pricing.pricing_enabled() if pricing_on is None else pricing_on):
+            return (False, None, None, None)
+        return (True,
+                wb_pricing.load_policies() or _EMPTY_POLICIES,
+                wb_pricing.load_timeline() or _EMPTY_TIMELINE,
+                wb_pricing.load_pricing())
+    except Exception as exc:
+        log("pricing inputs unreadable: %s" % exc)
+        return None
+
+
+def _pricing_unchanged(previous, current):
+    """True when two _pricing_inputs() tuples describe the same prices."""
+    if previous is None or current is None:
+        return False
+    return (previous[0] == current[0] and previous[1] is current[1]
+            and previous[2] is current[2] and previous[3] is current[3])
+
+
+def _realm_inputs():
+    """What row_realm() consults for a row that carries no realm field.
+
+    Rows written before the field existed - an error row with no account - are
+    attributed to the account that served them, or to the model's home realm.
+    Importing or dropping an account can therefore move such a row from one
+    exit to the other, and a cached aggregate must not outlive that.
+
+    这两样（当前出口 + uid→realm 归属）从**磁盘**同步读，而不是从活账号池的
+    内存映射读。池是启动时从同一份磁盘加载的快照，但「它什么时候加载完」会让
+    同一个进程在不同时刻算出不同的指纹：重启后第一刻的进程算出的是启动期那
+    一份，于是刚写下的 checkpoint 反而被判无效——而那正是它存在的意义（重启
+    后免冷扫）。从磁盘读，任何时刻、任何进程算出来都一样。
+
+    池仍然要查，但只作为「这次折叠能不能被冷进程复现」的判据（见
+    _realm_fold_reproducible），不再进指纹的值。
+    """
+    disk = _account_realm_map()
+    if disk is None:
+        return None
+    return (CURRENT_REALM, disk)
+
+
+_realm_disk_cache = {"key": None, "map": None}
+_realm_disk_lock = threading.Lock()
+
+
+def _account_files_key(directory):
+    """账号目录的便宜指纹：文件名 + (size, mtime)；读不到返回 None。"""
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith(".json"))
+    except OSError:
+        return None
+    entries = []
+    for name in names:
+        try:
+            info = os.stat(os.path.join(directory, name))
+        except OSError:
+            return None
+        entries.append((name, info.st_size, info.st_mtime_ns))
+    return (directory, tuple(entries))
+
+
+def _account_realm_map(directory=None):
+    """账号文件里的 uid→realm 映射（排序后的元组）；读不到返回 None。
+
+    用账号池自己的加载器推导，而不是在这里复制一份 uid/realm 解析逻辑：复制
+    出来的那份迟早会和 Account 里的逻辑漂移，而漂移意味着指纹描述的东西和
+    折叠读的东西不再是同一个。整份读一次的开销由缓存键挡着——目录下每个
+    *.json 的名字/size/mtime 都没变就直接用上次的结果。
+    """
+    directory = ACCOUNTS_DIR if directory is None else directory
+    key = _account_files_key(directory)
+    if key is None:
+        return None
+    with _realm_disk_lock:
+        cached = _realm_disk_cache
+        if cached["key"] == key:
+            return cached["map"]
+    try:
+        pool = wb_accounts.AccountPool(directory, log=None)
+        pool.load()
+        value = tuple(sorted((a.uid, a.realm) for a in pool.accounts if a.uid))
+    except Exception as exc:
+        log("account realm map unreadable: %s" % exc)
+        return None
+    with _realm_disk_lock:
+        _realm_disk_cache.update({"key": key, "map": value})
+    return value
+
+
+def _realm_fold_reproducible(disk):
+    """这次折叠用的归属，冷启动的进程能不能按同一份磁盘原样复现。
+
+    折叠读的是活账号池，指纹读的是磁盘。两者一致（正常情况：池就是启动时从
+    这份磁盘加载的）时没有疑问；磁盘被改过、池还没重载时两者会短暂不一致，
+    那种折叠写下的 checkpoint 会被冷进程按新归属当成有效，所以不写。池整个
+    不存在时折叠根本不查账号映射——只有磁盘上也没有账号，两边才一致。
+    """
+    if POOL is None:
+        return not disk
+    try:
+        pool = tuple(sorted((a.uid, a.realm) for a in POOL.accounts))
+    except Exception as exc:
+        log("realm inputs unreadable: %s" % exc)
+        return False
+    return pool == disk
+
+
+def _scan_usage_from(offset, fold, stop_at=None, skip=None, path=None):
+    """Fold every row past `offset` into `fold(row)`; returns (offset, error).
+
+    The offset handed back is the end of the last row the pass got through.
+    Rows are appended whole, so a line without its trailing newline is left
+    for the next pass rather than half-parsed - the rule _scan_daily_usage()
+    follows.
+
+    `skip(line)` drops a line before the parse; the windowed readers pass
+    _line_outside_window() here, so a line the range excludes costs a substring
+    search instead of a json.loads.
+
+    `stop_at` caps the read at the offset an all-time fold has already covered,
+    so a windowed payload built on top of that fold describes exactly the same
+    bytes as its all-time half.
+
+    `path` defaults to the usage log; the remaining-usage fold folds its own
+    event journal through the same pass rules.
+
+    The log is read in binary and the offset advances by the length of each
+    line: a tell() per line costs more than the parse it would be tracking,
+    and an offset only has to be a byte count. Each line is decoded to text
+    before it is looked at, which is the order the text-mode readers read in
+    and the one the pre-filter expects.
+
+    `error` is the exception that stopped the read, or None. A row the fold
+    cannot swallow ends the pass exactly where it used to - the readers have
+    always kept what they had folded so far - and the caller reports it with
+    its own label. The offset handed back with an error is the end of that
+    row: the fold may have half applied it before it raised, so the caller
+    starts its own fold over instead of resuming after it, while a windowed
+    pass built on the state still sees the row - and stops there - so the
+    two halves keep describing the same bytes.
+    """
+    if stop_at is not None and offset >= stop_at:
+        return offset, None
+    try:
+        with open(path or USAGE_LOG, "rb") as fh:
+            fh.seek(offset)
+            while True:
+                if stop_at is not None and offset >= stop_at:
+                    break
+                raw = fh.readline()
+                if not raw:
+                    break
+                if not raw.endswith(b"\n"):
+                    break
+                end = offset + len(raw)
+                if stop_at is not None and end > stop_at:
+                    # The line straddles the covered bytes, so the all-time
+                    # fold never saw it either: leave it out of this pass too.
+                    break
+                try:
+                    # Decoded before anything else, exactly as the text-mode
+                    # readers do: a line no reader can decode stops them where
+                    # it stands, so it stops this pass too rather than letting
+                    # it count rows the full scan never reached. Stripping the
+                    # text (not the bytes) keeps the two agreeing on what
+                    # counts as an empty line.
+                    line = raw.decode("utf-8").strip()
+                except UnicodeDecodeError as exc:
+                    return end, exc
+                if not line:
+                    offset = end
+                    continue
+                if skip is not None and skip(line):
+                    offset = end
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    offset = end
+                    continue
+                try:
+                    fold(row)
+                except Exception as exc:
+                    return end, exc
+                offset = end
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        return offset, exc
+    return offset, None
+
+
+def _copy_usage_bucket(bucket):
+    """Copy one by_model* bucket, its accounts dict included."""
+    out = dict(bucket)
+    out["accounts"] = dict(bucket["accounts"])
+    return out
+
+
+def _copy_usage_snapshot(snap):
+    """A snapshot copy the caller may decorate and hand out.
+
+    The fold is cached and shared, so what leaves this module is a copy - the
+    same reason _daily_state_copy() exists for the daily counters. Only the
+    three per-model views nest; every other value is a scalar.
+    """
+    out = dict(snap)
+    out["cost_missing"] = dict(snap["cost_missing"])
+    out["by_model"] = {m: _copy_usage_bucket(b) for m, b in snap["by_model"].items()}
+    out["by_model_realm"] = {m: {rr: _copy_usage_bucket(b) for rr, b in realms.items()}
+                             for m, realms in snap["by_model_realm"].items()}
+    out["by_model_acct"] = {
+        m: {rr: {acct: _copy_usage_bucket(b) for acct, b in accts.items()}
+            for rr, accts in realms.items()}
+        for m, realms in snap["by_model_acct"].items()}
+    return out
+
+
+def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None):
+    """Fold one parsed row into a usage snapshot.
+
+    One definition for both callers: the all-time fold (fed only the rows past
+    its offset) and the windowed one (fed the whole file, out-of-window lines
+    dropped before the parse). The realm and window tests come first, so every
+    total below - requests, tokens, per-model and per-account breakdowns -
+    describes the same slice of the log.
+
+    pricing_on 是本次扫描开头问过一次的总开关：聚合只读 known/cny（_fold_cost
+    再读 disabled），悬停明细构造出来就被丢掉，所以整扫不建明细、开关也不逐行
+    重问。代价是设置改动从下一次扫描起生效；逐行展示路径不受影响，仍然每行
+    查、改设置当场可见。
+
+    `also` 是同一行还要折进的第二份同形状快照（按日分桶的窗口半）。过滤、
+    算价与字段提取只做一次，两份各自累加：折叠本来就要求两侧各记一笔，而
+    cost_for_row 与 realm 判定是每行最贵的那部分，只该付一次。
+    """
+    if r and not row_matches_realm(row, r):
+        return
+    at = row.get("at") or 0
+    if since and at < since:
+        return
+    if until and at > until:
+        return
+    outcome = row_outcome(row)
+    # Each row is priced against the version that was in force when it
+    # happened, so a later price change cannot rewrite yesterday's totals.
+    cost = wb_pricing.cost_for_row(row, details=False, enabled=pricing_on)
+    model = row.get("model")
+    targets = (snap,) if also is None else (snap, also)
+    if outcome != "completed":
+        for tgt in targets:
+            tgt["errors"] += 1
+            # Credit is money already spent: a request that failed after the
+            # upstream had billed for it still consumed credit, so it is summed
+            # here exactly like the analytics page sums it. Token totals keep
+            # the completed-only rule this page has always used, and a client
+            # abort is skipped because its usage block is incomplete.
+            if outcome != "client_aborted":
+                tgt["credit"] += (row.get("credit") or 0)
+                _fold_cost(tgt, cost, model)
+        return
+    # Read each tracked field once: the row lands in four buckets below and
+    # every one of them walks the same fields.
+    present = [(k, row[k] or 0) for k in USAGE_FIELDS if k in row]
+    m = model or "unknown"
+    rr = row_realm(row)
+    acct_id = row.get("account")
+    acct_key = acct_id or "(unattributed)"
+    known = cost["known"]
+    cny = cost["cny"] if known else 0.0
+    for tgt in targets:
+        tgt["requests"] += 1
+        for k, value in present:
+            tgt[k] += value
+        _fold_cost(tgt, cost, model)
+        per = tgt["by_model"].setdefault(m, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
+        per_realm = tgt["by_model_realm"].setdefault(m, {}).setdefault(
+            rr, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
+        per_acct = (tgt["by_model_acct"].setdefault(m, {})
+                    .setdefault(rr, {})
+                    .setdefault(acct_key, {"requests": 0, "accounts": {},
+                                           "cost_cny": 0.0,
+                                           **{k: 0 for k in USAGE_FIELDS}}))
+        for bucket in (per, per_realm, per_acct):
+            bucket["requests"] += 1
+            for k, value in present:
+                bucket[k] += value
+            if known:
+                bucket["cost_cny"] += cny
+            if acct_id:
+                accounts = bucket["accounts"]
+                accounts[acct_id] = accounts.get(acct_id, 0) + 1
+
+
+_usage_snap_state = {}
+_usage_snap_state_lock = threading.Lock()
+
+
+def _usage_snap_state_ready(r, pricing_on):
+    """把 `r` 的 all-time 折叠推进到文件尾；返回 (state, offset, error)。
+
+    调用方必须已持有 _usage_snap_state_lock。日桶与 all-time 折叠共用这一次
+    扫描（见 _fold_usage_snapshot 的 also），所以窗口半与 all-time 半描述的
+    永远是同一段字节——这正是旧实现用 stop_at 想保证的事。
+    """
+    state = _usage_snap_state.get(r)
+    if state is None:
+        state = _usage_snap_state[r] = {"snap": None, "offset": 0, "key": None,
+                                        "pricing": None, "realm": None,
+                                        "tail": b"", "days": {}, "days_floor": None}
+    pricing = _pricing_inputs(pricing_on)
+    realm = _realm_inputs()
+    log_key = _usage_log_key()
+    if state["snap"] is None:
+        # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+        if not _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
+            state.update({"snap": _empty_stats(), "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
+    elif (not _pricing_unchanged(state["pricing"], pricing)
+            or state["realm"] != realm
+            or not _log_resume_ok(state, log_key)):
+        state.update({"snap": _empty_stats(), "offset": 0, "tail": b"",
+                      "days": {}, "days_floor": None})
+    state.update({"pricing": pricing, "realm": realm, "key": log_key})
+
+    def fold(row):
+        # 一行折两处：all-time 半 + 它所属那天的窗口半。过滤与算价在
+        # _fold_usage_snapshot 里只做一次。
+        _fold_usage_snapshot(row, state["snap"], r, None, None, pricing_on,
+                             also=_usage_day_bucket(state, row, r,
+                                                    _day_snapshot_bucket))
+
+    offset, error = _scan_usage_from(state["offset"], fold)
+    if error is None:
+        state["offset"] = offset
+        state["tail"] = _log_tail_signature(offset)
+    return state, offset, error
+
+
+def _usage_alltime_snapshot(r, pricing_on=None):
+    """A private copy of the cached all-time fold for realm filter `r`
+    (None = every realm).
+
+    One state per realm: the filter decides which rows the fold ever sees, so
+    `intl` and `cn` are two folds and neither may inherit the other's rows.
+    The state holds the raw fold only - `started`, `since`, `accounts_map` and
+    the rest are re-derived on every call, exactly as the full scan re-derived
+    them.
+    """
+    with _usage_snap_state_lock:
+        state, offset, error = _usage_snap_state_ready(r, pricing_on)
+        if error is None:
+            # Copied while the lock is held: the caller decorates what it
+            # gets, and a concurrent refresh must never be seen half-applied.
+            snap = _copy_usage_snapshot(state["snap"])
+        else:
+            # A row the fold could not swallow may have half applied itself,
+            # so the carried-over totals cannot be resumed from there: this
+            # call answers what was folded - the full scan reports the same
+            # partial totals - and the next refresh starts over, which is
+            # what the full scan does on every call.
+            log(f"usage snapshot read failed: {error}")
+            snap = state["snap"]
+            state.update({"snap": None, "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
+    # 落盘决定在锁外做（见 checkpoint 一节）：写盘要逐把读三份状态，在状态
+    # 锁里再取别的状态锁会构成锁序环。折叠失败的那次不写——它的 offset 已经
+    # 归零，落盘函数也会跳过。
+    if error is None:
+        _usage_cache_maybe_save("snapshot", offset)
+    return snap
+
+
+def _scan_usage_snapshot_window(r, since, until, pricing_on=None):
+    """One pass over the log, keeping only the rows inside the window.
+
+    Nothing is carried over here - a window moves with the clock - but the
+    pre-filter drops the parse for every line it can prove is outside it,
+    which is what keeps a cold day or week view cheap on a multi-day log.
+
+    The bounds reach the pre-filter through `or None` because that is the
+    test the fold itself applies (`if since and at < since`): a bound of 0
+    is a bound the fold ignores, and the pre-filter must not read it as
+    "keep nothing after the epoch" and drop rows the fold would have
+    counted.
+    """
+    snap = _empty_stats()
+    _, error = _scan_usage_from(
+        0,
+        lambda row: _fold_usage_snapshot(row, snap, r, since, until, pricing_on),
+        skip=lambda line: _line_outside_window(line, since or None,
+                                                 until or None))
+    if error is not None:
+        log(f"usage snapshot read failed: {error}")
+    return snap
+
+
+def _usage_snapshot_window_from_days(r, day_key, pricing_on):
+    """窗口半快照 = 窗口内的日桶之和；日桶不可用时返回 None。
+
+    先把 all-time 折叠推进到文件尾：日桶与它同一次扫描推进，窗口半与
+    all-time 半因此描述同一段字节。
+    """
+    with _usage_snap_state_lock:
+        state, offset, error = _usage_snap_state_ready(r, pricing_on)
+        if error is not None:
+            # 折叠失败时状态已经归零，日桶跟着清空：这一次退回整段扫描，
+            # 与「没有缓存」时的行为一致。
+            log(f"usage snapshot read failed: {error}")
+            state.update({"snap": None, "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
+            return None
+        if not _days_cover(state, day_key):
+            return None
+        snap = _empty_stats()
+        days = state["days"]
+        for key in sorted(days):
+            if key >= day_key:
+                _add_usage_snapshot(snap, days[key])
+    _usage_cache_maybe_save("snapshot", offset)
+    return snap
+
+
+def _usage_snapshot_window(r, since, until, pricing_on=None):
+    """窗口半快照：对齐窗口由日桶相加，其余保持整段扫描。
+
+    只有「until 开放 + 起点是本地午夜」的窗口拆得成整天的并集（today /
+    week / month 都是）。自定义区间与带 until 的区间一律走整段扫描：起点
+    不是午夜就拆不开，而 until 落在某天中间时，那一天的桶里还有窗口外的
+    行，加进去就是错的。
+    """
+    day_key = _window_day_key(since) if until is None else None
+    if day_key is not None and _usage_day_buckets_enabled():
+        snap = _usage_snapshot_window_from_days(r, day_key, pricing_on)
+        if snap is not None:
+            return snap
+        # 日桶没盖住窗口起点（还没折过/被剪枝/折叠出错）：冷路径现折一份
+        # 按日分组的窗口半，口径与日桶状态一致，两条路径的字节因此相同。
+        return _scan_usage_snapshot_window_days(r, since, pricing_on)
+    return _scan_usage_snapshot_window(r, since, until, pricing_on)
+
+
 def _usage_snapshot_uncached(realm=None, since=None, until=None):
     # None means every realm; usage_snapshot() has already mapped "all"
     # onto it, so the filter below is simply skipped.
     r = realm
     rep = POOL.representative(realm=r) if POOL else current_account()
-    snap = _empty_stats()
+    # 总开关整扫只问一次，值一路传进折叠与价格指纹：每行重问一次就是每行一次
+    # os.stat，2.7 万行上很可观（见 tests/_test_usage_aggregate_fold.py）。
+    pricing_on = wb_pricing.pricing_enabled()
+    if since is None and until is None:
+        # An open window covers every row, and the rows only ever arrive at
+        # the end of the log, so the all-time totals are carried over from the
+        # last fold and only the rows appended since then are read.
+        snap = _usage_alltime_snapshot(r, pricing_on)
+    else:
+        snap = _usage_snapshot_window(r, since, until, pricing_on)
     snap["started"] = _usage.get("started", time.time())
-    try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                if r and not row_matches_realm(row, r):
-                    continue
-                # The window is applied before the request is counted, so every
-                # total below - requests, tokens, per-model and per-account
-                # breakdowns - describes the same slice of the log.
-                at = row.get("at") or 0
-                if since and at < since:
-                    continue
-                if until and at > until:
-                    continue
-                outcome = row_outcome(row)
-                # Each row is priced against the version that was in force
-                # when it happened, so a later price change cannot rewrite
-                # yesterday's totals.
-                cost = wb_pricing.cost_for_row(row)
-                if outcome != "completed":
-                    snap["errors"] += 1
-                    # Credit is money already spent: a request that failed
-                    # after the upstream had billed for it still consumed
-                    # credit, so it is summed here exactly like the analytics
-                    # page sums it. Token totals keep the completed-only rule
-                    # this page has always used, and a client abort is skipped
-                    # because its usage block is incomplete.
-                    if outcome != "client_aborted":
-                        snap["credit"] += (row.get("credit") or 0)
-                        _fold_cost(snap, cost, row.get("model"))
-                else:
-                    snap["requests"] += 1
-                    for k in USAGE_FIELDS:
-                        if k in row:
-                            snap[k] += (row[k] or 0)
-                    _fold_cost(snap, cost, row.get("model"))
-                    m = row.get("model") or "unknown"
-                    rr = row_realm(row)
-                    per = snap["by_model"].setdefault(m, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
-                    per_realm = snap["by_model_realm"].setdefault(m, {}).setdefault(
-                        rr, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
-                    acct_id = row.get("account")
-                    acct_key = acct_id or "(unattributed)"
-                    per_acct = (snap["by_model_acct"].setdefault(m, {})
-                                .setdefault(rr, {})
-                                .setdefault(acct_key, {"requests": 0, "accounts": {},
-                                                       "cost_cny": 0.0,
-                                                       **{k: 0 for k in USAGE_FIELDS}}))
-                    for bucket in (per, per_realm, per_acct):
-                        bucket["requests"] += 1
-                        for k in USAGE_FIELDS:
-                            if k in row:
-                                bucket[k] += (row[k] or 0)
-                        if cost["known"]:
-                            bucket["cost_cny"] += cost["cny"]
-                        if acct_id:
-                            bucket["accounts"][acct_id] = bucket["accounts"].get(acct_id, 0) + 1
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        log(f"usage snapshot read failed: {exc}")
     snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snap.get("started", time.time())))
     snap["log_file"] = USAGE_LOG
     snap["realm"] = r or "all"
@@ -1196,21 +3109,266 @@ _count_lock = threading.Lock()
 # enough for a record total that only ever grows.
 _COUNT_TTL = float(os.environ.get("WB_COUNT_TTL", 30))
 
+# 增量计数的状态（offset/tail/n/n_realm），由 _count_state_lock 保护。
+# 与 by_account 折叠同一套位置校验（_usage_log_key + _log_offset_holds +
+# _log_tail_signature）：日志被截断、被替换或同尺寸重写时从零重数，宁多扫
+# 一次也不能给出错的页数。TTL 缓存按 realm 分键，这份状态则与 realm 无关
+# ——一次扫描同时维护总数与每个 realm 的计数，任何 realm 的查询都复用同一
+# 条进度，不再各自全量扫一遍。
+_count_state_lock = threading.Lock()
+_count_state = {"offset": 0, "key": None, "tail": b"", "n": 0, "n_realm": {}}
+
+
+_series_cache = {}
+_series_lock = threading.Lock()
+
+
+def _usage_timeseries_scope(realm, range, since, until, bucket_seconds):
+    """(realm, lo, hi, step, 缓存键) —— usage_timeseries() 与它的 ETag 共用。
+
+    lo/hi 是这次真正要扫的窗口（未钉住的边界在这里补成"现在/往前 24 小时"），
+    键只收**钉住的**边界，理由见下面 wrapper 里的注释。
+    """
+    r = realm_scope(realm, CURRENT_REALM)
+    lo, hi = range_window(range, since, until)
+    # Which bounds the caller pinned, captured before the fallbacks below fill
+    # the rest in. Only a pinned bound may enter the cache key as a value:
+    # "now" (and the 24h-before-now default lo) is recomputed on every call,
+    # so a key holding it could never be reused while the panel polls the same
+    # chart, and the cache would buy nothing. The "auto" sentinel keeps the two
+    # kinds of bound apart, so a rolling window is never served a pinned
+    # window's series.
+    pinned_lo, pinned_hi = lo, hi
+    if hi is None:
+        hi = time.time()
+    if lo is None:
+        lo = hi - 86400
+    span = max(1.0, hi - lo)
+    if bucket_seconds:
+        step = max(60, int(bucket_seconds))
+    elif span <= 6 * 3600:
+        step = 60
+    elif span <= 14 * 86400:
+        step = 3600
+    else:
+        step = 86400
+    # Bounds, not a range flag: this week and this month overlap, so a flag
+    # would let one window serve the other's series from the cache. The
+    # bucket step joins the key for the same reason: an explicit bucket
+    # changes every bucket's width, and the auto-scaled one flips with the
+    # span, so two different steps are two different payloads.
+    key = (r or "all",
+           pinned_lo if pinned_lo is not None else "auto",
+           pinned_hi if pinned_hi is not None else "auto",
+           step)
+    return r, lo, hi, step, key
+
+
+def usage_timeseries(realm=None, range=None, since=None, until=None,
+                     bucket_seconds=None, ttl=None):
+    """Bucketed token/credit series for the analytics chart.
+
+    Bucket size auto-scales with the window: minute (<=6h), hour (<=14d),
+    day otherwise; an explicit bucket_seconds overrides it. Completed
+    requests contribute tokens; every non-client-aborted row contributes
+    credit (money already spent). The most recent credited requests ride
+    along so the panel can show a credit history without another endpoint.
+
+    Cached wrapper: the Token chart polls this endpoint whenever the metrics
+    tab is open, and one uncached call re-reads and re-parses the whole log.
+    Same shared TTL as its siblings, and the rebuild runs under the lock so a
+    burst of pollers cannot each start their own scan.
+    """
+    ttl = _STATS_TTL if ttl is None else ttl
+    r, lo, hi, step, key = _usage_timeseries_scope(realm, range, since, until,
+                                                   bucket_seconds)
+    now = time.time()
+    with _series_lock:
+        hit = _series_cache.get(key)
+        if hit is not None and (now - hit[0]) < ttl:
+            return hit[1]
+        data = _usage_timeseries_uncached(r, lo, hi, step)
+        _series_cache[key] = (time.time(), data)
+    return data
+
+
+def usage_timeseries_etag(realm=None, range=None, since=None, until=None,
+                          bucket_seconds=None):
+    """usage_timeseries() 当前缓存条目的 ETag；没有条目时返回 None。
+
+    配对调用由 _json_cached() 负责。注意键里只有钉住的边界，所以"滚动窗口"这一类
+    请求始终落在同一条目上：条目没重建，响应体（含它自己的 until / 桶边界）就逐
+    字节不变，这正是可以放心回 304 的原因。
+    """
+    _r, _lo, _hi, _step, key = _usage_timeseries_scope(realm, range, since, until,
+                                                       bucket_seconds)
+    with _series_lock:
+        hit = _series_cache.get(key)
+    if hit is None:
+        return None
+    return _cache_etag("series", repr(key), hit[0])
+
+
+# Every row this process writes starts with `{"at": <float>,` - record_usage
+# and record_error put the timestamp first and json.dumps keeps that order -
+# which is what makes the window pre-filter below possible.
+_AT_PREFIX = '{"at": '
+
+
+def _line_outside_window(line, lo, hi):
+    """True when this log line's `at` is provably outside [lo, hi].
+
+    Either bound may be None, which means "unbounded on that side": the
+    ranges the dashboard asks for ("today", "this week") only pin a start,
+    and an open side must never drop a row.
+
+    The scan uses it to drop out-of-window lines without paying for
+    json.loads, which is what made a cold pass over the log expensive. False
+    means "parse it as before" - both for lines that match the shape and fall
+    inside the window, and for anything the check cannot read exactly:
+
+    * another key order or a hand-edited line: no leading `{"at": `, or no
+      comma to end the value;
+    * an integer token: json.loads would hand back an int, and int/float
+      comparison stays exact where float(token) rounds once the value passes
+      2**53 (a float token round-trips through float() exactly, which is why
+      those are the only ones accepted);
+    * a later `"at"` key: json.loads keeps the last duplicate, so the first
+      value read here would be the wrong one. Escaped quotes inside string
+      values (\\") cannot produce a false `"at"`, so this check only ever
+      costs a parse - and it runs only for lines that would be skipped, so a
+      line the scan is going to parse anyway never pays for it.
+    """
+    if not line.startswith(_AT_PREFIX):
+        return False
+    end = line.find(",", len(_AT_PREFIX))
+    if end < 0:
+        return False
+    token = line[len(_AT_PREFIX):end]
+    if "." not in token and "e" not in token and "E" not in token:
+        return False
+    try:
+        at = float(token)
+    except ValueError:
+        return False
+    if not ((lo is not None and at < lo) or (hi is not None and at > hi)):
+        return False
+    return line.find('"at"', end) < 0
+
+
+def _usage_timeseries_scan(realm, lo, hi, step):
+    """One uncached pass over the log, folding rows into fixed-width buckets.
+
+    这是窗口序列的兜底路径：日/小时桶切片不成立（见 _series_slice）时用它，
+    口径一字未改。
+    """
+    buckets = {}
+    credits = []
+    try:
+        with open(USAGE_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                # Cheap window test first: a day or week window covers a small
+                # slice of a multi-day log, and the json.loads this skips is
+                # what made a cold scan expensive. A line the check cannot read
+                # exactly falls through to the full parse and the full test
+                # below, so a skipped row is always one the parse would have
+                # skipped as well - same output, fewer parses.
+                if _line_outside_window(line, lo, hi):
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if realm and not row_matches_realm(row, realm):
+                    continue
+                at = row.get("at") or 0
+                if at < lo or at > hi:
+                    continue
+                key = int((at - lo) // step)
+                bucket = buckets.setdefault(key, {
+                    "at": lo + key * step, "requests": 0, "errors": 0,
+                    "prompt_tokens": 0, "completion_tokens": 0,
+                    "reasoning_tokens": 0, "cached_tokens": 0,
+                    "total_tokens": 0, "credit": 0.0,
+                })
+                outcome = row_outcome(row)
+                if outcome == "completed":
+                    bucket["requests"] += 1
+                    for field in ("prompt_tokens", "completion_tokens",
+                                  "reasoning_tokens", "cached_tokens",
+                                  "total_tokens"):
+                        bucket[field] += (row.get(field) or 0)
+                else:
+                    bucket["errors"] += 1
+                credit = row.get("credit") or 0
+                if outcome != "client_aborted":
+                    bucket["credit"] += credit
+                if credit > 0:
+                    credits.append({
+                        "at": at, "iso": row.get("iso") or "",
+                        "model": row.get("model") or "",
+                        "account": row.get("account") or "",
+                        "credit": credit,
+                        "total_tokens": row.get("total_tokens") or 0,
+                    })
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log("usage timeseries read failed: %s" % exc)
+    credits.sort(key=lambda item: item.get("at") or 0, reverse=True)
+    return {
+        "ok": True, "realm": realm or "all", "bucket_seconds": step,
+        "since": lo, "until": hi,
+        "series": [buckets[key] for key in sorted(buckets)],
+        "credits": credits[:50],
+    }
+
+
+def _usage_timeseries_uncached(realm, lo, hi, step):
+    """窗口序列：优先由日/小时桶切片，不成立时整段扫描。
+
+    切片只在「窗口起点是本地午夜 + 桶宽 3600/86400」时才是同一件事，所以
+    先按这两条判断要不要惊动状态：自定义区间与分钟桶根本不折状态，也就
+    不会为它们白扫一遍。
+    """
+    day_key = _window_day_key(lo) if step in (3600, 86400) else None
+    if day_key is not None and _usage_day_buckets_enabled():
+        with _series_state_lock:
+            state, offset, error = _usage_series_state_ready(realm)
+            out = None
+            if error is not None:
+                # 折叠失败：状态归零（下一次从零折起），这次退回整段扫描。
+                log("usage timeseries fold failed: %s" % error)
+                state.update({"days": {}, "days_floor": None, "max_at": 0,
+                              "credits": [], "offset": 0, "tail": b""})
+            else:
+                out = _series_slice(state, realm, lo, hi, step, day_key)
+        if error is None:
+            _usage_cache_maybe_save("series", offset)
+        if out is not None:
+            return out
+    return _usage_timeseries_scan(realm, lo, hi, step)
+
 
 def count_usage_rows(realm=None):
-    """Cached row count - substring match instead of a full JSON parse.
+    """Cached row count - incremental, substring match instead of a full parse.
 
     Rows written before the `realm` field existed (they are all error rows)
-    have to fall back to the account/model heuristic in row_matches_realm,
-    so those few are still parsed properly.
+    have to fall back to the account/model heuristic in row_realm, so those
+    few are still parsed properly - once, when the fold first reaches them.
 
     This runs on every /usage/recent poll purely to render the page total,
     and a full scan of the file dominated that endpoint (measured at ~50% of
-    its cost on a 45MB log). A short TTL keeps the number honest while
-    removing the scan from the poll path.
+    its cost on a 45MB log). The fold is carried over and refreshed with the
+    rows appended since the last call, so a poll costs what the new traffic
+    costs instead of what the whole log costs; the short TTL still keeps the
+    number honest while removing even that from the poll path.
     """
-    # Normalise first: the needle below is built from this value, so a
-    # literal "all" would search for a realm field that never exists.
+    # 先归一化：桶键就是 realm 字符串本身，字面 "all" 会被当成一个永远不存在
+    # 的桶（realm_scope 把它映射成 None = 总数）。
     realm = realm_scope(realm)
     r = realm or ""
     now = time.time()
@@ -1224,34 +3382,120 @@ def count_usage_rows(realm=None):
     return n
 
 
-def _count_usage_rows_uncached(realm=None):
-    needles = ()
-    if realm:
-        needles = ('"realm": "%s"' % realm, '"realm":"%s"' % realm)
-    n = 0
+# `"realm"` 的键文本。旧实现拿 `'"realm": "<值>"'` / `'"realm":"<值>"'` 两个
+# needle 做子串命中，新实现按同一对间距从行里取字段值（见 _count_usage_line）
+# ——口径逐字相同，只是不再为每个 realm 各扫一遍文件。
+_REALM_KEY = '"realm"'
+_REALM_KEY_LEN = len(_REALM_KEY)
+
+
+def _count_usage_line(state, line):
+    """折一行：总数 + 这一行声明的 realm 桶。
+
+    总数数的是**所有非空行**（包括解析不了的行），与旧实现一致。带 realm
+    字段的行按字段值归桶：取值只认旧 needle 覆盖的两种间距（`"realm": "x"`
+    与 `"realm":"x"`），间距再花哨的写法旧实现本来就匹配不到任何 realm，
+    这里也不为它建桶；值读到下一个引号为止——查询用的 realm 不会带引号，
+    字符串里的转义引号也拼不出 `"realm"` 这个键文本（同 _line_outside_window
+    的说明），所以不会误判。同一行重复声明 `"realm"`（手改过的行）按每一处
+    声明的值各计一次，与旧 needle 子串命中的行为一致；只有完全没有该字段的
+    老行（都是错误行）才解析 JSON 走 row_realm() 的账号/模型回退——旧实现
+    每次查询都要为它们付一次 json.loads，这里只在折叠时付一次。
+    """
+    state["n"] += 1
+    counts = state["n_realm"]
+    pos = line.find(_REALM_KEY)
+    if pos < 0:
+        # 没有 realm 字段（老错误行）：解析回退。解析不了就只算进总数。
+        try:
+            realm = row_realm(json.loads(line))
+        except Exception:
+            return
+        counts[realm] = counts.get(realm, 0) + 1
+        return
+    while pos >= 0:
+        end = pos + _REALM_KEY_LEN
+        if line.startswith(': "', end):
+            start = end + 3
+        elif line.startswith(':"', end):
+            start = end + 2
+        else:
+            start = -1
+        if start >= 0:
+            quote = line.find('"', start)
+            if quote >= 0:
+                value = line[start:quote]
+                counts[value] = counts.get(value, 0) + 1
+        pos = line.find(_REALM_KEY, end)
+
+
+def _count_usage_scan(state):
+    """把日志 offset 之后的每一行折进 state；返回 (offset, error)。
+
+    与 _scan_usage_from 同一套字节纪律（整行推进、半行留给下一趟、解码失败
+    即停），但折叠的是**行文本**而不是解析出的 row：计数的总口径里有一类行
+    根本不是合法 JSON（总行数照数），而 _scan_usage_from 在 fold 之前就把
+    它们丢掉了。逐行调用在这里直接写死（不走回调），全量重数一次要过几万行，
+    每行省一次间接调用是这条冷路径上最便宜的一笔。
+    """
+    offset = state["offset"]
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                if not needles:
-                    n += 1
-                    continue
-                if any(x in line for x in needles):
-                    n += 1
-                    continue
-                if '"realm"' in line:
-                    continue          # realm 字段存在但值不同
+        with open(USAGE_LOG, "rb") as fh:
+            fh.seek(offset)
+            while True:
+                raw = fh.readline()
+                if not raw:
+                    break
+                if not raw.endswith(b"\n"):
+                    break
+                end = offset + len(raw)
                 try:
-                    if row_matches_realm(json.loads(line), realm):
-                        n += 1
-                except Exception:
-                    pass
+                    line = raw.decode("utf-8").strip()
+                except UnicodeDecodeError as exc:
+                    return end, exc
+                if line:
+                    try:
+                        _count_usage_line(state, line)
+                    except Exception as exc:
+                        return end, exc
+                offset = end
     except FileNotFoundError:
         pass
-    except Exception:
-        pass
-    return n
+    except Exception as exc:
+        return offset, exc
+    return offset, None
+
+
+def _count_usage_rows_uncached(realm=None):
+    """增量计数：把折叠推进到文件尾，返回 realm 对应的行数。
+
+    状态按「本进程数到哪」记账（offset/tail/n/n_realm），每次调用只数新增
+    的字节；位置校验不过（截断、换文件、同尺寸重写）才从零重数。realm 为
+    空返回总行数，否则返回该 realm 桶里的行数。
+    """
+    state = _count_state
+    with _count_state_lock:
+        log_key = _usage_log_key()
+        if not _log_resume_ok(state, log_key):
+            state.update({"offset": 0, "tail": b"", "n": 0, "n_realm": {}})
+        state["key"] = log_key
+        offset, error = _count_usage_scan(state)
+        n = state["n"]
+        counts = state["n_realm"]
+        if error is None:
+            state["offset"] = offset
+            state["tail"] = _log_tail_signature(offset)
+        else:
+            # 出错的那一行（非法 UTF-8 才会走到这里）可能已经半折进去了：
+            # 这份状态整个作废，下次从零重数——by_account 折叠同款处理。
+            # 这一次仍返回已经折到的部分：旧实现的文本层按块解码，坏行落在
+            # 第一块里时整次报 0、落在后面时给部分数；新实现稳定地给出坏行
+            # 之前的行数，任何情况下都不会更差。
+            log("usage count failed: %s" % error)
+            state.update({"offset": 0, "tail": b"", "n": 0, "n_realm": {}})
+        if not realm:
+            return n
+        return counts.get(realm, 0)
 
 
 def recent_usage(limit=100, realm=None, page=1):
@@ -1359,6 +3603,9 @@ def recent_usage(limit=100, realm=None, page=1):
 POOL = None
 SCHEDULER = None
 PRICING = None
+CREDITS_REFRESHER = None
+# Release discovery only - the checker never downloads or installs anything.
+UPDATES = None
 ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts')
 def realm_state_file():
     """Path of the persisted realm switch.
@@ -1420,6 +3667,152 @@ def account_views(realm=None):
     if not POOL:
         return []
     return POOL.list_public(realm=realm)
+
+# --------------------------------------------------------- 积分获取历史（发放记录）
+# 上游对每个账号返回一份积分包清单（免费套餐、每日活跃奖励的 Bonus Pack、活动包…），
+# 每个包带面额、发放时间与到期时间。看板的「积分获取历史」就是这份清单的合并视图：
+# 只读内存里的账号积分快照，**不发任何上游请求**（要更新的数字先点「一键刷新积分」），
+# 所以它同时给出快照时刻，让面板标明数据有多旧。
+GRANT_STATUS_ACTIVE = "active"        # 上游标了 in_usage：当前正从它扣减
+GRANT_STATUS_AVAILABLE = "available"  # 有剩余、未过期，只是当前不参与扣减
+GRANT_STATUS_USED_UP = "used_up"      # 用完了
+GRANT_STATUS_EXPIRED = "expired"      # 已过期
+
+
+def _parse_stamp_epoch(text):
+    """'2026-10-10 00:42:45' -> epoch；认不出来返回 None。"""
+    if not text:
+        return None
+    try:
+        return time.mktime(time.strptime(str(text)[:19], "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
+
+
+def _grant_status(pkg, now):
+    """一个积分包现在的状态；判定顺序是「过期 > 用完 > 在扣减 > 可用」。"""
+    try:
+        remain = float(pkg.get("remain") or 0)
+    except (TypeError, ValueError):
+        remain = 0.0
+    expired = bool(pkg.get("is_expired"))
+    expire_at = _parse_stamp_epoch(pkg.get("expire_time"))
+    if expire_at is not None and expire_at <= now:
+        expired = True
+    if expired:
+        return GRANT_STATUS_EXPIRED
+    if remain <= 0:
+        return GRANT_STATUS_USED_UP
+    return GRANT_STATUS_ACTIVE if pkg.get("in_usage") else GRANT_STATUS_AVAILABLE
+
+
+# 发放记录与本机动作的关联窗口：动作在发放前 2 小时内算「这次动作带来的」，
+# 上游记的发放时间可能比我们那条动作记录早几秒，所以向后也留一点余量。
+GRANT_ACTION_BEFORE = 2 * 3600
+GRANT_ACTION_AFTER = 600
+
+
+def _grant_actions():
+    """uid -> [{at, ts, task, ok}]（按时间升序），只含签到与每日活跃的真实尝试。
+
+    历史文件是磁盘上的东西：读取一律先过 wb_activity.project()，多出来的键
+    （别的写入方、手工编辑、被塞进来的凭证）不会跟着载荷出去；任何读取失败都
+    退化成「没有关联动作」，绝不让一次查询挂掉。
+    """
+    index = {}
+    try:
+        rows = wb_activity.load()
+    except Exception:
+        return index
+    for raw in rows or []:
+        row = wb_activity.project(raw)
+        task = row["task"]
+        if task not in (wb_activity.TASK_CHECKIN, wb_activity.TASK_DAILY_CHAT):
+            continue
+        at = wb_activity._parse_ts(row["ts"])
+        if at is None:
+            continue
+        index.setdefault(row["uid"], []).append(
+            {"at": at, "ts": row["ts"], "task": task, "ok": bool(row["ok"])})
+    for items in index.values():
+        items.sort(key=lambda item: item["at"])
+    return index
+
+
+def _grant_action(index, uid, at):
+    """发放时刻之前最近的一次本机签到 / 每日活跃尝试；窗口外没有就 None。"""
+    if at is None:
+        return None
+    for item in reversed(index.get(uid) or ()):
+        if item["at"] > at + GRANT_ACTION_AFTER:
+            continue
+        if item["at"] < at - GRANT_ACTION_BEFORE:
+            break
+        return {"task": item["task"], "ts": item["ts"], "ok": item["ok"],
+                "delta_seconds": int(round(at - item["at"]))}
+    return None
+
+def credit_grants(now=None):
+    """每个积分包一行（新的在前）＋汇总；只读快照，不发上游请求。"""
+    now = time.time() if now is None else now
+    actions = _grant_actions()
+    rows = []
+    fetched = 0.0
+    for account in (POOL.accounts if POOL else []):
+        credits = getattr(account, "credits", None) or {}
+        try:
+            fetched = max(fetched, float(credits.get("updated_at") or 0))
+        except (TypeError, ValueError):
+            pass
+        for pkg in credits.get("packages") or []:
+            if not isinstance(pkg, dict):
+                continue
+            def _num(key):
+                try:
+                    return float(pkg.get(key) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            expire_iso = pkg.get("expire_time") or pkg.get("cycle_end_time") or ""
+            create_at = _parse_stamp_epoch(pkg.get("create_time"))
+            rows.append({
+                "uid": account.uid,
+                "nickname": account.nickname or (account.uid or "")[:8],
+                "realm": account.realm,
+                "name": str(pkg.get("name") or pkg.get("package_code") or "Package"),
+                "product": str(pkg.get("sub_product_name") or pkg.get("product_name") or ""),
+                "grant_reason": str(pkg.get("grant_reason") or ""),
+                "size": _num("size"),
+                "remain": _num("remain"),
+                "used": _num("used"),
+                "unit": str(pkg.get("unit") or "credit"),
+                "create_at": create_at,
+                "create_iso": str(pkg.get("create_time") or ""),
+                "expire_at": _parse_stamp_epoch(expire_iso),
+                "expire_iso": str(expire_iso),
+                "no_expiry": bool(pkg.get("no_expiry")),
+                "days_left": pkg.get("days_left"),
+                "status": _grant_status(pkg, now),
+                "action": _grant_action(actions, account.uid, create_at),
+            })
+    # 新的在前；同一秒按账号、包名稳定排序，免得每次刷新顺序都在跳。
+    rows.sort(key=lambda r: (-(r["create_at"] or 0), r["nickname"], r["name"]))
+    return {
+        "ok": True,
+        "generated_at": now,
+        "generated_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+        "fetched_at": fetched or None,
+        "fetched_iso": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fetched))
+                        if fetched else None),
+        "rows": rows,
+        "summary": {
+            "count": len(rows),
+            "size": round(sum(r["size"] for r in rows), 2),
+            "remain": round(sum(r["remain"] for r in rows), 2),
+            "used": round(sum(r["used"] for r in rows), 2),
+            "accounts": len(set(r["uid"] for r in rows)),
+        },
+    }
+
 
 # --------------------------------------------------------------- 任务状态快照
 # GET /tasks 每次都要向上游要两份数据（成长任务 + 汇总），实测约 2 秒；而看板切区域、
@@ -1581,43 +3974,117 @@ def usage_by_account(ttl=None):
     return data
 
 
+def usage_by_account_etag():
+    """usage_by_account() 当前缓存条目的 ETag；没有条目时返回 None。
+
+    这个视图只有一条缓存（没有窗口/区域参数），所以键是常量。配对调用由
+    _json_cached() 负责。
+    """
+    with _byacct_lock:
+        if _byacct_cache["data"] is None:
+            return None
+        built_at = _byacct_cache["at"]
+    return _cache_etag("by-account", "all", built_at)
+
+
+_byacct_state = {"buckets": None, "offset": 0, "key": None, "tail": b""}
+# The wrapper above holds _byacct_lock while it rebuilds and then calls in
+# here, and _usage_by_account_uncached() is also called straight from the
+# bench and the tests; a lock of its own keeps the refresh from re-entering
+# the wrapper's - that one is not reentrant, so sharing it hung the process
+# on the first cache miss.
+_byacct_state_lock = threading.Lock()
+
+
+def _fold_usage_by_account(row, buckets):
+    """Fold one row into the per-account buckets.
+
+    No window and no realm filter here - this view has always described the
+    whole log - so the fold only skips the rows the original skipped.
+    """
+    if row.get("error"):
+        return
+    key = row.get("account") or "(unattributed)"
+    bucket = buckets.get(key)
+    if bucket is None:
+        bucket = buckets[key] = {
+            "account": key, "requests": 0, "prompt_tokens": 0,
+            "completion_tokens": 0, "reasoning_tokens": 0,
+            "cached_tokens": 0, "total_tokens": 0, "models": {},
+        }
+    bucket["requests"] += 1
+    bucket["prompt_tokens"] += row.get("prompt_tokens") or 0
+    bucket["completion_tokens"] += row.get("completion_tokens") or 0
+    bucket["reasoning_tokens"] += row.get("reasoning_tokens") or 0
+    bucket["cached_tokens"] += row.get("cached_tokens") or 0
+    bucket["total_tokens"] += row.get("total_tokens") or 0
+    model = row.get("model") or "?"
+    models = bucket["models"]
+    models[model] = models.get(model, 0) + 1
+
+
+def _usage_by_account_buckets():
+    """The cached per-account fold, refreshed and copied for the caller.
+
+    The copy matters: _usage_by_account_uncached() replaces each bucket's
+    `models` dict with a sorted list, and the next refresh must still find the
+    counts dict where it left it.
+    """
+    with _byacct_state_lock:
+        log_key = _usage_log_key()
+        if _byacct_state["buckets"] is None:
+            # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+            if not _usage_cache_adopt_by_account(_byacct_state, log_key):
+                _byacct_state.update({"buckets": {}, "offset": 0, "tail": b""})
+        elif not _log_resume_ok(_byacct_state, log_key):
+            _byacct_state.update({"buckets": {}, "offset": 0, "tail": b""})
+        _byacct_state["key"] = log_key
+        offset, error = _scan_usage_from(
+            _byacct_state["offset"],
+            lambda row: _fold_usage_by_account(row, _byacct_state["buckets"]))
+        buckets = _byacct_state["buckets"]
+        if error is None:
+            _byacct_state["offset"] = offset
+            _byacct_state["tail"] = _log_tail_signature(offset)
+        else:
+            # The row that stopped the fold may have half applied
+            # itself, so this view starts over next call - the full
+            # scan it replaces does the same on every call.
+            log("usage_by_account failed: %s" % error)
+            _byacct_state.update({"buckets": {}, "offset": 0, "tail": b""})
+        out = {k: dict(v) for k, v in buckets.items()}
+    if error is None:
+        _usage_cache_maybe_save("by_account", offset)
+    return out
+
+
 def _usage_by_account_uncached():
-    """Aggregate the JSONL log per account id."""
-    buckets = {}
-    try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                if row.get("error"):
-                    continue
-                key = row.get("account") or "(unattributed)"
-                bucket = buckets.setdefault(key, {
-                    "account": key, "requests": 0, "prompt_tokens": 0,
-                    "completion_tokens": 0, "reasoning_tokens": 0,
-                    "cached_tokens": 0, "total_tokens": 0, "models": {},
-                })
-                bucket["requests"] += 1
-                for field in ("prompt_tokens", "completion_tokens",
-                              "reasoning_tokens", "cached_tokens", "total_tokens"):
-                    bucket[field] += row.get(field) or 0
-                model = row.get("model") or "?"
-                bucket["models"][model] = bucket["models"].get(model, 0) + 1
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        log("usage_by_account failed: %s" % exc)
+    """Aggregate the JSONL log per account id.
+
+    Incremental: the fold is carried over and refreshed with the rows appended
+    since the last call, so this costs what the new traffic costs instead of
+    what the whole log costs.
+    """
+    buckets = _usage_by_account_buckets()
     out = sorted(buckets.values(), key=lambda b: -b["total_tokens"])
     for item in out:
         item["models"] = sorted(item["models"].items(), key=lambda kv: -kv[1])[:5]
     return out
 _analytics_cache = {}
 _analytics_lock = threading.Lock()
+
+
+def _analytics_scope(realm, range, since, until):
+    """(since, until, 缓存键) —— compute_usage_analytics() 与它的 ETag 共用。
+
+    注意键里用的是**原始** realm（`realm or "all"`），与这个接口一直以来的键
+    一致；折叠时用 realm_scope(realm) 另有其义。两者都不能顺手"统一"，否则就是
+    换了一条缓存键。
+    """
+    lo, hi = range_window(range, since, until)
+    cache_key = "%s|%s|%s" % (realm or "all",
+                              lo if lo is not None else "", hi if hi is not None else "")
+    return lo, hi, cache_key
 
 
 def compute_usage_analytics(ttl=None, realm=None, range=None, since=None, until=None):
@@ -1634,9 +4101,7 @@ def compute_usage_analytics(ttl=None, realm=None, range=None, since=None, until=
     """
     ttl = _STATS_TTL if ttl is None else ttl
     now = time.time()
-    lo, hi = range_window(range, since, until)
-    cache_key = "%s|%s|%s" % (realm or "all",
-                              lo if lo is not None else "", hi if hi is not None else "")
+    lo, hi, cache_key = _analytics_scope(realm, range, since, until)
     with _analytics_lock:
         entry = _analytics_cache.get(cache_key)
         if entry is not None and (now - entry["at"]) < ttl:
@@ -1644,6 +4109,19 @@ def compute_usage_analytics(ttl=None, realm=None, range=None, since=None, until=
         data = _compute_usage_analytics_uncached(realm=realm_scope(realm), since=lo, until=hi)
         _analytics_cache[cache_key] = {"at": time.time(), "data": data}
     return data
+
+
+def usage_analytics_etag(realm=None, range=None, since=None, until=None):
+    """compute_usage_analytics() 当前缓存条目的 ETag；无条目返回 None。
+
+    配对调用由 _json_cached() 负责，理由见那里。
+    """
+    _lo, _hi, cache_key = _analytics_scope(realm, range, since, until)
+    with _analytics_lock:
+        entry = _analytics_cache.get(cache_key)
+    if entry is None:
+        return None
+    return _cache_etag("analytics", cache_key, entry["at"])
 
 
 def _new_analytics_stat():
@@ -1674,152 +4152,420 @@ KEY_BUCKET_UNKNOWN = "__unknown_key__"
 KEY_MODEL_TOP_N = 5
 
 
-def _scan_usage_log(all_summary, window_summary, acct_map, model_map, since=None, until=None,
-                    realm=None, key_map=None):
-    """Walk the usage JSONL once, folding every row into the maps.
+# One half of the analytics payload folds into four maps: the window summary,
+# the per-account entries, the per-model entries and the per-key entries. The
+# all-time half and the windowed half hold the same maps and differ only in
+# which stat on each entry they own, so the row fold below is written once and
+# told which half it is feeding.
+_ANALYTICS_ALL = ("all_time", "all_models")
+_ANALYTICS_WINDOW = ("window", "window_models")
 
-    `all_summary` always covers the whole log (it is the stable reference the
-    page shows next to the selection); `window_summary` and the per-account /
-    per-model "window" buckets cover only the selected range, which is what
-    every figure on the first column of the page describes.
 
-    `key_map` (optional) folds the same rows by the API key that called the
-    gateway. It is a separate axis from `acct_map` on purpose: one key can be
+def _new_analytics_maps():
+    """The four maps one half of the payload folds into."""
+    return {"summary": _new_analytics_stat(), "accts": {}, "models": {}, "keys": {}}
+
+
+def _analytics_row_values(row):
+    """The per-row numbers the folds below need, read once per row.
+
+    feed()/bump_models() used to call row.get() for each of them on every
+    invocation - eight stat objects per row, all walking the same handful of
+    fields - which was the single biggest cost of a cold analytics pass.
+    """
+    return (row.get("prompt_tokens") or 0,
+            row.get("completion_tokens") or 0,
+            row.get("reasoning_tokens") or 0,
+            row.get("cached_tokens") or 0,
+            row.get("total_tokens") or 0,
+            row.get("credit") or 0,
+            row.get("ttft_ms"),
+            row.get("tokens_per_sec"),
+            row.get("elapsed_ms"))
+
+
+def _feed_analytics(stat_obj, vals, is_err, cost_cny):
+    """Fold one row's numbers into one analytics stat object.
+
+    Token totals follow actual consumption, so a request that failed after the
+    upstream had already billed for tokens still shows them; only the
+    request/error counters depend on the outcome. An unpriced model passes
+    cost_cny = 0.0, which adds nothing: the accumulator starts as a float in
+    _new_analytics_stat(), so the sum is exactly what the guarded
+    `if cost["known"]` used to leave behind.
+    """
+    if is_err:
+        stat_obj["errors"] += 1
+    else:
+        stat_obj["requests"] += 1
+    stat_obj["prompt_tokens"] += vals[0]
+    stat_obj["completion_tokens"] += vals[1]
+    stat_obj["reasoning_tokens"] += vals[2]
+    stat_obj["cached_tokens"] += vals[3]
+    stat_obj["total_tokens"] += vals[4]
+    stat_obj["credit"] += vals[5]
+    stat_obj["cost_cny"] += cost_cny
+    if vals[6]:
+        stat_obj["ttft_sum"] += vals[6]
+        stat_obj["ttft_n"] += 1
+    if vals[7]:
+        stat_obj["speed_sum"] += vals[7]
+        stat_obj["speed_n"] += 1
+    if vals[8]:
+        stat_obj["elapsed_sum"] += vals[8]
+        stat_obj["elapsed_n"] += 1
+
+
+def _bump_analytics_models(tgt, m_id, vals, is_err, cost_cny):
+    """Fold one row into one {model: {...}} bucket.
+
+    Model distribution counts successful requests only: a failed call
+    attributed to a model would show up as demand for it when the caller got
+    nothing.
+    """
+    if is_err:
+        return
+    tm = tgt.get(m_id)
+    if tm is None:
+        tm = tgt[m_id] = {"requests": 0, "tokens": 0, "reasoning": 0, "cost_cny": 0.0}
+    tm["requests"] += 1
+    tm["tokens"] += vals[4]
+    tm["reasoning"] += vals[2]
+    tm["cost_cny"] += cost_cny
+
+
+def _fold_usage_analytics(row, realm, maps, half, pricing_on=None, also=None):
+    """Fold one parsed row into one half of the analytics payload.
+
+    `maps` holds the four maps that half folds into and `half` names the stat
+    each entry of that half owns, so the incremental all-time fold (every
+    entry's all_time stat) and the windowed pass (the same entries' window
+    stat) share one definition of what a row contributes.
+
+    The key axis is separate from the account axis on purpose: one key can be
     served by many upstream accounts, and one account can serve many keys, so
     the two tables are views of the same spend, not a decomposition of it.
+
+    `also` 是同一行还要折进的第二份 (maps, half)（按日分桶的窗口半）。过滤、
+    算价与字段提取只做一次，两份各自累加：折叠本来就要求两侧各记一笔，而
+    cost_for_row 与 realm 判定是每行最贵的那部分，只该付一次。
     """
-    if os.path.exists(USAGE_LOG):
-        try:
-            with open(USAGE_LOG, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        r = json.loads(line)
-                    except Exception:
-                        continue
-                    if realm and not row_matches_realm(r, realm):
-                        continue
-                    # Only a genuine gateway/upstream failure is an error.
-                    # A client cancellation is not: its token counts are
-                    # incomplete, and folding them into the ratios this page
-                    # reports would understate cache hit and speed. It is
-                    # counted in perf_stats instead.
-                    outcome = row_outcome(r)
-                    if outcome == "client_aborted":
-                        continue
-                    is_err = outcome != "completed"
-                    cost = wb_pricing.cost_for_row(r)
-                    at = r.get("at", 0)
-                    # Same bounds as /usage and /usage/perf, so the three
-                    # readers agree on what the selected range contains.
-                    in_window = ((since is None or at >= since)
-                                 and (until is None or at <= until))
-                    acct_uid = r.get("account") or "(unattributed)"
-                    m_id = r.get("model") or "(unknown)"
-                    def feed(stat_obj, is_error):
-                        if is_error:
-                            stat_obj["errors"] += 1
-                        else:
-                            stat_obj["requests"] += 1
-                        # Token totals follow actual consumption, so a request
-                        # that failed after the upstream had already billed for
-                        # tokens still shows them. Only the request/error
-                        # counters depend on the outcome.
-                        stat_obj["prompt_tokens"] += (r.get("prompt_tokens") or 0)
-                        stat_obj["completion_tokens"] += (r.get("completion_tokens") or 0)
-                        stat_obj["reasoning_tokens"] += (r.get("reasoning_tokens") or 0)
-                        stat_obj["cached_tokens"] += (r.get("cached_tokens") or 0)
-                        stat_obj["total_tokens"] += (r.get("total_tokens") or 0)
-                        stat_obj["credit"] += (r.get("credit") or 0)
-                        if cost["known"]:
-                            stat_obj["cost_cny"] += cost["cny"]
-                        if r.get("ttft_ms"):
-                            stat_obj["ttft_sum"] += r["ttft_ms"]
-                            stat_obj["ttft_n"] += 1
-                        if r.get("tokens_per_sec"):
-                            stat_obj["speed_sum"] += r["tokens_per_sec"]
-                            stat_obj["speed_n"] += 1
-                        if r.get("elapsed_ms"):
-                            stat_obj["elapsed_sum"] += r["elapsed_ms"]
-                            stat_obj["elapsed_n"] += 1
-                    def bump_models(tgt_all, tgt_window, is_error):
-                        # Model distribution counts successful requests only:
-                        # a failed call attributed to a model would show up as
-                        # demand for it when the caller got nothing.
-                        if is_error:
-                            return
-                        tm = tgt_all.setdefault(m_id, {"requests": 0, "tokens": 0, "reasoning": 0, "cost_cny": 0.0})
-                        tm["requests"] += 1
-                        tm["tokens"] += (r.get("total_tokens") or 0)
-                        tm["reasoning"] += (r.get("reasoning_tokens") or 0)
-                        if cost["known"]:
-                            tm["cost_cny"] += cost["cny"]
-                        if in_window:
-                            tdm = tgt_window.setdefault(m_id, {"requests": 0, "tokens": 0, "reasoning": 0, "cost_cny": 0.0})
-                            tdm["requests"] += 1
-                            tdm["tokens"] += (r.get("total_tokens") or 0)
-                            tdm["reasoning"] += (r.get("reasoning_tokens") or 0)
-                            if cost["known"]:
-                                tdm["cost_cny"] += cost["cny"]
-                    feed(all_summary, is_err)
-                    if in_window:
-                        feed(window_summary, is_err)
-                    if acct_uid not in acct_map:
-                        acct_map[acct_uid] = {
-                            "uid": acct_uid,
-                            "nickname": acct_uid,
-                            "realm": r.get("realm", ""),
-                            "domain": "",
-                            "window": _new_analytics_stat(),
-                            "all_time": _new_analytics_stat(),
-                            "window_models": {},
-                            "all_models": {},
-                        }
-                    feed(acct_map[acct_uid]["all_time"], is_err)
-                    if in_window:
-                        feed(acct_map[acct_uid]["window"], is_err)
-                    bump_models(acct_map[acct_uid]["all_models"], acct_map[acct_uid]["window_models"], is_err)
-                    if m_id not in model_map:
-                        model_map[m_id] = {"model": m_id, "window": _new_analytics_stat(), "all_time": _new_analytics_stat()}
-                    feed(model_map[m_id]["all_time"], is_err)
-                    if in_window:
-                        feed(model_map[m_id]["window"], is_err)
-                    if key_map is not None:
-                        # A row written before this feature existed has no
-                        # `key` field at all; a row from a deployment that
-                        # never configured a key has one, and it is empty.
-                        if "key" in r:
-                            k_id = r.get("key") or KEY_BUCKET_ANON
-                        else:
-                            k_id = KEY_BUCKET_BEFORE
-                        km = key_map.get(k_id)
-                        if km is None:
-                            km = key_map[k_id] = {
-                                "key": k_id,
-                                "window": _new_analytics_stat(),
-                                "all_time": _new_analytics_stat(),
-                                "window_models": {},
-                                "all_models": {},
-                                # realm -> row count. A key bound to one
-                                # exit only ever sees that exit; a key with no
-                                # binding follows the model, and its credit
-                                # column then adds up two different products.
-                                # Kept as a dict because this ends up in JSON.
-                                "realms": {},
-                                "last_at": 0,
-                            }
-                        k_realm = row_realm(r) or ""
-                        km["realms"][k_realm] = km["realms"].get(k_realm, 0) + 1
-                        if at and at > km["last_at"]:
-                            km["last_at"] = at
-                        feed(km["all_time"], is_err)
-                        if in_window:
-                            feed(km["window"], is_err)
-                        bump_models(km["all_models"], km["window_models"], is_err)
-        except Exception as exc:
-            log("compute_usage_analytics failed: %s" % exc)
+    if realm and not row_matches_realm(row, realm):
+        return
+    # Only a genuine gateway/upstream failure is an error. A client
+    # cancellation is not: its token counts are incomplete, and folding them
+    # into the ratios this page reports would understate cache hit and speed.
+    # It is counted in perf_stats instead.
+    outcome = row_outcome(row)
+    if outcome == "client_aborted":
+        return
+    is_err = outcome != "completed"
+    cost = wb_pricing.cost_for_row(row, details=False, enabled=pricing_on)
+    cost_cny = cost["cny"] if cost["known"] else 0.0
+    vals = _analytics_row_values(row)
+    acct_uid = row.get("account") or "(unattributed)"
+    m_id = row.get("model") or "(unknown)"
+    # A row written before this feature existed has no `key` field at all; a
+    # row from a deployment that never configured a key has one, and it is
+    # empty.
+    if "key" in row:
+        k_id = row.get("key") or KEY_BUCKET_ANON
+    else:
+        k_id = KEY_BUCKET_BEFORE
+    k_realm = row_realm(row) or ""
+    at = row.get("at") or 0
+    targets = ((maps, half),) if also is None else ((maps, half), also)
+    for tgt, (stat_key, models_key) in targets:
+        _feed_analytics(tgt["summary"], vals, is_err, cost_cny)
+
+        entry = tgt["accts"].get(acct_uid)
+        if entry is None:
+            entry = tgt["accts"][acct_uid] = {
+                "uid": acct_uid,
+                "nickname": acct_uid,
+                "realm": row.get("realm", ""),
+                "domain": "",
+                stat_key: _new_analytics_stat(),
+                models_key: {},
+            }
+        _feed_analytics(entry[stat_key], vals, is_err, cost_cny)
+        _bump_analytics_models(entry[models_key], m_id, vals, is_err, cost_cny)
+
+        model = tgt["models"].get(m_id)
+        if model is None:
+            model = tgt["models"][m_id] = {"model": m_id,
+                                           stat_key: _new_analytics_stat()}
+        _feed_analytics(model[stat_key], vals, is_err, cost_cny)
+
+        km = tgt["keys"].get(k_id)
+        if km is None:
+            km = tgt["keys"][k_id] = {
+                "key": k_id,
+                stat_key: _new_analytics_stat(),
+                models_key: {},
+                # realm -> row count. A key bound to one exit only ever sees
+                # that exit; a key with no binding follows the model, and its
+                # credit column then adds up two different products. Kept as a
+                # dict because this ends up in JSON.
+                "realms": {},
+                "last_at": 0,
+            }
+        km["realms"][k_realm] = km["realms"].get(k_realm, 0) + 1
+        if at and at > km["last_at"]:
+            km["last_at"] = at
+        _feed_analytics(km[stat_key], vals, is_err, cost_cny)
+        _bump_analytics_models(km[models_key], m_id, vals, is_err, cost_cny)
+
+
+_analytics_state = {}
+_analytics_state_lock = threading.Lock()
+
+
+def _analytics_all_time(realm, pricing_on=None):
+    """The cached all-time fold for one realm filter; returns (maps, offset).
+
+    One state per realm: the filter decides which rows the fold ever sees, so
+    two realms are two folds and neither may inherit the other's rows. Only
+    the all-time half is cached - the windowed half moves with the clock - and
+    the offset comes back with it so a windowed pass can stop where the fold
+    stopped.
+    """
+    with _analytics_state_lock:
+        state, offset, error = _analytics_state_ready(realm, pricing_on)
+        if error is None:
+            # Copied under the lock, same rule as the snapshot state: what
+            # the caller decorates must not be the live fold.
+            maps = _copy_analytics_all_time(state["maps"])
+        else:
+            # Same rule as the snapshot state: the row that stopped the
+            # fold may have half applied itself, so the state starts
+            # over next call. The offset still goes back - it is the
+            # end of that row - because the windowed half has to see
+            # it, and stop there, to describe the same bytes the
+            # all-time half already folded.
+            log("compute_usage_analytics failed: %s" % error)
+            maps = state["maps"]
+            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
+    if error is None:
+        _usage_cache_maybe_save("analytics", offset)
+    return maps, offset
+
+
+def _analytics_state_ready(realm, pricing_on=None):
+    """把 `realm` 的 all-time 折叠推进到文件尾；返回 (state, offset, error)。
+
+    调用方必须已持有 _analytics_state_lock。日桶与 all-time 折叠共用这一次
+    扫描（见 _fold_usage_analytics 的 also），窗口半与 all-time 半因此描述
+    同一段字节。
+    """
+    state = _analytics_state.get(realm)
+    if state is None:
+        state = _analytics_state[realm] = {"maps": _new_analytics_maps(),
+                                           "offset": 0, "key": None,
+                                           "pricing": None, "realm": None,
+                                           "tail": b"", "days": {},
+                                           "days_floor": None}
+    pricing = _pricing_inputs(pricing_on)
+    realm_inputs = _realm_inputs()
+    log_key = _usage_log_key()
+    if state["key"] is None:
+        # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+        if not _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
+            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
+    elif (not _pricing_unchanged(state["pricing"], pricing)
+            or state["realm"] != realm_inputs
+            or not _log_resume_ok(state, log_key)):
+        state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
+                      "days": {}, "days_floor": None})
+    state.update({"pricing": pricing, "realm": realm_inputs, "key": log_key})
+
+    def fold(row):
+        # 一行折两处：all-time 半 + 它所属那天的窗口半（过滤与算价只做一次）。
+        day = _usage_day_bucket(state, row, realm, _day_analytics_bucket)
+        _fold_usage_analytics(
+            row, realm, state["maps"], _ANALYTICS_ALL, pricing_on,
+            also=None if day is None else (day, _ANALYTICS_WINDOW))
+
+    offset, error = _scan_usage_from(state["offset"], fold)
+    if error is None:
+        state["offset"] = offset
+        state["tail"] = _log_tail_signature(offset)
+    return state, offset, error
+
+
+def _analytics_window_from_days(realm, day_key, pricing_on):
+    """窗口半 maps = 窗口内的日桶之和；日桶不可用时返回 None。
+
+    先确保 all-time 折叠推进到文件尾：日桶与它同一次扫描推进，窗口半与
+    all-time 半因此描述同一段字节（旧实现用 stop_at 保证的同一件事）。
+    """
+    with _analytics_state_lock:
+        state, offset, error = _analytics_state_ready(realm, pricing_on)
+        if error is not None:
+            log("compute_usage_analytics failed: %s" % error)
+            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
+            return None
+        if not _days_cover(state, day_key):
+            return None
+        maps = _new_analytics_maps()
+        days = state["days"]
+        for key in sorted(days):
+            if key >= day_key:
+                _add_analytics_window_maps(maps, days[key])
+    _usage_cache_maybe_save("analytics", offset)
+    return maps
+
+
+def _analytics_window(realm, since, until, stop_at, pricing_on):
+    """窗口半 analytics：对齐窗口由日桶相加，其余保持整段扫描。
+
+    与 _usage_snapshot_window 同一条规矩：只有「until 开放 + 起点是本地
+    午夜」的窗口拆得成整天的并集。
+    """
+    day_key = _window_day_key(since) if until is None else None
+    if day_key is not None and _usage_day_buckets_enabled():
+        maps = _analytics_window_from_days(realm, day_key, pricing_on)
+        if maps is not None:
+            return maps
+        # 日桶没盖住窗口起点：冷路径现折一份按日分组的窗口半，口径一致。
+        return _scan_usage_analytics_window_days(realm, since, stop_at,
+                                                 pricing_on)
+    return _scan_usage_analytics_window(realm, since, until, stop_at=stop_at,
+                                        pricing_on=pricing_on)
+
+
+def _scan_usage_analytics_window(realm, since, until, stop_at=None, pricing_on=None):
+    """One pass over the log, folding only the rows inside the window.
+
+    The all-time half is not rebuilt here - it comes from the incremental fold
+    - and the read stops where that fold stopped, so both halves of the
+    payload describe the same bytes even when a row lands mid-rebuild.
+    """
+    maps = _new_analytics_maps()
+
+    def fold(row):
+        # Same bounds as /usage and /usage/perf, so the three readers agree on
+        # what the selected range contains.
+        at = row.get("at", 0)
+        if since is not None and at < since:
+            return
+        if until is not None and at > until:
+            return
+        _fold_usage_analytics(row, realm, maps, _ANALYTICS_WINDOW, pricing_on)
+
+    _, error = _scan_usage_from(
+        0, fold, stop_at=stop_at,
+        skip=lambda line: _line_outside_window(line, since, until))
+    if error is not None:
+        log("compute_usage_analytics failed: %s" % error)
+    return maps
+
+
+def _copy_analytics_models(models):
+    """Copy one {model: {...}} bucket; its inner dicts are only ever read."""
+    return {mid: dict(entry) for mid, entry in models.items()}
+
+
+def _copy_analytics_all_time(maps):
+    """A private copy of the cached all-time maps.
+
+    The payload build decorates what it is given (finalize writes the
+    derived ratios into the stat dicts) and the cached fold keeps growing
+    under a concurrent refresh, so the caller gets a copy taken while the
+    state lock is held rather than a live view of it.
+    """
+    out = {"summary": dict(maps["summary"]), "accts": {}, "models": {}, "keys": {}}
+    for uid, entry in maps["accts"].items():
+        copy = dict(entry)
+        copy["all_time"] = dict(entry["all_time"])
+        copy["all_models"] = _copy_analytics_models(entry["all_models"])
+        out["accts"][uid] = copy
+    for m_id, entry in maps["models"].items():
+        out["models"][m_id] = {"model": m_id, "all_time": dict(entry["all_time"])}
+    for k_id, km in maps["keys"].items():
+        copy = dict(km)
+        copy["all_time"] = dict(km["all_time"])
+        copy["all_models"] = _copy_analytics_models(km["all_models"])
+        out["keys"][k_id] = copy
+    return out
+
+
+def _merge_analytics_halves(all_maps, win_maps):
+    """Combine the cached all-time fold with the windowed one.
+
+    `win_maps` is `all_maps` itself when no range was selected - every row is
+    inside an open window, so the windowed half is the all-time fold over
+    again. The halves are copied apart in that case, which is what a second
+    pass would have produced without the second pass, and it keeps a caller
+    that mutates one half out of the other (and out of the cache).
+
+    An entry only the windowed half knows cannot exist: the windowed pass
+    stops where the all-time fold stopped, so every row it saw is already in
+    there.
+    """
+    shared = win_maps is all_maps
+    acct_map = {}
+    for uid, entry in all_maps["accts"].items():
+        win = win_maps["accts"].get(uid)
+        if shared:
+            window_stat = dict(entry["all_time"])
+            window_models = _copy_analytics_models(entry["all_models"])
+        elif win is None:
+            window_stat = _new_analytics_stat()
+            window_models = {}
+        else:
+            window_stat = win["window"]
+            window_models = win["window_models"]
+        acct_map[uid] = {
+            "uid": uid,
+            "nickname": uid,
+            "realm": entry["realm"],
+            "domain": "",
+            "window": window_stat,
+            "all_time": dict(entry["all_time"]),
+            "window_models": window_models,
+            "all_models": _copy_analytics_models(entry["all_models"]),
+        }
+    model_map = {}
+    for m_id, entry in all_maps["models"].items():
+        stat = entry["all_time"]
+        win = win_maps["models"].get(m_id)
+        if shared:
+            window_stat = dict(stat)
+        elif win is None:
+            window_stat = _new_analytics_stat()
+        else:
+            window_stat = win["window"]
+        model_map[m_id] = {"model": m_id, "window": window_stat,
+                           "all_time": dict(stat)}
+    key_map = {}
+    for k_id, km in all_maps["keys"].items():
+        win = win_maps["keys"].get(k_id)
+        if shared:
+            window_stat = dict(km["all_time"])
+            window_models = _copy_analytics_models(km["all_models"])
+        elif win is None:
+            window_stat = _new_analytics_stat()
+            window_models = {}
+        else:
+            window_stat = win["window"]
+            window_models = win["window_models"]
+        key_map[k_id] = {
+            "key": k_id,
+            "window": window_stat,
+            "all_time": dict(km["all_time"]),
+            "window_models": window_models,
+            "all_models": _copy_analytics_models(km["all_models"]),
+            "realms": dict(km["realms"]),
+            "last_at": km["last_at"],
+        }
+    return {"summary": dict(all_maps["summary"]),
+            "window_summary": (dict(all_maps["summary"]) if shared
+                               else win_maps["summary"]),
+            "accts": acct_map, "models": model_map, "keys": key_map}
 
 
 def _add_analytics_stat(dst, src):
@@ -1827,6 +4573,516 @@ def _add_analytics_stat(dst, src):
     for field, value in src.items():
         if isinstance(value, (int, float)):
             dst[field] += value
+
+
+# ---------------------------------------------------------------------------
+# 按日分桶：窗口半的增量
+#
+# all-time 半已经是增量（按字节偏移折叠 + 落盘 checkpoint），但窗口半
+# （range=today / week / month）仍然是「从头扫到窗口」：窗口越宽扫得越多，
+# 路由器上一次 range=week 要 5 秒。窗口的边界全是本地午夜（range_window()），
+# 而每行只属于一天，所以只要在折叠时顺手把每一行折进「它所属那天的桶」，
+# 任何窗口就退化成「把窗口内的日桶相加」——O(天数)，checkpoint 带着日桶
+# 时冷缓存也是瞬间。
+#
+# 时间边界只认一个规则：行的本地日由行自己的 at 决定（_local_day_key），
+# 与 range_window() 的 today/week/month 用的是同一套本地午夜。折叠时刻不
+# 参与切天——迟写/补写的行必须落进它时间戳所属的那天，按折叠时刻切会让
+# 窗口相加错位。跨夏令时同理：日桶的键是本地日历日，只要窗口起点是本地
+# 午夜，「日键 >= 窗口日键」就是「at >= since」的等价写法（见 _window_day_key）。
+#
+# 已封口的日桶不会再变（新行只落进今天那一桶），窗口相加时旧桶原样复用；
+# 状态只在新建桶时剪枝（_prune_day_buckets），剪掉的只是任何窗口都够不到
+# 的天。剪枝会抬高 days_floor，任何够不到的天都因此退回整段扫描——宁可多
+# 扫一次，不能少算一天。
+#
+# 浮点求和的口径：窗口 = 日桶逐日相加，与旧实现「整段扫描逐行累加」的区别
+# 只是浮点的结合顺序（credit / cost_cny / speed_sum 可能差最后一两个 ulp，
+# 整数字段逐位相同）。逐行顺序无法从日聚合还原，这是日桶推导的固有代价；
+# 本文件里所有对齐窗口的路径统一用「按日分组」的口径（冷扫描、日桶、加载
+# checkpoint 三条路径给出的字节完全一致），把「像没有缓存一样正确」保成
+# 路径之间的一致性。WB_USAGE_DAY_BUCKETS=0 可整体退回旧的逐行口径。
+# ---------------------------------------------------------------------------
+
+# 日桶保留天数：月窗口最多回溯 30 天（当月 1 号），32 天留两天余量。更早的
+# 天没有任何窗口够得到，留着只让 checkpoint 白白变大——路由器上每次写盘都
+# 要重写整份文件。调小它（WB_USAGE_DAY_KEEP_DAYS）会让更宽的窗口退回整段
+# 扫描（结果仍然正确，只是慢）：对 flash 写入敏感的部署可以调到 8，只保周。
+_USAGE_DAY_KEEP_DAYS = 32
+
+# 日桶求和要跳过的字段：started 是每份快照各自的创建时刻，不是累计量。
+# 与 _USAGE_CACHE_SNAPSHOT_NUMBERS 同源（同一份构造函数的数字字段），只是
+# 在模块加载顺序上不能引用它（那段常量在文件更靠后），所以这里自己推导。
+_USAGE_DAY_SNAPSHOT_FIELDS = tuple(
+    k for k, v in _empty_stats().items()
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and k != "started")
+
+
+def _usage_day_keep_days():
+    """日桶保留天数，默认 32；WB_USAGE_DAY_KEEP_DAYS 可调。
+
+    每次调用都读环境变量，理由与 WB_USAGE_CACHE 相同（现场调、测试里来回切）。
+    """
+    try:
+        return max(1, int(os.environ.get("WB_USAGE_DAY_KEEP_DAYS",
+                                         _USAGE_DAY_KEEP_DAYS)))
+    except (TypeError, ValueError):
+        return _USAGE_DAY_KEEP_DAYS
+
+
+def _usage_day_buckets_enabled():
+    """日桶总开关，默认开；WB_USAGE_DAY_BUCKETS=0 退回逐行扫描口径。
+
+    与 WB_USAGE_CACHE 同样的用法：现场紧急关掉、测试在一个进程里来回切。
+    关掉时既不折日桶也不用它们，窗口路径与改动前逐字节一致。
+    """
+    return os.environ.get("WB_USAGE_DAY_BUCKETS", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _local_day_key(ts):
+    """ts 所属的本地日历日，"YYYY-MM-DD"。
+
+    用字符串而不是午夜 epoch 当日桶的键：窗口与日桶的比较就是一次字符串
+    比较（ISO 日期天然有序），查询不必再算一遍本地午夜，也不会被夏令时的
+    日长变化影响——同一套本地日历日规则在折叠与查询两侧都成立。
+    """
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def _day_key_start(key):
+    """日键 -> 该日的本地午夜 epoch。"""
+    lt = time.strptime(key, "%Y-%m-%d")
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+def _window_day_key(since):
+    """窗口起点能由日桶推导时返回它的日键，否则 None。
+
+    只有「起点正好是本地午夜」的窗口才拆得成整天的并集：at >= 本地午夜
+    等价于「日键 >= 那天的键」。自定义区间的起点是任意时刻，拆不开——那条
+    路径保持整段扫描（正确性优先）。
+    """
+    if since is None:
+        return None
+    if _local_midnight(since) != since:
+        return None
+    return _local_day_key(since)
+
+
+def _day_snapshot_bucket(key, day_start):
+    """一天一份的窗口半快照桶；形状与 _empty_stats() 一致。
+
+    started 不参与求和（见 _add_usage_snapshot），形状保留只是让校验与
+    all-time 半共用同一套 _usage_cache_snapshot_ok。
+    """
+    return _empty_stats()
+
+
+def _day_analytics_bucket(key, day_start):
+    """一天一份的窗口形状 analytics maps。"""
+    return _new_analytics_maps()
+
+
+def _day_series_bucket(key, day_start):
+    """一天一份的时间序列桶（带小时子表，见 _fold_usage_series）。"""
+    bucket = _new_series_bucket(day_start)
+    bucket["hours"] = {}
+    return bucket
+
+
+def _usage_day_bucket(state, row, r, factory):
+    """这一行该折进哪个日桶；必要时新建（顺带剪枝），不该折时返回 None。
+
+    行的归属只看它自己的 at：补写/迟到的行必须落进它时间戳所属的那天。
+    realm 不匹配的行折叠本来就会跳过，这里也不为它建桶；总开关关掉时连
+    日桶都不折（窗口路径也不会用它们，见 _usage_day_buckets_enabled）。
+    """
+    if not _usage_day_buckets_enabled():
+        return None
+    if r and not row_matches_realm(row, r):
+        return None
+    at = row.get("at") or 0
+    key = _local_day_key(at)
+    floor = state.get("days_floor")
+    if floor is not None and key < floor:
+        # 剪枝线以下的天：那些桶已经被丢掉，而且任何可服务的窗口都从
+        # days_floor 那天起，这一行不在其中——跳过不影响窗口。
+        return None
+    days = state["days"]
+    bucket = days.get(key)
+    if bucket is None:
+        bucket = days[key] = factory(key, _day_key_start(key))
+        _prune_day_buckets(state, days, key)
+    return bucket
+
+
+def _prune_day_buckets(state, days, newest_key):
+    """丢掉任何窗口都够不到的旧日桶，并把 days_floor 抬到剪枝线。
+
+    days_floor 的语义是「这份状态从哪天起是完整的」：它就是剪枝线（最新那天
+    往前 _usage_day_keep_days() 天），没剪过时第一次折到新的一天也会把它记
+    下来——比这条线更早的窗口一律退回整段扫描（时钟大幅回拨、日志里有远古
+    补写行这类情况），宁可多扫一次，不能少算一天。
+    """
+    horizon = _local_day_key(_day_key_start(newest_key)
+                             - _usage_day_keep_days() * 86400)
+    for old in [k for k in days if k < horizon]:
+        del days[old]
+    floor = state.get("days_floor")
+    if floor is None or floor < horizon:
+        state["days_floor"] = horizon
+
+
+def _days_cover(state, day_key):
+    """这份状态的日桶能否服务以 day_key 为起点的窗口。
+
+    days_floor 是剪枝线：比它早的窗口可能少了被剪掉的天，只能退回扫描。
+    它最早也要折到第一个新的一天才会记下（没折过就是 None，此时谁都不服务
+    ——调用方总是先折到文件尾，所以实际不会遇到）。
+    """
+    floor = state.get("days_floor")
+    return floor is not None and day_key >= floor
+
+
+def _add_usage_bucket(dst_map, key, src):
+    """把一个 by_model* 桶并入同键的桶（不存在就整只拷进来）。"""
+    dst = dst_map.get(key)
+    if dst is None:
+        dst_map[key] = _copy_usage_bucket(src)
+        return
+    for field in _USAGE_CACHE_BUCKET_NUMBERS:
+        dst[field] += src.get(field) or 0
+    for acct, count in src["accounts"].items():
+        dst["accounts"][acct] = dst["accounts"].get(acct, 0) + count
+
+
+def _add_usage_snapshot(dst, src):
+    """把一份窗口半快照按字段并入另一份（日桶求和用）。
+
+    逐字段相加，不是重折：日桶是不可变的聚合，窗口只是它们的和。started
+    是每份快照各自的创建时刻，不是累计量，跳过。
+    """
+    for field in _USAGE_DAY_SNAPSHOT_FIELDS:
+        dst[field] += src.get(field) or 0
+    for mid, count in src["cost_missing"].items():
+        dst["cost_missing"][mid] = dst["cost_missing"].get(mid, 0) + count
+    for mid, bucket in src["by_model"].items():
+        _add_usage_bucket(dst["by_model"], mid, bucket)
+    for mid, realms in src["by_model_realm"].items():
+        for rr, bucket in realms.items():
+            _add_usage_bucket(dst["by_model_realm"].setdefault(mid, {}), rr, bucket)
+    for mid, realms in src["by_model_acct"].items():
+        for rr, accts in realms.items():
+            tgt = dst["by_model_acct"].setdefault(mid, {}).setdefault(rr, {})
+            for acct, bucket in accts.items():
+                _add_usage_bucket(tgt, acct, bucket)
+
+
+def _add_analytics_models(dst, src):
+    """把一份 {model: {requests, tokens, reasoning, cost_cny}} 并入另一份。"""
+    for mid, stat in src.items():
+        tgt = dst.get(mid)
+        if tgt is None:
+            dst[mid] = dict(stat)
+            continue
+        for field in ("requests", "tokens", "reasoning", "cost_cny"):
+            tgt[field] += stat.get(field) or 0
+
+
+def _add_analytics_window_maps(dst, src):
+    """把一份窗口形状的 analytics maps 并入另一份（日桶求和用）。
+
+    日桶本身就是 _ANALYTICS_WINDOW 那一半的形状（window / window_models），
+    所以这里只动这两个键；realms / last_at 照并，虽然 _merge_analytics_halves
+    最终取的是 all-time 侧的值。
+    """
+    _add_analytics_stat(dst["summary"], src["summary"])
+    for uid, entry in src["accts"].items():
+        tgt = dst["accts"].get(uid)
+        if tgt is None:
+            tgt = dst["accts"][uid] = {
+                "uid": uid, "nickname": uid, "realm": entry["realm"],
+                "domain": "", "window": _new_analytics_stat(),
+                "window_models": {}}
+        _add_analytics_stat(tgt["window"], entry["window"])
+        _add_analytics_models(tgt["window_models"], entry["window_models"])
+    for mid, entry in src["models"].items():
+        tgt = dst["models"].get(mid)
+        if tgt is None:
+            tgt = dst["models"][mid] = {"model": mid,
+                                        "window": _new_analytics_stat()}
+        _add_analytics_stat(tgt["window"], entry["window"])
+    for kid, entry in src["keys"].items():
+        tgt = dst["keys"].get(kid)
+        if tgt is None:
+            tgt = dst["keys"][kid] = {
+                "key": kid, "window": _new_analytics_stat(),
+                "window_models": {}, "realms": {}, "last_at": 0}
+        _add_analytics_stat(tgt["window"], entry["window"])
+        _add_analytics_models(tgt["window_models"], entry["window_models"])
+        for rr, count in entry["realms"].items():
+            tgt["realms"][rr] = tgt["realms"].get(rr, 0) + count
+        if entry["last_at"] > tgt["last_at"]:
+            tgt["last_at"] = entry["last_at"]
+
+
+def _copy_analytics_window_maps(maps):
+    """一份窗口形状 maps 的深拷贝（落盘用，形状同 _new_analytics_maps()）。"""
+    out = {"summary": dict(maps["summary"]), "accts": {}, "models": {}, "keys": {}}
+    for uid, entry in maps["accts"].items():
+        copy = dict(entry)
+        copy["window"] = dict(entry["window"])
+        copy["window_models"] = _copy_analytics_models(entry["window_models"])
+        out["accts"][uid] = copy
+    for mid, entry in maps["models"].items():
+        out["models"][mid] = {"model": mid, "window": dict(entry["window"])}
+    for kid, km in maps["keys"].items():
+        copy = dict(km)
+        copy["window"] = dict(km["window"])
+        copy["window_models"] = _copy_analytics_models(km["window_models"])
+        copy["realms"] = dict(km["realms"])
+        out["keys"][kid] = copy
+    return out
+
+
+def _scan_usage_snapshot_window_days(r, since, pricing_on=None):
+    """窗口半的冷路径：整段扫一遍，先按日分桶再相加。
+
+    日桶状态不可用（还没折过、被剪枝、折叠出错）时走这里。结果必须与日桶
+    状态给出的窗口半逐字节一致：窗口起点是本地午夜，两边装的是同一批行、
+    同一个「按日分组」的求和口径，只是桶一个现折、一个存量。
+    """
+    days = {}
+
+    def fold(row):
+        at = row.get("at") or 0
+        if since and at < since:
+            return
+        key = _local_day_key(at)
+        bucket = days.get(key)
+        if bucket is None:
+            bucket = days[key] = _empty_stats()
+        _fold_usage_snapshot(row, bucket, r, None, None, pricing_on)
+
+    _, error = _scan_usage_from(
+        0, fold,
+        skip=lambda line: _line_outside_window(line, since or None, None))
+    if error is not None:
+        log(f"usage snapshot read failed: {error}")
+    snap = _empty_stats()
+    for key in sorted(days):
+        _add_usage_snapshot(snap, days[key])
+    return snap
+
+
+def _scan_usage_analytics_window_days(realm, since, stop_at=None, pricing_on=None):
+    """窗口半 analytics 的冷路径：按日分桶再相加（见 snapshot 版）。"""
+    days = {}
+
+    def fold(row):
+        at = row.get("at") or 0
+        if since is not None and at < since:
+            return
+        key = _local_day_key(at)
+        maps = days.get(key)
+        if maps is None:
+            maps = days[key] = _new_analytics_maps()
+        _fold_usage_analytics(row, realm, maps, _ANALYTICS_WINDOW, pricing_on)
+
+    _, error = _scan_usage_from(
+        0, fold, stop_at=stop_at,
+        skip=lambda line: _line_outside_window(line, since, None))
+    if error is not None:
+        log("compute_usage_analytics failed: %s" % error)
+    out = _new_analytics_maps()
+    for key in sorted(days):
+        _add_analytics_window_maps(out, days[key])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 时间序列的日/小时桶
+#
+# usage_timeseries() 本来就把行按时间装桶，但每次缓存未命中都要整段扫描
+# （路由器上 range=week 约 2 秒）。窗口边界同样是本地午夜，而它的桶宽只有
+# 3600 与 86400 两种能与窗口对齐（span<=6h 的分钟桶只出现在自定义区间，
+# 那条路保持整段扫描）。折叠时顺手维护日桶与小时桶，窗口就是它们的切片：
+# 每个输出桶恰好等于一个存量桶（不做跨桶相加），所以连浮点求和都是逐位
+# 一致的——不像 snapshot/analytics 的窗口半需要把日桶相加。
+# ---------------------------------------------------------------------------
+_series_state = {}
+_series_state_lock = threading.Lock()
+# credit 历史只保留最近这么多条（整段扫描返回的也是窗口内的前 50 条）。
+_SERIES_CREDITS_KEEP = 50
+
+
+def _new_series_bucket(at):
+    """一个时间序列桶；键序与 _usage_timeseries_uncached 的输出逐字一致。"""
+    return {"at": at, "requests": 0, "errors": 0, "prompt_tokens": 0,
+            "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
+            "total_tokens": 0, "credit": 0.0}
+
+
+def _feed_series_bucket(bucket, row):
+    """一行折进一个序列桶（日桶或小时桶）。
+
+    口径与 _usage_timeseries_uncached 的折叠逐条一致：completed 计 requests
+    与令牌，其它结果（含客户端中止）计 errors；credit 只要不是客户端中止就
+    累加。
+    """
+    outcome = row_outcome(row)
+    if outcome == "completed":
+        bucket["requests"] += 1
+        for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens",
+                      "cached_tokens", "total_tokens"):
+            bucket[field] += (row.get(field) or 0)
+    else:
+        bucket["errors"] += 1
+    if outcome != "client_aborted":
+        bucket["credit"] += (row.get("credit") or 0)
+
+
+def _series_credit_push(credits, row, at):
+    """把一条带 credit 的行放进「最近 50 条」缓冲。
+
+    整段扫描返回的 credits 是窗口内按 at 倒序的前 50 条；缓冲里始终留着
+    最新的一批（至少 50 条，涨到 100 条时裁回 50），于是任何后缀窗口
+    （today/week/month 都是）的前 50 条都在这批里——比缓冲最旧一条还旧的
+    行不可能是窗口的前 50 条。at 相同时两边都是稳定排序，顺序（日志顺序）
+    一致。
+    """
+    credits.append({"at": at, "iso": row.get("iso") or "",
+                    "model": row.get("model") or "",
+                    "account": row.get("account") or "",
+                    "credit": row.get("credit") or 0,
+                    "total_tokens": row.get("total_tokens") or 0})
+    if len(credits) > _SERIES_CREDITS_KEEP * 2:
+        credits.sort(key=lambda item: item.get("at") or 0, reverse=True)
+        del credits[_SERIES_CREDITS_KEEP:]
+
+
+def _fold_usage_series(row, r, state):
+    """一行折进时间序列状态：日桶 + 小时桶 + credit 缓冲。"""
+    at = row.get("at") or 0
+    if at > state["max_at"]:
+        # 折过的最大 at：窗口上界（hi=now）只要不低于它，存量桶就都在窗口内。
+        # 越界的行（时钟回拨/补写）会让它偏大，那只是更保守，方向安全。
+        state["max_at"] = at
+    bucket = _usage_day_bucket(state, row, r, _day_series_bucket)
+    if bucket is None:
+        return
+    _feed_series_bucket(bucket, row)
+    if at < bucket["at"]:
+        # 本地午夜落在不存在的小时里（极少数时区的夏令时正好在午夜切换）：
+        # 这一天的行放不进小时格点，把 hours 摘掉让切片对这一天整体退回扫描
+        # （日桶本身照常，step=86400 的切片不受影响）。
+        bucket.pop("hours", None)
+        return
+    # 小时子桶按「离那天的本地午夜多少秒」切：窗口起点是本地午夜时，窗口
+    # 序列的桶序号 k = 天序号*24 + 小时序号（夏令时不在日边界上时也一样，
+    # 因为两边都是纯 epoch 算术；日边界被夏令时挪动的情形由 _series_slice
+    # 的格点校验挡住）。键写成字符串，与 JSON 往返后的形状一致。
+    hour = str(int((at - bucket["at"]) // 3600))
+    sub = bucket["hours"].get(hour)
+    if sub is None:
+        sub = bucket["hours"][hour] = _new_series_bucket(
+            bucket["at"] + int(hour) * 3600)
+    _feed_series_bucket(sub, row)
+    if (row.get("credit") or 0) > 0:
+        _series_credit_push(state["credits"], row, at)
+
+
+def _usage_series_state_ready(r):
+    """把 `r` 的时间序列状态推进到文件尾；返回 (state, offset, error)。
+
+    调用方必须已持有 _series_state_lock。时间序列折叠不算价，所以状态只带
+    realm 指纹（行没有 realm 字段时 row_realm() 会读它）。
+    """
+    state = _series_state.get(r)
+    if state is None:
+        state = _series_state[r] = {
+            "days": {}, "days_floor": None, "max_at": 0, "credits": [],
+            "offset": 0, "key": None, "realm": None, "tail": b""}
+    realm = _realm_inputs()
+    log_key = _usage_log_key()
+    if state["key"] is None:
+        # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+        if not _usage_cache_adopt_series(r, state, log_key, realm):
+            state.update({"days": {}, "days_floor": None, "max_at": 0,
+                          "credits": [], "offset": 0, "tail": b""})
+    elif state["realm"] != realm or not _log_resume_ok(state, log_key):
+        state.update({"days": {}, "days_floor": None, "max_at": 0,
+                      "credits": [], "offset": 0, "tail": b""})
+    state.update({"realm": realm, "key": log_key})
+    offset, error = _scan_usage_from(
+        state["offset"], lambda row: _fold_usage_series(row, r, state))
+    if error is None:
+        state["offset"] = offset
+        state["tail"] = _log_tail_signature(offset)
+    return state, offset, error
+
+
+def _series_output_bucket(bucket):
+    """存量桶 -> 输出桶（键序固定；日桶的 hours 子表不进输出）。"""
+    return {"at": bucket["at"], "requests": bucket["requests"],
+            "errors": bucket["errors"], "prompt_tokens": bucket["prompt_tokens"],
+            "completion_tokens": bucket["completion_tokens"],
+            "reasoning_tokens": bucket["reasoning_tokens"],
+            "cached_tokens": bucket["cached_tokens"],
+            "total_tokens": bucket["total_tokens"], "credit": bucket["credit"]}
+
+
+def _series_slice(state, realm, lo, hi, step, day_key):
+    """窗口序列 = 日桶/小时桶的切片；不满足对齐条件时返回 None。
+
+    成立条件（缺一不可，任何一条不成立就退回整段扫描——正确性优先）：
+      * 窗口起点是本地午夜（day_key 由 _window_day_key 给出）；
+      * 桶宽是 3600 或 86400（与窗口对齐的两种）；
+      * days_floor 覆盖窗口起点（剪枝/更早的天没折过就只能整段扫）；
+      * hi 不低于折过的最大 at，否则窗口上界会切掉桶里的行；
+      * 每个桶的 at 落在 lo + k*step 的格点上。这一条同时挡住夏令时：日长
+        不是 86400 秒的那天之后，每一天的本地午夜都不再落在 86400 的格点上，
+        于是自动退回整段扫描。时区没有夏令时（cn/路由器）时恒真。
+    """
+    if step not in (3600, 86400):
+        return None
+    if hi < state["max_at"]:
+        return None
+    if not _days_cover(state, day_key):
+        return None
+    lo_i = int(lo)
+    series = []
+    for key in sorted(state["days"]):
+        if key < day_key:
+            continue
+        bucket = state["days"][key]
+        day_at = int(bucket["at"])
+        if (day_at - lo_i) % 86400:
+            return None
+        if step == 86400:
+            series.append(_series_output_bucket(bucket))
+            continue
+        hours = bucket.get("hours")
+        if hours is None:
+            # 这一天的小时格点不成立（见 _fold_usage_series 的午夜兜底）：
+            # 整个窗口退回整段扫描，不能只跳过这一天。
+            return None
+        for hour in sorted(hours, key=int):
+            sub = hours[hour]
+            if int(sub["at"]) != day_at + int(hour) * 3600:
+                return None
+            if (int(sub["at"]) - lo_i) % 3600:
+                return None
+            series.append(_series_output_bucket(sub))
+    # credit 历史：缓冲按 at 倒序稳定排序后取窗口内的前 50 条——与整段扫描
+    # 的选择逐条相同（见 _series_credit_push 的论证）。
+    credits = sorted(state["credits"], key=lambda item: item.get("at") or 0,
+                     reverse=True)
+    credits = [c for c in credits if (c.get("at") or 0) >= lo][:_SERIES_CREDITS_KEEP]
+    return {"ok": True, "realm": realm or "all",
+            "bucket_seconds": step, "since": lo, "until": hi,
+            "series": series, "credits": credits}
 
 
 def _top_models(bucket, top_n=KEY_MODEL_TOP_N):
@@ -1895,9 +5151,13 @@ def _build_key_rows(key_map, realm=None):
         rows[k_id] = empty_row(k_id, entry.get("name") or k_id, declared,
                                entry.get("enabled", True) is not False, "panel")
     # The launcher key (--api-key / API_KEY) lives in no settings file, so it
-    # is only ever visible as an id in the log. It gets a row when it could
-    # have been used at all, which is what keeps the totals reconcilable.
-    if "launcher" not in rows and (API_KEY or "launcher" in key_map):
+    # is only ever visible as an id in the log. It is not an attribution
+    # dimension: once the panel holds any key of its own the launcher key is
+    # no longer accepted at all (see identify_key), so an unused one is a
+    # permanent zero that says nothing about who spent what. Give it a row
+    # only when the log shows it was actually used - the only state in which
+    # it carries history worth reconciling.
+    if "launcher" not in rows and "launcher" in key_map:
         rows["launcher"] = empty_row("launcher", "启动参数", "", True, "launcher")
 
     def adopt(row, km):
@@ -1991,14 +5251,26 @@ def _finalize_analytics_stat(stat_obj):
 
 def _compute_usage_analytics_uncached(realm=None, since=None, until=None):
     """Detailed analytics for Token, Cache, and Reasoning metrics page."""
-    all_summary = _new_analytics_stat()
-    window_summary = _new_analytics_stat()
-    acct_map = {}
-    model_map = {}
-    key_map = {}
-    _scan_usage_log(all_summary, window_summary, acct_map, model_map,
-                    since=since, until=until, realm=realm, key_map=key_map)
+    # 与 /usage 快照同一条规矩：一次扫描里总开关只问一次，值传进折叠与指纹。
+    pricing_on = wb_pricing.pricing_enabled()
+    all_maps, offset = _analytics_all_time(realm, pricing_on)
+    if since is None and until is None:
+        # An open window covers every row, so the windowed half is the
+        # all-time fold over again; the merge copies the two apart.
+        win_maps = all_maps
+    else:
+        # The all-time half is not re-folded: the windowed half comes from
+        # the day buckets that fold advanced (or, failing that, from a pass
+        # that stops where that fold stopped), so one page never mixes two
+        # reads.
+        win_maps = _analytics_window(realm, since, until, offset, pricing_on)
+    parts = _merge_analytics_halves(all_maps, win_maps)
+    acct_map = parts["accts"]
+    model_map = parts["models"]
+    key_map = parts["keys"]
     _enrich_accounts_from_pool(acct_map, realm=realm)
+    all_summary = parts["summary"]
+    window_summary = parts["window_summary"]
     _finalize_analytics_stat(all_summary)
     _finalize_analytics_stat(window_summary)
     for a in acct_map.values():
@@ -2027,6 +5299,1053 @@ def _compute_usage_analytics_uncached(realm=None, since=None, until=None):
         # is a second view of the same spend, not a breakdown of it.
         "keys": keys_list,
     }
+
+
+# ---------------------------------------------------------------------------
+# 聚合状态落盘（重启后免冷扫）
+#
+# 上面的三份增量聚合（_usage_alltime_snapshot / _usage_by_account_buckets /
+# _analytics_all_time）把状态放在模块级字典里，进程一重启就全丢：第一次刷新
+# 仍是全量扫一遍日志。日志每天涨一万多行，冷扫描成本跟着线性上升——路由器
+# 上 2.7 万行的一次冷启动要 6~8 秒，一个月后接近两分钟。这里把三份状态连同
+# 它们的位置信息写进数据目录下的一个 JSON 文件，重启后第一次刷新只读文件
+# 尾部的新增字节。
+#
+# 文件放在数据目录里是刻意的：它和日志同生命周期，跟着 sysupgrade 一起走，
+# 也和日志一起被搬走、清掉。读写失败（只读文件系统、磁盘满、权限不足）一律
+# 静默降级——checkpoint 只是加速，丢的是一次加速，绝不能影响服务本身。
+#
+# 加载校验复用 #189 已有的原语，不另造一套：offset 必须仍落在同一个文件的
+# 现有字节里（_log_offset_holds），offset 前的最后 64 字节必须与写下时一致
+# （_log_tail_signature），再加上价格/realm 指纹和 schema 版本。任何一项对不
+# 上就当没有缓存、走全量——宁可多扫一次，也不能给出错的数字。
+# ---------------------------------------------------------------------------
+
+# 数据目录下的文件名。usage/*.json 已被 .gitignore 覆盖。
+_USAGE_CACHE_NAME = "usage-aggregate-cache.json"
+# 状态结构或折叠口径一变就 +1，旧文件整体作废。这是唯一挡在「旧结构喂进新
+# 代码」前面的东西，改动状态形状时别忘了它。
+# v2：写盘不再排序（v1 用 sort_keys 写，加载回来所有 dict 变字母序，响应
+# 与冷启动逐字节不同）。键顺序算状态结构的一部分，所以旧文件必须整体作废
+# ——否则那份字母序会一直粘在内存里，直到日志尾部被重写才会被清掉。
+# v3：状态多了按日分桶（窗口半的增量）与时间序列的日/小时桶。载荷形状变了，
+# 旧文件同样整体作废：升级后第一次刷新做一次全量折叠（一次性代价，之后
+# checkpoint 照旧）——这正是把窗口半也变成增量的入场费。
+_USAGE_CACHE_SCHEMA = 3
+
+
+def _usage_cache_enabled():
+    """落盘总开关，默认开；WB_USAGE_CACHE=0 关。
+
+    每次调用都读环境变量而不是在导入时定死：现场用它紧急关掉，测试用它在一
+    个进程里来回切，而一次 os.environ.get 的开销在刷新路径上可以忽略。
+    """
+    return os.environ.get("WB_USAGE_CACHE", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _usage_cache_path():
+    """checkpoint 的路径。
+
+    每次调用重算，而不是在导入时算成常量：--usage-dir、测试和探针脚本都会
+    在导入之后改 USAGE_DIR，常量会写到旧目录去。
+    """
+    return os.path.join(USAGE_DIR, _USAGE_CACHE_NAME)
+
+
+def _usage_cache_min_bytes():
+    """写盘节流：折叠推进不足这么多字节就不写。默认 1MB。
+
+    1MB 是「重启后最多回放多少」的上限——路由器上扫描约 0.5s/MB，回放 1MB
+    等于冷启动成本多半秒；而日志每天涨 6MB 上下，正常流量下一天也未必触发
+    一次。写小了是写放大（路由器 flash 写入慢且费寿命），写大了重启变慢。
+    """
+    try:
+        return max(0, int(os.environ.get("WB_USAGE_CACHE_MIN_BYTES", 1024 * 1024)))
+    except (TypeError, ValueError):
+        return 1024 * 1024
+
+
+def _usage_cache_min_seconds():
+    """写盘节流：距上次尝试不足这么多秒就不写。默认 900s（15 分钟）。
+
+    这条兜住「字节阈值还没到、但偏移已经推进了一点」的情况：不设它，一段
+    短流量之后停下的日志要等到下次凑满 1MB 才会落盘。15 分钟让面板开着时
+    一天最多约百次写盘（每次几十 KB），对 flash 友好；重启回放的上限则是
+    min(1MB, 15 分钟流量)。
+    """
+    try:
+        return max(0.0, float(os.environ.get("WB_USAGE_CACHE_MIN_SECONDS", 900)))
+    except (TypeError, ValueError):
+        return 900.0
+
+
+_usage_cache_lock = threading.Lock()
+# 写盘串行锁：只被 _usage_cache_maybe_save() 拿一次、且永远是最外层（拿它
+# 之后才拿状态锁/节流锁），所以它不参与任何锁序环。
+_usage_cache_write_lock = threading.Lock()
+# 进程启动后只读一次 checkpoint：读到就记下来（按 realm 逐份取用），读不到
+# 也记 None——坏文件、只读文件系统都不该让每次刷新都去解析一遍。
+_usage_cache_loaded = False
+_usage_cache_read_result = None
+# 写盘节流状态，全部由 _usage_cache_lock 保护：
+#   progress[kind]     —— 本进程见过该类状态折叠到的最远 offset；
+#   checkpointed[kind] —— 该类状态上次「尝试」落盘时的 offset（失败也记，
+#                         只读文件系统上不能每次刷新都去试写一遍）；
+#   last_attempt       —— 上次尝试写盘的时刻，时间阈值与失败退避都靠它。
+# 按「类」记账而不是记一个总数：某类状态第一次折叠（或中途重扫）时 offset
+# 从 0 跳到文件尾，这一类要尽快落盘，而刚采用过 checkpoint 的类不能被别的
+# 类的推进带着白写一遍。
+_usage_cache_progress = {}
+_usage_cache_checkpointed = {}
+_usage_cache_last_attempt = time.time()
+
+
+def _usage_cache_data():
+    """checkpoint 的解析结果，或 None。
+
+    调用点可能在状态锁内（采用阶段），所以本函数会取 _usage_cache_lock；
+    反向的锁序不存在——写盘路径取状态锁之前一定先放开本锁，见
+    _usage_cache_maybe_save。
+    """
+    global _usage_cache_loaded, _usage_cache_read_result
+    if not _usage_cache_enabled():
+        return None
+    if _usage_cache_loaded:
+        return _usage_cache_read_result
+    with _usage_cache_lock:
+        if not _usage_cache_loaded:
+            _usage_cache_read_result = _usage_cache_read()
+            _usage_cache_loaded = True
+        return _usage_cache_read_result
+
+
+def _usage_cache_read():
+    """读 checkpoint 文件并做顶层校验；任何一步不成立都返回 None。
+
+    None 和「文件不存在」同义：调用方按没有缓存处理，绝不因此报错。
+    """
+    try:
+        with open(_usage_cache_path(), "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    # 先看类型再看值：JSON 的 true 在 Python 里等于 1，schema: true 不能算
+    # 「版本 1」。
+    if not _usage_cache_int(data.get("schema")):
+        return None
+    if data["schema"] != _USAGE_CACHE_SCHEMA:
+        return None
+    return data
+
+
+_usage_cache_digest_memo = {}
+
+
+def _object_digest(obj):
+    """一段 JSON 内容摘要，按对象身份记忆；算不出来返回 None。
+
+    记忆表的值强引用对象本身，所以 id() 不会被回收复用；超过几条就整体清空
+    ——正常进程里价表对象只在价格变化时换代，这里只是给长期运行兜底。
+    """
+    hit = _usage_cache_digest_memo.get(id(obj))
+    if hit is not None and hit[0] is obj:
+        return hit[1]
+    try:
+        payload = json.dumps(obj, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha1(payload).hexdigest()
+    except Exception:
+        return None
+    if len(_usage_cache_digest_memo) > 8:
+        _usage_cache_digest_memo.clear()
+    _usage_cache_digest_memo[id(obj)] = (obj, digest)
+    return digest
+
+
+def _pricing_inputs_key(inputs):
+    """把 _pricing_inputs() 的元组压成一段跨进程可比的价格指纹。
+
+    进程内那套靠对象身份（_pricing_unchanged），身份活不过重启，所以这里存
+    内容摘要。摘要取的是取价函数真正返回的对象而不是价表文件：文件损坏时会
+    回退到内联表，折叠读到的也是内联表，指纹必须描述折叠真正读的东西；文件
+    不在时内联表有没有变过，也只有摘要看得出来。
+    """
+    if inputs is None:
+        return None
+    if not inputs[0]:
+        # 总开关关着：取价路径一个价表都不读，开关本身就是全部输入。
+        return ["off"]
+    digests = []
+    for obj in inputs[1:]:
+        digest = _object_digest(obj)
+        if digest is None:
+            return None
+        digests.append(digest)
+    return ["on"] + digests
+
+
+def _realm_inputs_key(inputs):
+    """realm 指纹本来就是值比较（不是身份），JSON 化后原样可比。"""
+    if inputs is None:
+        return None
+    realm, accounts = inputs
+    return [realm, [[uid, r] for uid, r in accounts]]
+
+
+# 折叠会就地累加/读取的字段集合直接从构造函数推导：上游往 _empty_stats() 或
+# _new_analytics_stat() 里加字段时这里自动跟着收——漏一个，放行的缓存就会在
+# 折叠半路抛 KeyError，那次刷新报出半份数字（折叠的错误路径只保留已折的
+# 部分）。
+_USAGE_CACHE_SNAPSHOT_NUMBERS = tuple(
+    k for k, v in _empty_stats().items()
+    if isinstance(v, (int, float)) and not isinstance(v, bool))
+_USAGE_CACHE_SNAPSHOT_MAPS = ("cost_missing", "by_model", "by_model_realm", "by_model_acct")
+_USAGE_CACHE_ANALYTICS_NUMBERS = tuple(_new_analytics_stat().keys())
+_USAGE_CACHE_BUCKET_NUMBERS = ("requests", "cost_cny") + USAGE_FIELDS
+# 时间序列桶的数字字段（_new_series_bucket 的键，含 at）。从构造函数推导，
+# 与上面两条同一个道理：上游加字段时校验自动跟着收。
+_USAGE_CACHE_SERIES_NUMBERS = tuple(_new_series_bucket(0).keys())
+
+
+def _usage_cache_number(value):
+    """折叠累加的数字。bool 是 int 的子类，必须挡掉。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _usage_cache_int(value):
+    """严格整数：JSON 里写成 12345.0 的不算。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _usage_cache_counts_ok(counts):
+    """{str: 数字} 形状的计数表（cost_missing / models / realms）。"""
+    if not isinstance(counts, dict):
+        return False
+    for key, value in counts.items():
+        if not isinstance(key, str) or not _usage_cache_number(value):
+            return False
+    return True
+
+
+def _usage_cache_bucket_ok(bucket):
+    """一个 by_model* 桶：折叠会就地累加这些键。"""
+    if not isinstance(bucket, dict):
+        return False
+    for field in _USAGE_CACHE_BUCKET_NUMBERS:
+        if not _usage_cache_number(bucket.get(field)):
+            return False
+    return _usage_cache_counts_ok(bucket.get("accounts"))
+
+
+def _usage_cache_snapshot_ok(snap):
+    """snapshot 折叠的形状。
+
+    少一个键，折叠或 _copy_usage_snapshot() 就会半路抛错，那次刷新报出半份
+    数字——校验必须挡在采用之前。
+    """
+    if not isinstance(snap, dict):
+        return False
+    for field in _USAGE_CACHE_SNAPSHOT_NUMBERS:
+        if not _usage_cache_number(snap.get(field)):
+            return False
+    for field in _USAGE_CACHE_SNAPSHOT_MAPS:
+        if not isinstance(snap.get(field), dict):
+            return False
+    if not _usage_cache_counts_ok(snap["cost_missing"]):
+        return False
+    for _, bucket in snap["by_model"].items():
+        if not _usage_cache_bucket_ok(bucket):
+            return False
+    for _, realms in snap["by_model_realm"].items():
+        if not isinstance(realms, dict):
+            return False
+        for _, bucket in realms.items():
+            if not _usage_cache_bucket_ok(bucket):
+                return False
+    for _, realms in snap["by_model_acct"].items():
+        if not isinstance(realms, dict):
+            return False
+        for _, accts in realms.items():
+            if not isinstance(accts, dict):
+                return False
+            for _, bucket in accts.items():
+                if not _usage_cache_bucket_ok(bucket):
+                    return False
+    return True
+
+
+def _usage_cache_stat_ok(stat):
+    """一个 analytics 统计桶：折叠会就地累加它的每一个字段。"""
+    if not isinstance(stat, dict):
+        return False
+    for field in _USAGE_CACHE_ANALYTICS_NUMBERS:
+        if not _usage_cache_number(stat.get(field)):
+            return False
+    return True
+
+
+def _usage_cache_models_ok(models):
+    """analytics 的 {model: {requests, tokens, reasoning, cost_cny}} 表。"""
+    if not isinstance(models, dict):
+        return False
+    for mid, stat in models.items():
+        if not isinstance(mid, str) or not isinstance(stat, dict):
+            return False
+        for field in ("requests", "tokens", "reasoning", "cost_cny"):
+            if not _usage_cache_number(stat.get(field)):
+                return False
+    return True
+
+
+def _usage_cache_analytics_window_ok(maps):
+    """窗口形状的 analytics maps（日桶）：同一批表，装的是 window 那一半。
+
+    与 _usage_cache_analytics_ok 是两份形状，不能互相顶替：日桶只折窗口半，
+    少 all_time/all_models 两个键，用 all-time 的校验器会把整份 analytics
+    entry 拒掉（连它自己那份 all-time 也一起丢），窗口就退回整段扫描。
+    """
+    if not isinstance(maps, dict):
+        return False
+    if not _usage_cache_stat_ok(maps.get("summary")):
+        return False
+    accts, models, keys = maps.get("accts"), maps.get("models"), maps.get("keys")
+    if not isinstance(accts, dict) or not isinstance(models, dict) or not isinstance(keys, dict):
+        return False
+    for uid, entry in accts.items():
+        if not isinstance(uid, str) or not isinstance(entry, dict):
+            return False
+        for field in ("nickname", "realm", "domain"):
+            if not isinstance(entry.get(field), str):
+                return False
+        if not _usage_cache_stat_ok(entry.get("window")):
+            return False
+        if not _usage_cache_models_ok(entry.get("window_models")):
+            return False
+    for mid, entry in models.items():
+        if not isinstance(mid, str) or not isinstance(entry, dict):
+            return False
+        if not isinstance(entry.get("model"), str):
+            return False
+        if not _usage_cache_stat_ok(entry.get("window")):
+            return False
+    for kid, entry in keys.items():
+        if not isinstance(kid, str) or not isinstance(entry, dict):
+            return False
+        if not isinstance(entry.get("key"), str):
+            return False
+        if not _usage_cache_stat_ok(entry.get("window")):
+            return False
+        if not _usage_cache_models_ok(entry.get("window_models")):
+            return False
+        if not _usage_cache_counts_ok(entry.get("realms")):
+            return False
+        if not _usage_cache_number(entry.get("last_at")):
+            return False
+    return True
+
+
+def _usage_cache_analytics_ok(maps):
+    """analytics all-time maps：summary/accts/models/keys 四张表。"""
+    if not isinstance(maps, dict):
+        return False
+    if not _usage_cache_stat_ok(maps.get("summary")):
+        return False
+    accts, models, keys = maps.get("accts"), maps.get("models"), maps.get("keys")
+    if not isinstance(accts, dict) or not isinstance(models, dict) or not isinstance(keys, dict):
+        return False
+    for uid, entry in accts.items():
+        if not isinstance(uid, str) or not isinstance(entry, dict):
+            return False
+        for field in ("nickname", "realm", "domain"):
+            if not isinstance(entry.get(field), str):
+                return False
+        if not _usage_cache_stat_ok(entry.get("all_time")):
+            return False
+        if not _usage_cache_models_ok(entry.get("all_models")):
+            return False
+    for mid, entry in models.items():
+        if not isinstance(mid, str) or not isinstance(entry, dict):
+            return False
+        if not isinstance(entry.get("model"), str):
+            return False
+        if not _usage_cache_stat_ok(entry.get("all_time")):
+            return False
+    for kid, entry in keys.items():
+        if not isinstance(kid, str) or not isinstance(entry, dict):
+            return False
+        if not isinstance(entry.get("key"), str):
+            return False
+        if not _usage_cache_stat_ok(entry.get("all_time")):
+            return False
+        if not _usage_cache_models_ok(entry.get("all_models")):
+            return False
+        if not _usage_cache_counts_ok(entry.get("realms")):
+            return False
+        if not _usage_cache_number(entry.get("last_at")):
+            return False
+    return True
+
+
+def _usage_cache_buckets_ok(buckets):
+    """by_account 的 {account: 桶}：折叠会就地累加每个桶。"""
+    if not isinstance(buckets, dict):
+        return False
+    for key, bucket in buckets.items():
+        if not isinstance(key, str) or not isinstance(bucket, dict):
+            return False
+        if not isinstance(bucket.get("account"), str):
+            return False
+        for field in ("requests", "prompt_tokens", "completion_tokens",
+                      "reasoning_tokens", "cached_tokens", "total_tokens"):
+            if not _usage_cache_number(bucket.get(field)):
+                return False
+        if not _usage_cache_counts_ok(bucket.get("models")):
+            return False
+    return True
+
+
+def _usage_cache_remaining_ok(entry):
+    """剩余用量折叠：事件表 + 每个 (账号, 模型) 的 at/cum 两个平行列表。
+
+    at 必须单调（窗口求和靠二分找左端）、cum 必须单调且与 at 等长——这两条
+    是加载后一切查询的前提，坏一条就会静默算出错数字，所以逐元素走一遍：
+    一次重启付 1~3ms，换掉一次全量冷扫。
+    """
+    if not isinstance(entry, dict):
+        return False
+    if not _usage_cache_int(entry.get("offset")) or entry.get("offset") <= 0:
+        return False
+    if not isinstance(entry.get("tail"), str):
+        return False
+    key = entry.get("key")
+    if not isinstance(key, list) or len(key) != 3 or not all(
+            _usage_cache_int(v) for v in key):
+        return False
+    file_pos = entry.get("file")
+    if not isinstance(file_pos, dict) or not _usage_cache_int(file_pos.get("offset")):
+        return False
+    if not isinstance(file_pos.get("tail"), str):
+        return False
+    file_key = file_pos.get("key")
+    if not isinstance(file_key, list) or len(file_key) != 3 or not all(
+            _usage_cache_int(v) for v in file_key):
+        return False
+    events = entry.get("events")
+    if not isinstance(events, list) or len(events) > _REMAINING_MAX_EVENTS:
+        return False
+    for event in events:
+        if not isinstance(event, dict):
+            return False
+        if not isinstance(event.get("account"), str) or not isinstance(event.get("model"), str):
+            return False
+        for field in ("at", "reset", "sample"):
+            if not _usage_cache_number(event.get(field)):
+                return False
+    usage = entry.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    for pair_key, pair in usage.items():
+        if (not isinstance(pair_key, str) or "\x1f" not in pair_key
+                or not isinstance(pair, dict)):
+            return False
+        at = pair.get("at")
+        cum = pair.get("cum")
+        if not isinstance(at, list) or not isinstance(cum, list) or len(at) != len(cum):
+            return False
+        if not _usage_cache_int(pair.get("head")) or not _usage_cache_int(pair.get("base")):
+            return False
+        if pair["head"] < 0 or pair["head"] > len(at) or pair["base"] < 0:
+            return False
+        last_at = None
+        for value in at:
+            if not _usage_cache_number(value):
+                return False
+            if last_at is not None and value < last_at:
+                return False
+            last_at = value
+        last_cum = None
+        for value in cum:
+            if not _usage_cache_int(value):
+                return False
+            if last_cum is not None and value < last_cum:
+                return False
+            last_cum = value
+        # base 是「保留区之前那段的累计和」，cum 从最早一行累计且含被裁前缀，
+        # 所以 base 不可能超过 cum[0]。旧版压缩把 base 累加过（第二次起重复
+        # 计入前缀），这样的条目必须整份拒绝——否则左端落在保留区之前的区间
+        # 求和会算出负数（真机面板显示过 -1293.5M）。
+        if cum and pair["base"] > cum[0]:
+            return False
+    return True
+
+
+def _usage_cache_day_key_ok(key):
+    """日键必须是 "YYYY-MM-DD"：窗口与日桶的比较靠的就是这个形状。"""
+    return (isinstance(key, str) and len(key) == 10 and key[4] == "-"
+            and key[7] == "-")
+
+
+def _usage_cache_days_ok(days, floor, bucket_ok):
+    """按日分桶的表：{日键: 桶}，floor 是「对哪些天完整」的下界（日键或 None）。
+
+    桶的形状由调用方给（snapshot / analytics / 时间序列各一套），日键与
+    floor 的形状在这里统一校验：键不是日期的桶永远不会被窗口选中，但也说明
+    这份状态不是我们写出来的，直接拒绝更干净。
+    """
+    if not isinstance(days, dict):
+        return False
+    if floor is not None and not _usage_cache_day_key_ok(floor):
+        return False
+    for key, bucket in days.items():
+        if not _usage_cache_day_key_ok(key) or not bucket_ok(bucket):
+            return False
+    return True
+
+
+def _usage_cache_series_bucket_ok(bucket):
+    """时间序列桶：9 个数字；日桶还带 hours 子表（小时键是数字字符串）。
+
+    小时键写成字符串是 JSON 往返决定的（JSON 的对象键只能是字符串），折叠
+    侧因此从一开始就用 str(小时序号)，加载回来的状态与现折的状态形状一致。
+    """
+    if not isinstance(bucket, dict):
+        return False
+    for field in _USAGE_CACHE_SERIES_NUMBERS:
+        if not _usage_cache_number(bucket.get(field)):
+            return False
+    hours = bucket.get("hours")
+    if hours is None:
+        return True
+    if not isinstance(hours, dict):
+        return False
+    for hour, sub in hours.items():
+        if not (isinstance(hour, str) and hour.isdigit()):
+            return False
+        if not isinstance(sub, dict) or "hours" in sub:
+            return False
+        for field in _USAGE_CACHE_SERIES_NUMBERS:
+            if not _usage_cache_number(sub.get(field)):
+                return False
+    return True
+
+
+def _usage_cache_credits_ok(credits):
+    """credit 缓冲：{at, iso, model, account, credit, total_tokens} 的列表。"""
+    if not isinstance(credits, list):
+        return False
+    for item in credits:
+        if not isinstance(item, dict):
+            return False
+        for field in ("at", "credit", "total_tokens"):
+            if not _usage_cache_number(item.get(field)):
+                return False
+        for field in ("iso", "model", "account"):
+            if not isinstance(item.get(field), str):
+                return False
+    return True
+
+
+def _usage_cache_take(kind, realm=None):
+    """从 checkpoint 数据里取出一份状态（取过即删），没有合适的返回 None。
+
+    snapshot/analytics 按 realm 匹配（JSON 的 null 表示不限 realm），
+    by_account / remaining 只有一份。逐份取用：同一份不会被第二次采用，也就
+    不存在「先取走、校验失败、下个 realm 又拿到一份脏状态」的路径。
+    """
+    data = _usage_cache_data()
+    if not data:
+        return None
+    entries = data.get(kind)
+    if not isinstance(entries, list):
+        return None
+    # 取走这一步也要在锁里：两个 realm 的首次刷新可能同时到这里，一个
+    # 边遍历边 pop、另一个也在 pop，遍历就会跳过条目。跳过的后果只是这次
+    # 不采用（安全方向），但少一次竞争就少一个要解释的路径。
+    with _usage_cache_lock:
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            if kind not in ("by_account", "remaining"):
+                # realm 字段必须显式存在且类型正确：realm=None 的折叠（全部
+                # realm）和某个具体 realm 的折叠是两份不同的状态，缺字段的
+                # 条目一旦被 None 匹配走，就会把「只折了一个 realm」的数字
+                # 当成「全部 realm」报出去。
+                entry_realm = entry.get("realm")
+                if "realm" not in entry or not (entry_realm is None
+                                                or isinstance(entry_realm, str)):
+                    continue
+                if entry_realm != realm:
+                    continue
+            entries.pop(index)
+            return entry
+    return None
+
+
+def _usage_cache_position_ok(entry, log_key):
+    """校验一份状态的 (offset, key, tail)；不合格返回 None。
+
+    复用 #189 的两个原语而不是另造一套：offset 必须仍落在同一个文件的现有
+    字节里（dev/ino 相同、当前 size >= offset），并且 offset 前的最后 64 字节
+    与写下时一致——文件被替换、截短、copytruncate 后重写都会被这两条挡住。
+    """
+    offset = entry.get("offset")
+    key = entry.get("key")
+    tail_hex = entry.get("tail")
+    if not _usage_cache_int(offset) or offset <= 0:
+        return None
+    if not isinstance(key, list) or len(key) != 3 or not all(
+            _usage_cache_int(v) for v in key):
+        return None
+    if not isinstance(tail_hex, str):
+        return None
+    try:
+        tail = bytes.fromhex(tail_hex)
+    except ValueError:
+        return None
+    if not _log_offset_holds(tuple(key), log_key, offset):
+        return None
+    if _log_tail_signature(offset) != tail:
+        return None
+    return offset, tail
+
+
+def _usage_cache_fingerprints_ok(entry, pricing_key, realm_key):
+    """价格与 realm 指纹必须和当前进程读到的一致。
+
+    任一侧取不到（None）都算不一致：取不到就意味着「折叠当时读了什么」已经
+    无法确认，缓存不能当有效用。
+    """
+    if pricing_key is None or realm_key is None:
+        return False
+    return entry.get("pricing") == pricing_key and entry.get("realm_inputs") == realm_key
+
+
+def _usage_cache_note_adopted(kind, offset):
+    """采用成功后的节流初始化：刚加载的 offset 不算「有新字节要写」。
+
+    不初始化的话，重启后第一次刷新会把「offset 从 0 涨到文件尾」当成一次大
+    推进，白白重写一份内容相同的文件。
+    """
+    global _usage_cache_last_attempt
+    with _usage_cache_lock:
+        if offset > _usage_cache_progress.get(kind, 0):
+            _usage_cache_progress[kind] = offset
+        if offset > _usage_cache_checkpointed.get(kind, 0):
+            _usage_cache_checkpointed[kind] = offset
+        _usage_cache_last_attempt = time.time()
+
+
+def _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
+    """把 checkpoint 里对应 realm 的 snapshot 折叠装进 state；成功返回 True。
+
+    调用方持有 _usage_snap_state_lock，并且只在 state 全新时调用：采用只把
+    offset/tail 往前挪，折叠逻辑一行不动。
+    """
+    entry = _usage_cache_take("snapshot", r)
+    if entry is None:
+        return False
+    position = _usage_cache_position_ok(entry, log_key)
+    if position is None:
+        return False
+    if not _usage_cache_fingerprints_ok(entry, _pricing_inputs_key(pricing),
+                                        _realm_inputs_key(realm)):
+        return False
+    snap = entry.get("snap")
+    if not _usage_cache_snapshot_ok(snap):
+        return False
+    days = entry.get("days")
+    floor = entry.get("days_floor")
+    if not _usage_cache_days_ok(days, floor, _usage_cache_snapshot_ok):
+        return False
+    offset, tail = position
+    state.update({"snap": snap, "offset": offset, "tail": tail,
+                  "days": days, "days_floor": floor})
+    _usage_cache_note_adopted("snapshot", offset)
+    return True
+
+
+def _usage_cache_adopt_by_account(state, log_key):
+    """by_account 折叠的采用；这一份没有价格/realm 指纹（折叠不读它们）。"""
+    entry = _usage_cache_take("by_account")
+    if entry is None:
+        return False
+    position = _usage_cache_position_ok(entry, log_key)
+    if position is None:
+        return False
+    buckets = entry.get("buckets")
+    if not _usage_cache_buckets_ok(buckets):
+        return False
+    offset, tail = position
+    state.update({"buckets": buckets, "offset": offset, "tail": tail})
+    _usage_cache_note_adopted("by_account", offset)
+    return True
+
+
+def _usage_cache_adopt_remaining(state, log_key):
+    """剩余用量折叠的采用；同样没有价格/realm 指纹（折叠不读它们）。
+
+    事件日志的位置在这里单独校验：它很小，位置对不上就整份放弃——冷读一遍
+    两个文件比「先采用一半、再发现对不上」简单得多。
+    """
+    entry = _usage_cache_take("remaining")
+    if entry is None or not _usage_cache_remaining_ok(entry):
+        return False
+    position = _usage_cache_position_ok(entry, log_key)
+    if position is None:
+        return False
+    try:
+        file_state = {"offset": entry["file"]["offset"],
+                      "key": tuple(entry["file"]["key"]),
+                      "tail": bytes.fromhex(entry["file"]["tail"])}
+    except ValueError:
+        return False
+    if not _log_resume_ok(file_state, _usage_log_key(LIMIT_EVENTS_FILE),
+                          LIMIT_EVENTS_FILE):
+        return False
+    offset, tail = position
+    usage = {}
+    for pair_key, pair in entry["usage"].items():
+        uid, _, model = pair_key.partition("\x1f")
+        usage[(uid, model)] = {"at": list(pair["at"]), "cum": list(pair["cum"]),
+                               "head": pair["head"], "base": pair["base"]}
+    state["log"] = {"offset": offset, "key": tuple(entry["key"]), "tail": tail}
+    state["file"] = file_state
+    state["usage"] = usage
+    state["events"] = [dict(event) for event in entry["events"]]
+    state["keys"] = {(event["account"], event["model"], float(event["reset"]))
+                     for event in state["events"]}
+    _usage_cache_note_adopted("remaining", offset)
+    return True
+
+
+def _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
+    """analytics all-time 折叠的采用。"""
+    entry = _usage_cache_take("analytics", realm)
+    if entry is None:
+        return False
+    position = _usage_cache_position_ok(entry, log_key)
+    if position is None:
+        return False
+    if not _usage_cache_fingerprints_ok(entry, _pricing_inputs_key(pricing),
+                                        _realm_inputs_key(realm_inputs)):
+        return False
+    maps = entry.get("maps")
+    if not _usage_cache_analytics_ok(maps):
+        return False
+    days = entry.get("days")
+    floor = entry.get("days_floor")
+    if not _usage_cache_days_ok(days, floor, _usage_cache_analytics_window_ok):
+        return False
+    offset, tail = position
+    state.update({"maps": maps, "offset": offset, "tail": tail,
+                  "days": days, "days_floor": floor})
+    _usage_cache_note_adopted("analytics", offset)
+    return True
+
+
+def _usage_cache_adopt_series(r, state, log_key, realm_inputs):
+    """时间序列状态的采用；这一份只有 realm 指纹（折叠不算价）。"""
+    entry = _usage_cache_take("series", r)
+    if entry is None:
+        return False
+    position = _usage_cache_position_ok(entry, log_key)
+    if position is None:
+        return False
+    realm_key = _realm_inputs_key(realm_inputs)
+    if realm_key is None or entry.get("realm_inputs") != realm_key:
+        return False
+    days = entry.get("days")
+    floor = entry.get("days_floor")
+    if not _usage_cache_days_ok(days, floor, _usage_cache_series_bucket_ok):
+        return False
+    max_at = entry.get("max_at")
+    if not _usage_cache_number(max_at):
+        return False
+    credits = entry.get("credits")
+    if not _usage_cache_credits_ok(credits):
+        return False
+    offset, tail = position
+    state.update({"days": days, "days_floor": floor, "max_at": max_at,
+                  "credits": credits, "offset": offset, "tail": tail})
+    _usage_cache_note_adopted("series", offset)
+    return True
+
+
+def _usage_cache_days_copy(days, copy_bucket):
+    """日桶表的深拷贝（序列化在锁外做，桶必须和活状态脱钩）。"""
+    return {key: copy_bucket(bucket) for key, bucket in (days or {}).items()}
+
+
+def _copy_series_day(bucket):
+    """一个时间序列日桶的深拷贝（含 hours 子表）。"""
+    copy = dict(bucket)
+    copy["hours"] = {h: dict(sub) for h, sub in (bucket.get("hours") or {}).items()}
+    return copy
+
+
+def _usage_cache_snapshot_entry(realm, state):
+    """一份 snapshot 状态的 JSON 形态；不适合落盘时返回 None。
+
+    只写「折叠成功过」的状态：错误路径会把 offset 归零，这里直接跳过——
+    offset 为 0 的缓存没有任何加速作用，写进去只会让加载端白校验一遍。
+    """
+    offset = state.get("offset") or 0
+    tail = state.get("tail")
+    if offset <= 0 or not isinstance(tail, bytes) or state.get("snap") is None:
+        return None
+    pricing_key = _pricing_inputs_key(state.get("pricing"))
+    realm_inputs = state.get("realm")
+    realm_key = _realm_inputs_key(realm_inputs)
+    if pricing_key is None or realm_key is None:
+        return None
+    if not _realm_fold_reproducible(realm_inputs[1]):
+        # 这次折叠的归属冷进程复现不了（见 _realm_fold_reproducible）：写下去
+        # 会被按新归属当成有效。宁可这次不写，等池就绪/重载后再写。
+        return None
+    return {"realm": realm, "offset": offset,
+            "key": list(state["key"] or (0, 0, 0)), "tail": tail.hex(),
+            "pricing": pricing_key, "realm_inputs": realm_key,
+            # 深拷贝在锁内做，序列化在锁外做（见 _usage_cache_collect）。
+            "snap": _copy_usage_snapshot(state["snap"]),
+            # 按日分桶的窗口半：与 all-time 半同一次扫描折出来的，位置也
+            # 跟着同一条 offset/tail 校验，不另设一套。
+            "days": _usage_cache_days_copy(state.get("days"),
+                                           _copy_usage_snapshot),
+            "days_floor": state.get("days_floor")}
+
+
+def _usage_cache_by_account_entry(state):
+    """by_account 折叠的 JSON 形态；同上，只写折叠成功过的。"""
+    offset = state.get("offset") or 0
+    tail = state.get("tail")
+    buckets = state.get("buckets")
+    if offset <= 0 or not isinstance(tail, bytes) or not isinstance(buckets, dict):
+        return None
+    return {"offset": offset, "key": list(state["key"] or (0, 0, 0)),
+            "tail": tail.hex(),
+            # 深拷贝：序列化在锁外做，桶里的 models 必须和活状态脱钩。
+            "buckets": {k: dict(v, models=dict(v.get("models") or {}))
+                        for k, v in buckets.items()}}
+
+
+def _usage_cache_remaining_entry(state):
+    """剩余用量折叠的 JSON 形态；同上，只写折叠成功过的。
+
+    两份位置都要带上：usage.jsonl 的（加载端靠 _usage_cache_position_ok
+    校验）和事件日志的（很小，加载端整份比对）。缓冲以 "uid\\x1fmodel" 为
+    键——JSON 的对象键只能是字符串。
+    """
+    log = state.get("log") or {}
+    file_slot = state.get("file") or {}
+    events = state.get("events")
+    usage = state.get("usage")
+    offset = log.get("offset") or 0
+    tail = log.get("tail")
+    if offset <= 0 or not isinstance(tail, bytes):
+        return None
+    if not isinstance(events, list) or not isinstance(usage, dict):
+        return None
+    buffers = {}
+    for (uid, model), pair in usage.items():
+        if not isinstance(pair, dict):
+            return None
+        buffers["%s\x1f%s" % (uid, model)] = {
+            "at": list(pair.get("at") or ()),
+            "cum": list(pair.get("cum") or ()),
+            "head": int(pair.get("head") or 0),
+            "base": int(pair.get("base") or 0),
+        }
+    return {"offset": offset, "key": list(log.get("key") or (0, 0, 0)),
+            "tail": tail.hex(),
+            "file": {"offset": int(file_slot.get("offset") or 0),
+                     "key": list(file_slot.get("key") or (0, 0, 0)),
+                     "tail": (file_slot.get("tail") or b"").hex()},
+            "events": [dict(event) for event in events],
+            "usage": buffers}
+
+
+def _usage_cache_analytics_entry(realm, state):
+    """analytics all-time 折叠的 JSON 形态；同上。"""
+    offset = state.get("offset") or 0
+    tail = state.get("tail")
+    if offset <= 0 or not isinstance(tail, bytes):
+        return None
+    pricing_key = _pricing_inputs_key(state.get("pricing"))
+    realm_inputs = state.get("realm")
+    realm_key = _realm_inputs_key(realm_inputs)
+    if pricing_key is None or realm_key is None:
+        return None
+    if not _realm_fold_reproducible(realm_inputs[1]):
+        return None          # 同 snapshot：这次折叠的归属冷进程复现不了
+    return {"realm": realm, "offset": offset,
+            "key": list(state["key"] or (0, 0, 0)), "tail": tail.hex(),
+            "pricing": pricing_key, "realm_inputs": realm_key,
+            "maps": _copy_analytics_all_time(state["maps"]),
+            "days": _usage_cache_days_copy(state.get("days"),
+                                           _copy_analytics_window_maps),
+            "days_floor": state.get("days_floor")}
+
+
+def _usage_cache_series_entry(realm, state):
+    """时间序列状态的 JSON 形态；同上，只写折叠成功过的。
+
+    这一份最大（日桶 + 24 小时子桶 × 保留天数），所以深拷贝只拷桶本身，
+    credit 缓冲是 dict 列表、直接浅拷外层。
+    """
+    offset = state.get("offset") or 0
+    tail = state.get("tail")
+    if offset <= 0 or not isinstance(tail, bytes):
+        return None
+    realm_key = _realm_inputs_key(state.get("realm"))
+    if realm_key is None:
+        return None
+    return {"realm": realm, "offset": offset,
+            "key": list(state["key"] or (0, 0, 0)), "tail": tail.hex(),
+            "realm_inputs": realm_key,
+            "days": _usage_cache_days_copy(state.get("days"), _copy_series_day),
+            "days_floor": state.get("days_floor"),
+            "max_at": state.get("max_at") or 0,
+            "credits": [dict(item) for item in (state.get("credits") or [])]}
+
+
+def _usage_cache_collect():
+    """逐把取五份状态，做锁外可序列化的深拷贝；返回 (payload, offsets) 或 None。
+
+    每份状态单独加锁、单独拷贝，几份之间不强求同一个瞬间：加载端对每份分别
+    校验 offset/tail/指纹，一份新一份旧也各自成立。锁是逐把拿、随即放开的，
+    不存在嵌套——写盘路径不能制造「snapshot -> analytics」这样的锁序边。
+    """
+    snapshot_entries = []
+    by_account_entries = []
+    analytics_entries = []
+    series_entries = []
+    remaining_entries = []
+    offsets = {}
+    with _usage_snap_state_lock:
+        for realm, state in _usage_snap_state.items():
+            entry = _usage_cache_snapshot_entry(realm, state)
+            if entry is not None:
+                snapshot_entries.append(entry)
+                offsets["snapshot"] = max(offsets.get("snapshot", 0), state["offset"])
+    with _byacct_state_lock:
+        entry = _usage_cache_by_account_entry(_byacct_state)
+        if entry is not None:
+            by_account_entries.append(entry)
+            offsets["by_account"] = _byacct_state["offset"]
+    with _analytics_state_lock:
+        for realm, state in _analytics_state.items():
+            entry = _usage_cache_analytics_entry(realm, state)
+            if entry is not None:
+                analytics_entries.append(entry)
+                offsets["analytics"] = max(offsets.get("analytics", 0), state["offset"])
+    with _series_state_lock:
+        for realm, state in _series_state.items():
+            entry = _usage_cache_series_entry(realm, state)
+            if entry is not None:
+                series_entries.append(entry)
+                offsets["series"] = max(offsets.get("series", 0), state["offset"])
+    with _remaining_state_lock:
+        entry = _usage_cache_remaining_entry(_remaining_state)
+        if entry is not None:
+            remaining_entries.append(entry)
+            offsets["remaining"] = entry["offset"]
+    if not (snapshot_entries or by_account_entries or analytics_entries
+            or series_entries or remaining_entries):
+        return None
+    payload = {"schema": _USAGE_CACHE_SCHEMA, "written_at": time.time(),
+               "snapshot": snapshot_entries, "by_account": by_account_entries,
+               "analytics": analytics_entries, "series": series_entries,
+               # 新增的一类：老版本读这份文件时会忽略这个键（它只校验 schema
+               # 与自己的几个键），所以不用抬 schema、也就不会让别人的缓存失效。
+               "remaining": remaining_entries}
+    return payload, offsets
+
+
+def _usage_cache_write(payload):
+    """原子写：同目录临时文件 + os.replace。
+
+    直接在目标文件上写，崩在中间会留下半份 JSON；加载端虽然能识别（解析失败
+    按没有缓存处理），但一份完整的旧文件更省事。不 fsync：这是一份加速件，
+    掉电后写坏或丢掉的，加载端一律当没有缓存，不值得为它多刷一次盘。
+
+    不排序键：checkpoint 里 dict 的键顺序就是折叠时的插入顺序（先出现的先
+    排），加载回来必须与冷启动逐字节一致——响应的 JSON 字节里键序是可见的，
+    而冷启动折叠出的顺序正是这份插入顺序。排序只留给 _object_digest() 那种
+    「只要内容一样就算一样」的指纹。
+    """
+    path = _usage_cache_path()
+    tmp = path + ".tmp"
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _usage_cache_maybe_save(kind, offset):
+    """一次折叠成功后，按节流阈值决定要不要把三份状态落盘。
+
+    调用点必须在状态锁之外：这里要逐把取三份状态，在状态锁里再取别的状态锁
+    会构成锁序环（snapshot -> analytics 与反向同时存在）。任何异常都吞掉——
+    落盘失败只损失一次加速，不能影响这次刷新。
+    """
+    global _usage_cache_last_attempt
+    if not _usage_cache_enabled():
+        return
+    try:
+        # 串行化整段写盘：两个请求线程可能同时判定「该写」，而临时文件名是
+        # 固定的（path + ".tmp"，和 save_runtime_override 一致），两个写者
+        # 同时打开同一个临时文件会互相截断。等锁的一方在锁里会重新判定一遍，
+        # 第一个写者已经把 checkpointed 推上去，于是它多半直接返回。
+        with _usage_cache_write_lock:
+            now = time.time()
+            with _usage_cache_lock:
+                if offset > _usage_cache_progress.get(kind, 0):
+                    _usage_cache_progress[kind] = offset
+                min_bytes = _usage_cache_min_bytes()
+                min_seconds = _usage_cache_min_seconds()
+                due = any(_usage_cache_progress.get(k, 0)
+                          - _usage_cache_checkpointed.get(k, 0) >= min_bytes
+                          for k in _usage_cache_progress)
+                # 计时器分支只在**确有推进**时才允许触发：进度没动时写出的
+                # 是一份与上次逐字节相同的 checkpoint，纯写放大——面板开着
+                # 就每 900s 白写一份 120KB（复现见套件 [7]）。空闲重写对
+                # 「重启后免冷扫」没有任何贡献，只有日志增长才值得落盘。
+                advanced = any(_usage_cache_progress.get(k, 0)
+                               > _usage_cache_checkpointed.get(k, 0)
+                               for k in _usage_cache_progress)
+                if not due and (not advanced
+                                or (now - _usage_cache_last_attempt) < min_seconds):
+                    return
+                # 记「尝试」而不是「成功」：只读文件系统上失败会一直成立，
+                # 不退避的话每次刷新都去试写一遍。
+                _usage_cache_last_attempt = now
+            collected = _usage_cache_collect()
+            if collected is None:
+                return
+            payload, offsets = collected
+            _usage_cache_write(payload)
+            with _usage_cache_lock:
+                for k, value in offsets.items():
+                    if value > _usage_cache_checkpointed.get(k, 0):
+                        _usage_cache_checkpointed[k] = value
+    except Exception as exc:
+        log("usage aggregate cache write failed: %s" % exc)
+
+
 def runtime_settings_view():
     """Current panel-visible settings (never returns the password or the key)."""
     key = API_KEY or ""
@@ -2074,15 +6393,26 @@ def runtime_settings_view():
         "daily_credit_limit": wb_settings.daily_credit_limit(ACCOUNTS_DIR),
         "model_daily_token_limit": wb_settings.model_daily_token_limit(ACCOUNTS_DIR),
         "pricing_refresh_minutes": wb_settings.pricing_refresh_minutes(ACCOUNTS_DIR),
+        "credits_refresh_hours": wb_settings.credits_refresh_hours(ACCOUNTS_DIR),
+        "ui_language": wb_settings.ui_language(ACCOUNTS_DIR),
         "pricing_variant_inherit": wb_settings.pricing_variant_inherit(ACCOUNTS_DIR),
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
+        "remaining_priority_enabled":
+            wb_settings.remaining_priority_enabled(ACCOUNTS_DIR),
+        "accounts_collapsed": wb_settings.accounts_collapsed(ACCOUNTS_DIR),
+        "accounts_separate_tab": wb_settings.accounts_separate_tab(ACCOUNTS_DIR),
+        "key_before_hidden": wb_settings.key_before_hidden(ACCOUNTS_DIR),
+        "hidden_pages": wb_settings.hidden_pages(ACCOUNTS_DIR),
+        "update_check_enabled": wb_settings.update_check_enabled(ACCOUNTS_DIR),
+        "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
+        "prompt": wb_settings.prompt_config(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.6.14",
+        "version": "1.6.19",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -2105,25 +6435,77 @@ AFFINITY_BY_PREFIX = os.environ.get("WB_AFFINITY_BY_PREFIX", "1").lower() not in
     "0", "false", "no", "off")
 AFFINITY_DEBUG = os.environ.get("WB_AFFINITY_DEBUG", "0").lower() in (
     "1", "true", "yes", "on")
-def derive_affinity_key(messages):
-    """Derive a stable affinity key from a conversation's stable prefix.
-    The first two messages (system + first user turn) stay byte-identical for
-    the whole life of a conversation, so hashing them pins every later turn of
-    that conversation to the same upstream account - exactly what prompt
-    caching needs. Distinct conversations differ in their first user turn and
-    therefore still spread across the pool.
+# 亲和的上限：对话超过这么多条消息后不再绑定账号。
+#
+# 为什么需要上限：亲和把整段对话钉在同一个账号上，而对话的上下文是单调
+# 增长的，于是那一个账号要反复接收越来越大的请求体。实测（wk4 实例，
+# 2026-10-08，333 个请求）请求体与上游断连率的关系：
+#
+#     msgs <150    82 个请求   断连率  0.0%
+#     msgs 150-300 59 个请求   断连率  3.4%
+#     msgs 300-400 64 个请求   断连率  7.8%
+#     msgs 400-500 50 个请求   断连率 10.0%
+#
+# 断连（TimeoutError / RemoteDisconnected）会触发重试，把一个 8.8s 的请求
+# 拖到 11.6s，首字延迟随之翻倍。超过阈值后放弃亲和，让这个对话重新参与
+# 轮询：代价是它丢掉前缀缓存，收益是断连和重试消失。
+#
+# 阈值不能设得太低，否则会波及正常长度的对话（本实例 94% 的请求缓存命中率
+# 来自亲和）。设 0 表示不限制，保持 1.6.x 的原有行为。
+AFFINITY_MAX_MSGS = int(os.environ.get("WB_AFFINITY_MAX_MSGS", "400") or 0)
+# 超限对话改成【页内轮转】而不是撒到整个池子。
+#
+# 为什么：整池轮转下每个账号要等「池子大小」轮才再见到这段对话，间隔一旦
+# 超过上游缓存的存活期就整段漏。线上实测（2026-10-10，37706 条请求）：超限
+# 对话占 59% 的 prompt token，却贡献了 64% 的漏掉量，签名是只命中约 24k 的
+# 系统提示（账号见过同一客户端的系统提示、没见过这段历史）——典型的「落在
+# 没预热过的账号上」。页内轮转把「再见到」的周期从「池子大小」轮缩到 size
+# 轮，页里每个账号都留着前缀；同时超大请求体仍摊在 size 个账号上，不是压回
+# 一个（那正是 400 条上限要解决的断连问题）。
+#
+# 取值：≥2 = 页大小（账号数）；1 = 和普通对话一样钉住（等于取消上限）；
+# 0 = 保持 1.6.x 的整池轮转。页的划分见 wb_accounts.AccountPool._page_slice。
+AFFINITY_PAGE_SIZE = int(os.environ.get("WB_AFFINITY_PAGE_SIZE", "3") or 0)
+def affinity_route(messages):
+    """This conversation's (session_key, page).
+
+    `session_key` is the stable conversation key; `page` is the (index, size)
+    of the pool page a conversation past AFFINITY_MAX_MSGS rotates over, or
+    None for every other case (short conversations, the page switched off, and
+    conversations whose client supplied its own session key). Both come from
+    the same head hash, so every turn of a conversation agrees on its key and
+    its page without any server-side state.
     """
     if not AFFINITY_BY_PREFIX:
-        return None
+        return None, None
     try:
         msgs = messages or []
         if not msgs:
-            return None
+            return None, None
         head = msgs[:2]
         blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        return "pfx-" + hashlib.sha256(blob).hexdigest()[:16]
+        digest = hashlib.sha256(blob).hexdigest()[:16]
+        key = "pfx-" + digest
+        if AFFINITY_MAX_MSGS > 0 and len(msgs) > AFFINITY_MAX_MSGS:
+            if AFFINITY_PAGE_SIZE > 1:
+                page = (int(digest[:8], 16) % AFFINITY_PAGE_SIZE, AFFINITY_PAGE_SIZE)
+                if AFFINITY_DEBUG:
+                    log("affinity: %d msgs (> %d), page %d/%d"
+                        % (len(msgs), AFFINITY_MAX_MSGS, page[0], page[1]))
+                return key, page
+            if AFFINITY_PAGE_SIZE == 1:
+                # Pinned like any other conversation: the cap is switched off.
+                return key, None
+            if AFFINITY_DEBUG:
+                log("affinity: skip %d msgs (> %d), letting the pool rotate"
+                    % (len(msgs), AFFINITY_MAX_MSGS))
+            return None, None
+        return key, None
     except Exception:
-        return None
+        return None, None
+def derive_affinity_key(messages):
+    """Conversation key only; see affinity_route for the pool page."""
+    return affinity_route(messages)[0]
 def prompt_fingerprint(messages):
     """Privacy-safe fingerprint of the outgoing prompt.
     Cache hits need a byte-identical prefix, so these hashes answer "is my
@@ -2283,6 +6665,25 @@ INTL_UI_ORDER = [
     "kimi-k2.6",
     "kimi-k2.8-preview",
 ]
+def merge_reasoning(base, live):
+    """Field-level merge of one model's reasoning block.
+
+    The live catalogue is the source of truth, but it does not always restate
+    every field: the desktop endpoint sometimes gives a bare `effort` where the
+    bundled table knows the level is selectable. A top-level update would drop
+    `supportedEfforts`, and an `effort` without it reads as a pin - the model
+    then looks unselectable in /v1/models and every request to it is reported at
+    the wrong level. So the two blocks are merged field by field, and a block
+    that ends up with `supportedEfforts` is selectable: its `effort` is the
+    default restated, not a pin.
+    """
+    out = dict(base) if isinstance(base, dict) else {}
+    if isinstance(live, dict):
+        out.update(live)
+    if out.get("supportedEfforts") and out.get("effort"):
+        out.setdefault("defaultEffort", out["effort"])
+        out.pop("effort", None)
+    return out
 def merge_catalog(primary, realm=None, extras=False):
     r = realm or CURRENT_REALM
     merged = {}
@@ -2304,7 +6705,10 @@ def merge_catalog(primary, realm=None, extras=False):
             continue
         if meta:
             base = merged.get(mid) or {}
+            base_reasoning = base.get("reasoning")
             base.update(meta)
+            if isinstance(meta.get("reasoning"), dict):
+                base["reasoning"] = merge_reasoning(base_reasoning, meta["reasoning"])
             merged[mid] = base
         elif mid not in merged:
             merged[mid] = {}
@@ -2335,12 +6739,23 @@ def note_bundled_reasoning(realm, live, entries):
 
     The live catalogue is the source of truth and the snapshot is only the
     fallback, so values the snapshot alone carries can be no fresher than the
-    snapshot. One line per change is enough to notice that.
+    snapshot. Two shapes put them there: a model the live catalogue gives no
+    reasoning block at all, and one it gives a bare `effort` for where the
+    snapshot knows the level is selectable. One line per change is enough.
     """
     live_meta = dict(live or [])
-    missing = sorted(mid for mid, meta in entries
-                     if (meta.get("reasoning") or {})
-                     and not ((live_meta.get(mid) or {}).get("reasoning")))
+
+    def from_snapshot(mid, meta):
+        reasoning = meta.get("reasoning") or {}
+        if not reasoning:
+            return False
+        live_reasoning = (live_meta.get(mid) or {}).get("reasoning") or {}
+        if not live_reasoning:
+            return True
+        return bool(reasoning.get("supportedEfforts")) \
+            and not live_reasoning.get("supportedEfforts")
+
+    missing = sorted(mid for mid, meta in entries if from_snapshot(mid, meta))
     if not missing:
         _catalog_fallback_log.pop(realm, None)
         return
@@ -2348,8 +6763,8 @@ def note_bundled_reasoning(realm, live, entries):
         return
     _catalog_fallback_log[realm] = frozenset(missing)
     shown = ", ".join(missing[:6]) + (" ..." if len(missing) > 6 else "")
-    log("catalog    : no reasoning block in the live catalogue for %d model(s); "
-        "using the bundled table: %s" % (len(missing), shown))
+    log("catalog    : bundled table fills in reasoning controls the live "
+        "catalogue omits for %d model(s): %s" % (len(missing), shown))
 def fetch_models(realm=None):
     r = realm or CURRENT_REALM
     with _lock:
@@ -2437,12 +6852,24 @@ def model_entry(mid, meta):
         "modality": "+".join(inputs) + "->text",
     }
     # ---- limits ----
-    if meta.get("maxInputTokens"):
-        item["context_length"] = meta["maxInputTokens"]
-        item["max_input_tokens"] = meta["maxInputTokens"]
-    if meta.get("maxOutputTokens"):
-        item["max_output_tokens"] = meta["maxOutputTokens"]
-        item["max_completion_tokens"] = meta["maxOutputTokens"]
+    # Four-level lookup: remote > built-in knowledge table > local model.json
+    # cache > models.dev (asynchronously warmed; never blocks). context_length
+    # always has a value (1M when unknown - a high estimate is safer than a
+    # low one); max_output_tokens is omitted when unknown.
+    ctx_value, out_value, _limit_source = wb_modelsdev.lookup(
+        mid, meta.get("maxInputTokens"), meta.get("maxOutputTokens"),
+        directory=ACCOUNTS_DIR)
+    item["context_length"] = ctx_value
+    item["max_input_tokens"] = ctx_value
+    if out_value:
+        item["max_output_tokens"] = out_value
+        item["max_completion_tokens"] = out_value
+    # Annotate the measured upstream clamp (from output_probes.json) without
+    # overriding the model's spec value; the panel shows "钳制 N×" beside it.
+    clamp = wb_probes.clamp_for(ACCOUNTS_DIR, mid)
+    if clamp:
+        item["output_clamp"] = clamp
+        item["max_output_tokens_clamped"] = clamp
     ctx = (meta.get("contextWindow") or {}).get("supportedLengths")
     if ctx:
         item["context_windows"] = ctx
@@ -2818,6 +7245,11 @@ def clean_chunk(raw):
     except Exception:
         return raw
     changed = False
+    if isinstance(obj.get("usage"), dict):
+        before = dict(obj["usage"])
+        normalize_usage_cache_aliases(obj["usage"])
+        if obj["usage"] != before:
+            changed = True
     for choice in obj.get("choices") or []:
         delta = choice.get("delta")
         if not isinstance(delta, dict):
@@ -2943,13 +7375,39 @@ SANITIZE_KV_RE = re.compile(r"(?i)\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*")
 SANITIZE_OMO_JUNIOR_RE = re.compile(
     r"Sisyphus-Junior - Focused executor from OhMyOpenCode", re.IGNORECASE
 )
+# 指纹判定的字面量快路径（见 has_fingerprint）：原先对每段文本跑两个 (?i) 正则，
+# 4KB 输入实测 319µs，其中正则 137+188µs、几个 `in` 只占 9µs；64KB 文本要
+# 6.2ms，而 sanitize_messages 会给每个文本段都过一遍——build_upstream_body
+# (168KB) 的耗时约 95% 都耗在这里（13.60ms -> 2.14ms）。
+# 两个模式都是纯字面量，换成小写副本上的 `in` 之后是纯 C 速度的单遍扫描。
+#
+# 等价性：re.IGNORECASE 的 Unicode 语义与 str.lower() 只有三处差异（CPython
+# 3.13 全码点实测，其余所有带大小写的码点两法完全一致）：
+#   'İ'(U+0130) 与 'ı'(U+0131) 能匹配字面量 i，'ſ'(U+017F) 能匹配 s，
+# 而这三个字符的 lower() 并不落到 i/s。所以先把它们按 SANITIZE_REI_FOLD
+# 归一化成基字母、再小写，副本上的 `in` 与 (?i) search 完全等价（多字符模式
+# 同样成立；全码点替换 + 定向用例 + 随机串对拍零差异，见 tests/_test_hotpath_savings.py）。
+SANITIZE_REI_FOLD = str.maketrans({0x130: "i", 0x131: "i", 0x17F: "s"})
+# 两个小写字面量直接从正则派生，保证与正则永远同源：手抄第二份迟早漂移，
+# 派生出来的值不存在这个问题。pattern 里的 (?i) 是内联旗标，剥掉后就是
+# 字面量本体。
+SANITIZE_BARE_HDR_LOWER = SANITIZE_BARE_HDR_RE.pattern
+if SANITIZE_BARE_HDR_LOWER.startswith("(?i)"):
+    SANITIZE_BARE_HDR_LOWER = SANITIZE_BARE_HDR_LOWER[4:]
+SANITIZE_OMO_JUNIOR_LOWER = SANITIZE_OMO_JUNIOR_RE.pattern.lower()
 def has_fingerprint(text):
     if not isinstance(text, str) or not text:
         return False
     for f in SANITIZE_FEATURES:
         if f in text:
             return True
-    return bool(SANITIZE_BARE_HDR_RE.search(text) or SANITIZE_OMO_JUNIOR_RE.search(text))
+    # 三个特例字符几乎从不出现：先做三次 C 速度探测，命中才走归一化副本，
+    # 常规文本只付一次 lower()。
+    if "\u0130" in text or "\u0131" in text or "\u017f" in text:
+        low = text.translate(SANITIZE_REI_FOLD).lower()
+    else:
+        low = text.lower()
+    return SANITIZE_BARE_HDR_LOWER in low or SANITIZE_OMO_JUNIOR_LOWER in low
 def sanitize_text(text):
     if not isinstance(text, str) or not text:
         return text
@@ -3020,6 +7478,91 @@ def sanitize_messages(messages):
 # ---------------------------------------------------------------------------
 # Tool-call pairing repair
 # ---------------------------------------------------------------------------
+def _empty_content(value):
+    """True when an assistant message carries no content at all.
+
+    None / "" / [] all mean "no content": clients disagree on which empty
+    shape they emit, and a batch split into adjacent assistant messages must
+    merge for either shape (a missed [] was the original 11148 case).
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    if isinstance(value, list):
+        return len(value) == 0
+    return False
+
+
+def _merge_reasoning_content(dst, src):
+    """Fold src's reasoning_content into dst, newline-joined when both exist."""
+    rc = src.get("reasoning_content")
+    if not isinstance(rc, str) or not rc:
+        return
+    prev = dst.get("reasoning_content")
+    if isinstance(prev, str) and prev:
+        dst["reasoning_content"] = prev + "\n" + rc
+    else:
+        dst["reasoning_content"] = rc
+
+
+def merge_adjacent_tool_calls(messages):
+    """Merge back-to-back assistant tool_calls messages into one.
+
+    Some OpenAI-compatible agent clients replay a parallel batch as several
+    adjacent assistant messages, each carrying one tool_call. DeepSeek-family
+    upstreams answer 400 / code 11148 (tool_call_sequence_broken) for that
+    shape and retire the conversation, because every retry replays the same
+    history and switching accounts cannot help. Merging the declarations
+    restores the shape the upstream accepts.
+
+    Conditions are strict, so no semantics are invented:
+      - the messages must be adjacent;
+      - the trailing message must have empty content (None/""/[]);
+      - the leading message must already be an assistant with tool_calls.
+
+    A second form folds a plain assistant's string content into a preceding
+    tool_calls assistant that has no content of its own (the same split batch
+    replayed in the other order). reasoning_content is preserved either way,
+    because DeepSeek multi-turn thinking requires it back.
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages, False
+    out = []
+    changed = False
+    for m in messages:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        if m.get("role") == "assistant" and out:
+            prev = out[-1] if isinstance(out[-1], dict) else None
+            if prev is not None and prev.get("role") == "assistant":
+                tcs = m.get("tool_calls")
+                prev_calls = prev.get("tool_calls")
+                # Form 1: this message declares tool calls and has no content.
+                if (isinstance(tcs, list) and tcs
+                        and _empty_content(m.get("content"))
+                        and isinstance(prev_calls, list) and prev_calls):
+                    prev["tool_calls"] = prev_calls + tcs
+                    _merge_reasoning_content(prev, m)
+                    changed = True
+                    continue
+                # Form 2: plain string content folds into a preceding
+                # content-less tool_calls assistant.
+                if ("tool_calls" not in m
+                        and isinstance(m.get("content"), str) and m["content"]
+                        and isinstance(prev_calls, list) and prev_calls
+                        and _empty_content(prev.get("content"))):
+                    prev["content"] = m["content"]
+                    _merge_reasoning_content(prev, m)
+                    changed = True
+                    continue
+        out.append(m)
+    if not changed:
+        return messages, False
+    return out, True
+
+
 def repack_tool_result_blocks(messages):
     """Keep a tool_calls batch and its results adjacent.
 
@@ -3150,6 +7693,45 @@ def cleanup_orphan_tool_calls(messages):
     if not changed:
         return messages, False
     return out, True
+
+
+def is_truncated_arguments(raw):
+    """True when a non-empty tool-arguments string is not valid JSON.
+
+    A stream cut off by max_tokens or a dropped connection leaves the last
+    tool call with half-written JSON. An empty/whitespace string is a legal
+    no-argument tool, and any parseable JSON (including null/scalars/arrays)
+    is the model's own output for the client to validate - only non-empty
+    unparsable strings count as truncation.
+    """
+    if not isinstance(raw, str):
+        return False
+    trimmed = raw.strip()
+    if not trimmed:
+        return False
+    try:
+        json.loads(trimmed)
+        return False
+    except Exception:
+        return True
+
+
+def drop_truncated_tool_calls(calls):
+    """Return the tool calls whose arguments are not half-written JSON."""
+    if not isinstance(calls, list):
+        return calls
+    kept = []
+    for call in calls:
+        if not isinstance(call, dict):
+            kept.append(call)
+            continue
+        fn = call.get("function")
+        if isinstance(fn, dict) and is_truncated_arguments(fn.get("arguments")):
+            continue
+        kept.append(call)
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # DeepSeek Multi-turn Consistency: reasoning_content backfill
 # ---------------------------------------------------------------------------
@@ -3312,77 +7894,77 @@ def translate_max_completion_tokens(obj):
     except (TypeError, ValueError):
         pass
 # ---------------------------------------------------------------------------
-# 模型封鎖表
+# 模型封锁表
 #
-# 背景：客戶端除了使用者的對話，還會自己發背景請求（記憶整理、自動複核等）。
-# 這些請求不經過模型選單，而是直接使用目錄上的模型 ID，因此可能在使用者
-# 沒有實際操作時，用付費模型消耗額度。
+# 背景：客户端除了使用者的对话，还会自己发背景请求（记忆整理、自动复核等）。
+# 这些请求不经过模型选单，而是直接使用目录上的模型 ID，因此可能在使用者
+# 没有实际操作时，用付费模型消耗额度。
 #
-# 對策（選用）：把要拒絕的模型填進 ALLOWED_MODELS / BANNED_SUBSTRING /
-#               EXTRA_BANNED；命中的請求在本機直接回 400，完全不碰上游。
-#               預設全部為空 = 不封鎖任何模型，行為與原版相同。
+# 对策（选用）：把要拒绝的模型填进 ALLOWED_MODELS / BANNED_SUBSTRING /
+#               EXTRA_BANNED；命中的请求在本机直接回 400，完全不碰上游。
+#               预设全部为空 = 不封锁任何模型，行为与原版相同。
 #
-# 調整方式：
-#   要放行某個模型 -> 加進 ALLOWED_MODELS 或 ALLOWED_PREFIXES
-#   要連非 gpt 的模型一起擋 -> 加進 EXTRA_BANNED
+# 调整方式：
+#   要放行某个模型 -> 加进 ALLOWED_MODELS 或 ALLOWED_PREFIXES
+#   要连非 gpt 的模型一起挡 -> 加进 EXTRA_BANNED
 # ---------------------------------------------------------------------------
 
-# 允許放行的模型（你要用的）
+# 允许放行的模型（你要用的）
 ALLOWED_MODELS = {
-    # 預設不封鎖任何模型；填入模型 id 即可只放行這些
+    # 预设不封锁任何模型；填入模型 id 即可只放行这些
 }
 
-# 允許前綴：涵蓋 -high / -preview / [1M] 等變體
+# 允许前缀：涵盖 -high / -preview / [1M] 等变体
 ALLOWED_PREFIXES = ()
 
-# 封鎖字串：模型名裡含這個就拒絕
+# 封锁字串：模型名里含这个就拒绝
 BANNED_SUBSTRING = ""
 
-# 額外封鎖的內部模型（不在 gpt- 前綴內，但也會燒點）
+# 额外封锁的内部模型（不在 gpt- 前缀内，但也会烧点）
 EXTRA_BANNED = set()
 
 
 def is_model_banned(model):
-    """True 表示這個模型名不該被送去上游。
+    """True 表示这个模型名不该被送去上游。
 
-    規則：ALLOWED_MODELS / ALLOWED_PREFIXES 命中就放行；其餘只要命中
-    BANNED_SUBSTRING 或 EXTRA_BANNED 就拒絕，沒命中則照常送往上游。
-    三個設定預設都是空的，所以預設不封鎖任何模型。
+    规则：ALLOWED_MODELS / ALLOWED_PREFIXES 命中就放行；其余只要命中
+    BANNED_SUBSTRING 或 EXTRA_BANNED 就拒绝，没命中则照常送往上游。
+    三个设定预设都是空的，所以预设不封锁任何模型。
     """
     if not model:
         return False
     m = str(model).strip().lower()
-    # 白名單優先（含 -high / -preview / [1M] 這類變體）
+    # 白名单优先（含 -high / -preview / [1M] 这类变体）
     if m in ALLOWED_MODELS:
         return False
     if any(m.startswith(a) for a in ALLOWED_PREFIXES):
         return False
-    # 命中封鎖字串就拒絕
+    # 命中封锁字串就拒绝
     if BANNED_SUBSTRING and BANNED_SUBSTRING in m:
         return True
-    # 其他已知會燒點的內部模型
+    # 其他已知会烧点的内部模型
     if m in EXTRA_BANNED:
         return True
     return False
 
 
 # ---------------------------------------------------------------------------
-# 背景請求攔截
+# 背景请求拦截
 #
-# Codex App 除了使用者的對話，還會自己發背景請求（記憶整理、環境建議、自動複核…）。
-# 這些請求不經過模型選單，所以單靠模型白名單擋不住 —— 它們可能直接用目錄上
-# 的付費模型（例如 gpt-6-astra 這類），在使用者沒有實際操作時照樣消耗額度。
+# Codex App 除了使用者的对话，还会自己发背景请求（记忆整理、环境建议、自动复核…）。
+# 这些请求不经过模型选单，所以单靠模型白名单挡不住 —— 它们可能直接用目录上
+# 的付费模型（例如 gpt-6-astra 这类），在使用者没有实际操作时照样消耗额度。
 #
-# Codex 會在 client_metadata 裡帶 x-codex-turn-metadata，內容像：
+# Codex 会在 client_metadata 里带 x-codex-turn-metadata，内容像：
 #   {"request_kind":"memory","thread_source":"memory_consolidation",
 #    "turn_trigger":"memory_consolidation"}
-# 這裡就靠這個標記判斷：命中背景關鍵字 -> 本地直接拒絕，不碰上游、不扣點。
+# 这里就靠这个标记判断：命中背景关键字 -> 本地直接拒绝，不碰上游、不扣点。
 # ---------------------------------------------------------------------------
 
-# 要不要攔截背景請求（False = 全部放行，維持原行為）
+# 要不要拦截背景请求（False = 全部放行，维持原行为）
 BLOCK_BACKGROUND_REQUESTS = False
 
-# 命中任一關鍵字就視為背景請求（不分大小寫、子字串比對）
+# 命中任一关键字就视为背景请求（不分大小写、子字串比对）
 BACKGROUND_TRIGGER_KEYWORDS = (
     "memory_consolidation",
     "memory-write",
@@ -3429,7 +8011,7 @@ def turn_metadata_fields(payload):
     if not isinstance(meta, dict):
         return {}
 
-    # 收集所有可能的來源/觸發欄位
+    # 收集所有可能的来源/触发栏位
     fields = {}
     for key, value in meta.items():
         if isinstance(value, str) and value.strip().startswith("{"):
@@ -3463,9 +8045,9 @@ def is_compaction_request(payload):
 
 
 def background_request_reason(payload):
-    """若這是 Codex 自己發的背景請求，回傳說明字串；否則回傳 ""。
+    """若这是 Codex 自己发的背景请求，回传说明字串；否则回传 ""。
 
-    只看 client_metadata，不碰訊息內容。
+    只看 client_metadata，不碰讯息内容。
     """
     fields = turn_metadata_fields(payload)
     if not fields:
@@ -3554,6 +8136,48 @@ def key_model_message(entry, model):
             % (name, asked, allowed))
 
 
+# Process-memory degradation window: content-blocked passthrough/append
+# traffic switches to the minimal neutral prompt until the next 00:00 CST
+# (panel degrade.go). Restarts clear it, which is fine - the next rejection
+# re-triggers it.
+PROMPT_DEGRADE = wb_prompt.DegradeGate()
+
+
+def prompt_mode_config():
+    """Prompt mode settings, fail-open to passthrough on any read error."""
+    try:
+        cfg = wb_settings.prompt_config(ACCOUNTS_DIR)
+    except Exception:
+        cfg = None
+    if not isinstance(cfg, dict):
+        cfg = {"mode": "passthrough", "file": ""}
+    return cfg
+
+
+def apply_prompt_mode(messages):
+    """Apply the configured prompt mode to one request's messages.
+
+    passthrough is the legacy behaviour (client system prompts ride through);
+    custom/append are opt-in. While the degrade window is active, passthrough
+    and append switch to the minimal neutral prompt; custom never degrades.
+    An unreadable prompt file fails open to passthrough rather than blocking.
+    """
+    cfg = prompt_mode_config()
+    mode = cfg.get("mode") or "passthrough"
+    degraded = PROMPT_DEGRADE.active()
+    if mode in ("custom", "append"):
+        try:
+            text = wb_prompt.load_prompt(mode, cfg.get("file"))
+        except Exception:
+            text = ""
+        if text:
+            return wb_prompt.apply_mode(messages, mode, text, degraded=degraded)
+        return messages
+    if degraded:
+        return wb_prompt.apply_mode(messages, mode, "", degraded=True)
+    return messages
+
+
 def build_upstream_body(payload):
     model = payload.get("model") or ""
     # Resolve the effective thinking state before the backfill below: while
@@ -3571,6 +8195,9 @@ def build_upstream_body(payload):
         elif thinking_type != "disabled" and str(effort or "").strip().lower() != "none":
             thinking_enabled = True
     messages = normalize_roles(payload.get("messages") or [])
+    # Prompt mode runs before sanitize/backfill so the gateway prompt is the
+    # one the upstream sees, with the client's fingerprint-y system text gone.
+    messages = apply_prompt_mode(messages)
     messages = sanitize_messages(messages)
     messages = backfill_reasoning_content(
         messages, model, thinking_enabled=thinking_enabled
@@ -3584,13 +8211,16 @@ def build_upstream_body(payload):
     # upstream to ignore unknown keys.
     for _marker in [k for k in body if str(k).startswith("_")]:
         body.pop(_marker, None)
-    # dict(payload) 會把原始模型名一起帶過去，所以別名要在這裡覆蓋回去
+    # dict(payload) 会把原始模型名一起带过去，所以别名要在这里覆盖回去
     body["model"] = model
     body["messages"] = messages
     # Repair tool-call pairing before the body leaves: a call whose result never
-    # came back, or results split from their batch by an interleaved message,
-    # makes the upstream reject every later turn of that conversation.
-    repaired, _repacked = repack_tool_result_blocks(body["messages"])
+    # came back, results split from their batch by an interleaved message, or a
+    # parallel batch split into adjacent assistant messages makes the upstream
+    # reject every later turn of that conversation. Order matters: merge the
+    # split declarations first, so repack sees one complete batch.
+    repaired, _merged = merge_adjacent_tool_calls(body["messages"])
+    repaired, _repacked = repack_tool_result_blocks(repaired)
     repaired, _cleaned = cleanup_orphan_tool_calls(repaired)
     body["messages"] = repaired
     translate_max_completion_tokens(body)
@@ -3682,9 +8312,14 @@ def model_fixed_effort(model):
     reasoning.effort without supportedEfforts means the model always runs at
     that level: /v1/models advertises it as reasoning_fixed_effort and the
     picker offers no choice for it, so an effort the request carries anyway does
-    not change what ran.
+    not change what ran. A model that declares supportedEfforts is selectable
+    whatever else its block carries - an `effort` beside it is the default, not
+    a pin.
     """
-    effort = model_reasoning_meta(model).get("effort")
+    reasoning = model_reasoning_meta(model)
+    if reasoning.get("supportedEfforts"):
+        return None
+    effort = reasoning.get("effort")
     return effort.strip() if isinstance(effort, str) and effort.strip() else None
 
 
@@ -3765,20 +8400,73 @@ class RateLimited(Exception):
         super().__init__("upstream rate limit: %s" % (self.detail[:200] or "429"))
 
 
+def gateway_hint(status, message):
+    """A gateway-side note that sits beside the raw upstream message.
+
+    The hint never replaces the upstream wording (clients keep parsing the
+    same envelope); it only explains what the gateway could classify, so a
+    user staring at "400 Bad Request" learns whether the fix is a smaller
+    context, a different model, a re-login or simply waiting. An empty string
+    means "nothing to add" - no hint is invented for unknown failures.
+
+    Covers the shapes the hub can classify from the upstream body/status:
+    11133 model_param_invalid, 11135 invalid_image_data, rate limits, content
+    review, exhausted credits, dead sessions, missing models, prompt-length
+    rejections, WAF blocks and the local no-usable-account case.
+    """
+    text = str(message or "")
+    lower = text.lower()
+    if status == 503 and "concurrent chat limit" in lower:
+        return "gateway is busy at its concurrency limit; retry shortly"
+    if ("11133" in lower or "model_param_invalid" in lower
+            or "invalid request parameters" in lower):
+        return ("request parameters were rejected by the model provider; "
+                "check message format and model capabilities")
+    if ("11135" in lower or "invalid_image_data" in lower
+            or "replace the image" in lower):
+        return ("image data rejected by upstream; use a real/valid image, "
+                "may need a new conversation")
+    if "no usable account" in lower or "no healthy account" in lower:
+        return "no healthy account available in pool; check /status or retry later"
+    if ("context length" in lower or "context_length" in lower
+            or "prompt too long" in lower or "too many tokens" in lower
+            or "maximum context" in lower):
+        return ("request context exceeds the model's limit; reduce "
+                "history/message size")
+    if status == 429 or "rate limit" in lower or "frequency limit" in lower:
+        return "rate limited by upstream; retry after reset"
+    if status == 402 or ("insufficient" in lower and "credit" in lower):
+        return ("account credits exhausted at upstream; waiting for daily "
+                "check-in to restore")
+    if "session" in lower and ("not found" in lower or "expired" in lower):
+        return ("account session expired at upstream; the account is disabled "
+                "until re-login")
+    if "content" in lower and ("reject" in lower or "policy" in lower):
+        return ("request content was rejected by content policy; adjust the "
+                "prompt and retry")
+    if ("no such model" in lower or "model not found" in lower
+            or "unsupported model" in lower):
+        return ("upstream has no such model on this backend; switch model or "
+                "retry on another account")
+    if status == 403 and "waf" in lower:
+        return "upstream WAF blocked the gateway; retry after the block window"
+    return ""
+
+
 # ---------------------------------------------------------------------------
-# 出站身分自動切換
+# 出站身分自动切换
 #
-# 官方有三套身分（workbuddy / vscode / cli），端點與配額通道各不相同，
-# 對照表見 wb_identity._ENDPOINTS。
+# 官方有三套身分（workbuddy / vscode / cli），端点与配额通道各不相同，
+# 对照表见 wb_identity._ENDPOINTS。
 #
-# 某模型在某條通道被限流（429 / code 6004）時，換成另一套身分通常還能繼續
-# 用 —— 那是另一條配額線。每輪最多切 MAX_PRODUCT_SWITCHES 次，避免來回彈跳。
+# 某模型在某条通道被限流（429 / code 6004）时，换成另一套身分通常还能继续
+# 用 —— 那是另一条配额线。每轮最多切 MAX_PRODUCT_SWITCHES 次，避免来回弹跳。
 #
-# 身分會寫進憑證檔並在重啟後讀回（issue #76）：面板手動切換當下就落盤，
-# 這裡的自動切換則在下一次任何 save() 時一併寫入。
+# 身分会写进凭证档并在重启后读回（issue #76）：面板手动切换当下就落盘，
+# 这里的自动切换则在下一次任何 save() 时一并写入。
 #
-# 這個開關交給面板設定決定（issue #67），預設關閉：自動切換會吃掉重試預算，
-# 也會把帳號留在操作者沒主動選過的身分上，要用的話自己開。
+# 这个开关交给面板设定决定（issue #67），预设关闭：自动切换会吃掉重试预算，
+# 也会把帐号留在操作者没主动选过的身分上，要用的话自己开。
 # ---------------------------------------------------------------------------
 
 MAX_PRODUCT_SWITCHES = 4
@@ -3791,7 +8479,7 @@ def auto_switch_product_enabled():
 
 
 def _switch_count(account, model):
-    """這一輪已經切過幾次（60 秒內的切換算同一輪）。"""
+    """这一轮已经切过几次（60 秒内的切换算同一轮）。"""
     entry = _SWITCH_LOG.get((account.uid, model))
     if not entry:
         return 0
@@ -3802,11 +8490,11 @@ def _switch_count(account, model):
 
 
 def _try_switch_product(account, model):
-    """429 時換身分重試。回傳 True 表示已切換、可以重試。
+    """429 时换身分重试。回传 True 表示已切换、可以重试。
 
-    同一請求內最多切 MAX_PRODUCT_SWITCHES 次：
+    同一请求内最多切 MAX_PRODUCT_SWITCHES 次：
       cli -> workbuddy -> cli -> workbuddy
-    四次都不行就放棄，讓呼叫端回報真正的 429。
+    四次都不行就放弃，让呼叫端回报真正的 429。
     """
     count = _switch_count(account, model)
     if count >= MAX_PRODUCT_SWITCHES:
@@ -3835,7 +8523,7 @@ def _try_switch_product(account, model):
 
 
 def reset_switch_counter(account, model):
-    """成功之後歸零，下一次請求重新享有 4 次切換額度。"""
+    """成功之后归零，下一次请求重新享有 4 次切换额度。"""
     _SWITCH_LOG.pop((account.uid, model), None)
 
 
@@ -3889,16 +8577,131 @@ def is_transient(exc):
     return any(m in t for m in markers)
 
 
+# The shapes the upstream uses for a rate limit. A body naming one is a soft
+# limit; it still says nothing about scope, so the caller decides that from the
+# reset clock (one model), from credential wording (the account), or - when
+# neither is present - from repetition, and then only on one model.
+SOFT_LIMIT_MARKERS = ("usage exceeds frequency limit", "too many requests",
+                      "请求过于频繁")
+SOFT_LIMIT_CODES = (14003,)     # intl, observed on a real 429
+
+# Wording that scopes a 429 to the credential itself. These are matched as whole
+# words or explicit phrases, never as bare substrings: a 429 body carries
+# metadata such as "accountId", "account_id" or "credentialId", and a substring
+# test reads those field names as a scope statement and hands the credential the
+# 10m -> 2h ladder. Provisional: no captured body has shown yet what a genuine
+# account-level 429 says, so the list stays short and fails towards the narrow
+# model window.
+ACCOUNT_SCOPE_PHRASES = (
+    "account-level", "account level", "account-wide", "account scope",
+    "account quota", "account rate limit", "account limit",
+    "per account", "per-account", "this account", "your account",
+    "the account", "an account",
+    "credential-level", "credential level", "credential scope",
+    "credential limit", "per credential", "this credential",
+    "the credential", "your credential",
+    "账号级", "账户级", "该账号", "此账号", "该账户", "此账户",
+    "账号限流", "账户限流", "凭证级", "该凭证",
+)
+
+
+def credential_scope_phrase(detail):
+    """The scope phrase the body uses, or None when it names no scope.
+
+    ASCII phrases are anchored on word boundaries, so an identifier like
+    `accountId` cannot satisfy one. The Chinese phrases are plain substrings:
+    they have no word boundary to anchor to and cannot occur inside an
+    identifier.
+    """
+    lowered = (detail or "").lower()
+    for phrase in ACCOUNT_SCOPE_PHRASES:
+        if phrase.isascii():
+            if re.search(r"\b%s\b" % re.escape(phrase), lowered):
+                return phrase
+        elif phrase in lowered:
+            return phrase
+    return None
+
+
+def rate_limit_code(detail):
+    """The `code` field of a JSON 429 body, or None when it is not JSON."""
+    try:
+        obj = json.loads(detail)
+    except Exception:
+        return None
+    return obj.get("code") if isinstance(obj, dict) else None
+
+
+def rate_limit_is_soft_shape(detail):
+    """True when a 429 body names a rate limit, whatever its scope.
+
+    Both shapes the incident environment produced are covered: the bare "usage
+    exceeds frequency limit" body (229 of the 263 recorded 429s) and the intl
+    code 14003 body ("too many requests"). Recognising them is what lets the
+    caller answer with a window on one model rather than on the credential.
+    """
+    text = (detail or "").lower()
+    if any(marker in text for marker in SOFT_LIMIT_MARKERS):
+        return True
+    return rate_limit_code(detail) in SOFT_LIMIT_CODES
+
+
+# 上游「这个模型的窗口额度用满」的应答码。6004 是唯一带重置墙钟的额度判定，
+# 也是用户口径里「达到限额」的唯一标志：别的 429（14003、裸频率限制文本、
+# 账号级软限）即使碰巧带了个时钟，也不是额度用满的证据。
+CAP_LIMIT_CODE = 6004
+
+
+def rate_limit_is_cap(detail):
+    """True only for the upstream's quota-cap answer (code 6004).
+
+    Tolerant on purpose: the field has only ever been seen as an integer, but
+    a string form must not silently drop a real cap. Anything unparsable is
+    not a cap, so the caller's persistent-disable path fails closed.
+    """
+    try:
+        return int(rate_limit_code(detail)) == CAP_LIMIT_CODE
+    except (TypeError, ValueError):
+        return False
+
+
+def rate_limit_is_account_level(detail, reset_at):
+    """True only with positive evidence that the 429 is credential-scoped.
+
+    The model-scoped form names a reset wall clock (code 6004). Treating the
+    *absence* of one as account scope made every 429 without a timestamp - which
+    includes the most common body the upstream sends - buy the whole credential
+    a 600s cooldown doubling to 7200s, so a handful of them left every account of
+    a realm cooling at once while a panel test kept reporting the credential
+    healthy. Absence is evidence of nothing: the credential is parked only when
+    the body itself says the limit is on the credential; everything else gets a
+    window on one model, decided by the caller.
+
+    Provisional: the phrase list is short because no captured body has shown yet
+    what a genuine account-level 429 looks like, so it is meant to be re-checked
+    against one rather than grown speculatively.
+    """
+    if reset_at is not None:
+        return False
+    return credential_scope_phrase(detail) is not None
+
+
 def parse_rate_limit_reset(detail):
     """Pull the reset time out of an upstream 429 body, if it names one.
 
-    Upstream answers code 6004 with "... your usage will reset at
-    2026-09-19 18:29:03 UTC+8 ...". Returns an epoch or None. Kept tolerant on
-    purpose: an unparseable body must not break the request path.
+    Upstream answers code 6004 with a reset wall clock, but the wording is
+    per-realm: the intl form is "... your usage will reset at
+    2026-09-19 18:29:03 UTC+8 ...", the cn form is "... 将在
+    2026-10-09 14:44:59 UTC+8 重置 ...". Matching only the English form left
+    every cn 429 without a reset time, so it read as an account-level soft
+    limit and cooled the whole credential instead of parking just the
+    throttled model. Returns an epoch or None. Kept tolerant on purpose: an
+    unparseable body must not break the request path.
     """
     if not detail:
         return None
-    m = re.search(r"reset at\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})", detail)
+    m = re.search(r"(?:reset at|将在)\s*"
+                  r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})", detail)
     if not m:
         return None
     stamp = m.group(1).replace("T", " ")
@@ -3915,22 +8718,90 @@ def parse_rate_limit_reset(detail):
         return None
 
 
-def open_upstream(payload, session_key=None, target_realm=None):
+def upstream_timeouts():
+    """(header, idle) seconds for the chat upstream socket.
+
+    header covers connect/TLS/first byte; idle bounds each mid-stream
+    read, so active data keeps the connection alive while a silent
+    stream fails out and releases its in-flight lease. There is no
+    total-duration cap, matching the panel project's semantics.
+    """
+    try:
+        cfg = wb_settings.upstream_config(ACCOUNTS_DIR)
+    except Exception:
+        cfg = None
+    header = 120.0
+    idle = 300.0
+    if isinstance(cfg, dict):
+        try:
+            header = float(cfg.get("header_timeout_seconds") or header)
+        except (TypeError, ValueError):
+            pass
+        try:
+            idle = float(cfg.get("idle_timeout_seconds") or idle)
+        except (TypeError, ValueError):
+            pass
+    return max(1.0, header), max(1.0, idle)
+
+
+def _apply_stream_idle_timeout(response, seconds):
+    """Switch the upstream socket to the mid-stream idle timeout.
+
+    urllib's timeout covers the initial request; the same socket is then
+    read for the whole SSE stream. Setting the socket timeout to the idle
+    value bounds each read instead of the whole stream. Best-effort: an
+    unknown socket shape keeps the header timeout.
+    """
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return False
+    if seconds <= 0:
+        return False
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is None:
+        sock = getattr(fp, "_sock", None)
+    if sock is None:
+        return False
+    try:
+        sock.settimeout(seconds)
+        return True
+    except Exception:
+        return False
+
+
+def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=None):
     # Refresh the daily guards before picking. The scan underneath is
     # incremental and TTL-cached, so this is a stat() plus a cached dict on
     # the hot path, and an account parked by any of the guards is skipped
-    # like any other unusable one.
-    apply_daily_token_limit()
-    apply_daily_credit_limit()
-    apply_model_daily_token_limit()
+    # like any other unusable one. One call covers all three guards: they
+    # share the same fold, and calling them separately paid for it three
+    # times on every request.
+    apply_daily_guards()
+    # 剩余用量优先调度（开关默认关）：把「估计剩余接近耗尽」的 (账号, 模型)
+    # 权重推给池，让它们先接单。只在开关打开时读剩余估算（载荷有短 TTL，热路径
+    # 上是缓存命中）；关着时推空表，把上一次可能留下的权重清掉，下一个请求就
+    # 回到与从前逐字节一致的纯轮询。
+    if POOL is not None:
+        POOL.apply_remaining_weights(
+            remaining_schedule_weights() if remaining_priority_enabled() else None)
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     model = str(payload.get("model") or "")
-    upstream_body = build_upstream_body(payload)
+    # 复用调用方已建好的 body：/v1/chat/completions 在进这里之前已经 build 过
+    # 一次（那次的产物只用于一行日志和 prompt_fingerprint），此前这里会为同一
+    # 个 payload 再建一遍，大请求实测白付 ~13.6ms/请求。403 降级重试时仍按
+    # payload 重建（degrade 会切换 prompt 模式，必须拿到新 body）。
+    upstream_body = (prebuilt_body if prebuilt_body is not None
+                     else build_upstream_body(payload))
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。
     # 位置放在 build_upstream_body 之后，保证键与真正发往上游的消息一致
-    # （该函数可能在最前面插入 SYSTEM_PROMPT）。
+    # （该函数可能在最前面插入 SYSTEM_PROMPT）。affinity_page 只在超限对话上
+    # 有值（页内轮转），客户端自带会话键的请求不参与。
+    affinity_page = None
     if not session_key:
-        session_key = derive_affinity_key(upstream_body.get("messages"))
+        session_key, affinity_page = affinity_route(upstream_body.get("messages"))
         if session_key and AFFINITY_DEBUG:
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(upstream_body.get("messages") or [])))
@@ -3942,13 +8813,21 @@ def open_upstream(payload, session_key=None, target_realm=None):
     last_429_detail = ""
     last_403_detail = ""
     transient_hits = 0
+    degraded_retried = False
     # Read once per request, not per attempt: this is a panel setting, and a
     # settings read on every retry would be pure overhead.
     auto_switch = auto_switch_product_enabled()
+    # Panel parity: header/idle timeouts are read once per request, not
+    # once per retry, so a settings read never lands in the retry loop.
+    header_timeout, idle_timeout = upstream_timeouts()
     max_attempts = max(2, total) + 1 + (MAX_PRODUCT_SWITCHES if auto_switch else 0)
+    # 每次失败都把【出错的那个账号】从这段对话的历史里降级（demote），而不是
+    # 忘掉整段对话：重选时优先回到还留着这段前缀的暖号（见 SessionAffinity），
+    # 一次大 prompt 的冷启动比重选一次账号贵得多。
     for _attempt in range(max_attempts):
         account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                        exclude=tried, model=model) if POOL else None
+                                        exclude=tried, model=model,
+                                        page=affinity_page) if POOL else None
         if account is None:
             if transient_hits and _attempt < max_attempts - 1:
                 tried.clear()
@@ -3956,7 +8835,7 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 continue
             break
         if account.realm != realm:
-            if session_key and POOL: POOL.affinity.unbind(session_key)
+            if session_key and POOL: POOL.affinity.demote(session_key, account.uid)
             continue
         tried.add(account.uid)
         last_uid = account.uid
@@ -3973,8 +8852,10 @@ def open_upstream(payload, session_key=None, target_realm=None):
         req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
                                      headers=account.headers(purpose="chat"))
         try:
-            resp = wb_accounts.urlopen(req, timeout=600, proxy=account.proxy)
-            account.clear_error(model=model)
+            resp = wb_accounts.urlopen(req, timeout=header_timeout,
+                                       proxy=account.proxy)
+            _apply_stream_idle_timeout(resp, idle_timeout)
+            account.note_success(model=model)
             reset_switch_counter(account, model)
             # The third element is the reasoning effort this request ran at: the
             # body is rebuilt per attempt, but the effort is a property of the
@@ -3987,26 +8868,67 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 except Exception:
                     detail = ""
                 reset_at = parse_rate_limit_reset(detail)
+                if rate_limit_is_account_level(detail, reset_at):
+                    wait = account.note_soft_rate("HTTP 429 (account soft rate)")
+                    log("account %s soft-rate limited (%r), cooling %.0fs (streak %d)"
+                        % (account.uid[:8], credential_scope_phrase(detail), wait,
+                           account.soft_streak))
+                    if session_key and POOL:
+                        POOL.affinity.demote(session_key, account.uid)
+                    last_error = exc
+                    last_429 = exc
+                    last_429_detail = detail
+                    continue
+                # No reset clock, so nothing here says whether the limit is on
+                # the credential or on one model. For a recognised soft-limit
+                # shape the repetition is the evidence: the window goes on this
+                # model and grows on the short ladder (60s up to 10m) instead of
+                # the credential's 600s -> 2h one. An unrecognised body gets the
+                # same 60s on one model, with no streak at all.
                 wait = max(1.0, reset_at - time.time()) if reset_at else 60.0
+                if reset_at is None and rate_limit_is_soft_shape(detail):
+                    wait = account.note_unscoped_rate(model)
+                    log("account %s: unscoped 429, parking '%s' for %.0fs "
+                        "(unscoped streak %d)"
+                        % (account.uid[:8], model, wait, account.unscoped_streak))
                 # Model-scoped: only this model is throttled for this account,
                 # so sibling models stay serviceable on the same credential.
                 account.note_error("HTTP 429 (model throttled)", model=model, until=reset_at,
                                    cooldown=wait, detail=detail)
+                if reset_at:
+                    # A cap with a reset clock is the one observable moment the
+                    # window budget can be measured from; the usage rows alone
+                    # lose it (only the last account of a retry batch keeps its
+                    # attribution). See note_limit_event().
+                    note_limit_event(account, model, reset_at)
+                    # 「达到限额」的唯一标志是上游返回 6004（用户口径）：别的
+                    # 429 即使带重置墙钟也不构成额度判定，不记 cap、不写盘。
+                    # 记录范围（免费模型）由 note_model_cap 把守——范围外的
+                    # 模型返回 False，重启后自动放开，不参与持久化禁用。
+                    if rate_limit_is_cap(detail):
+                        try:
+                            if account.note_model_cap(model, reset_at):
+                                _save_account_caps(account, model, reset_at)
+                        except Exception as exc:
+                            log("account %s: model cap not persisted: %s"
+                                % (account.uid[:8], exc))
                 if auto_switch and _try_switch_product(account, model):
-                    # 換了身分就等於換了一條配額線：要把它從「已試過」拿掉，
-                    # 並清掉剛剛記下的模型冷卻，否則下一輪迴圈會找不到帳號。
+                    # 换了身分就等于换了一条配额线：要把它从「已试过」拿掉，
+                    # 并清掉刚刚记下的模型冷却，否则下一轮回圈会找不到帐号。
+                    # keep_caps：6004 的禁用（仍在恢复期内）跨身分成立，不能
+                    # 被这次清理带走——真机实测它会让 6004 之后账号立刻又可用。
                     tried.discard(account.uid)
                     try:
-                        account.clear_error(model=model)
+                        account.clear_error(model=model, keep_caps=True)
                     except Exception:
                         pass
                     if session_key and POOL:
-                        POOL.affinity.unbind(session_key)
+                        POOL.affinity.demote(session_key, account.uid)
                     continue
                 log("account %s throttled on '%s' (429), retry in %ds"
                     % (account.uid[:8], model, int(wait)))
                 if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
+                    POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 last_429 = exc
                 last_429_detail = detail
@@ -4016,16 +8938,40 @@ def open_upstream(payload, session_key=None, target_realm=None):
                     detail = exc.read(400).decode("utf-8", "replace")
                 except Exception:
                     detail = ""
+                # Panel degrade.go: a content rejection in passthrough/append
+                # mode is usually a system-prompt fingerprint false positive.
+                # Switch to the minimal neutral prompt until next 00:00 CST
+                # and retry this turn once; custom mode opted out.
+                if (not degraded_retried
+                        and prompt_mode_config().get("mode") in ("passthrough", "append")):
+                    PROMPT_DEGRADE.trigger()
+                    degraded_retried = True
+                    upstream_body = build_upstream_body(payload)
+                    tried.discard(account.uid)
+                    log("upstream 403 (content review) -> degraded prompt retry")
+                    continue
                 log("upstream 403 for '%s' (content review), passing through" % model)
                 if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
+                    POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 last_403_detail = detail
                 break
+            if exc.code == 402:
+                try:
+                    detail = exc.read(400).decode("utf-8", "replace")
+                except Exception:
+                    detail = ""
+                account.note_balance_cooled(detail or "HTTP 402 (insufficient credits)")
+                log("account %s out of credits (402), parked until 04:00"
+                    % account.uid[:8])
+                if session_key and POOL:
+                    POOL.affinity.demote(session_key, account.uid)
+                last_error = exc
+                continue
             if exc.code == 401:
                 log("account %s rejected (HTTP 401), rotating" % account.uid[:8])
                 if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
+                    POOL.affinity.demote(session_key, account.uid)
                 account.note_error("HTTP 401",
                                    cooldown=60,
                                    single_account=(total <= 1))
@@ -4033,22 +8979,30 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 continue
             if exc.code in (500, 502, 503, 504):
                 transient_hits += 1
-                log("upstream %s for '%s', retrying" % (exc.code, model))
+                account.note_failure("HTTP %d" % exc.code)
+                log("upstream %s for '%s', retrying (fails=%d)"
+                    % (exc.code, model, account.fails))
                 if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
+                    POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 continue
             raise
         except Exception as exc:
             if session_key and POOL:
-                POOL.affinity.unbind(session_key)
+                POOL.affinity.demote(session_key, account.uid)
             if is_transient(exc):
                 transient_hits += 1
-                log("upstream connection hiccup for '%s' (%s), retrying"
-                    % (model, type(exc).__name__))
+                account.note_unknown_failure("connection: %s" % type(exc).__name__)
+                # 带上 UID：这一行同时是一次扣分（连续 3 次就把账号熔断 30
+                # 分钟），不写清楚是谁挨的这一下，事后只能看着一串 hiccup 猜
+                # 是哪几个账号被关掉、池子为什么突然空了。
+                log("account %s: upstream connection hiccup for '%s' (%s), "
+                    "retrying (degrade=%d)"
+                    % (account.uid[:8], model, type(exc).__name__, account.degrade_count))
                 last_error = exc
                 time.sleep(min(0.6 * transient_hits, 2.0))
                 continue
+            account.note_unknown_failure(str(exc)[:120])
             account.note_error(str(exc)[:120], cooldown=60, single_account=(total <= 1))
             last_error = exc
             continue
@@ -4094,8 +9048,38 @@ def open_upstream(payload, session_key=None, target_realm=None):
                   % (model, wb_settings.model_daily_token_limit(ACCOUNTS_DIR, realm)))
         raise RateLimited(None, reason,
                           wait=seconds_until_local_midnight(), message=reason)
-    raise RuntimeError(f"no usable account for realm '{realm}': all are disabled, "
-                       f"cooling down, expired or parked by the daily token limit")
+    raise RuntimeError("no usable account for realm '%s': all are disabled, cooling down, "
+                       "expired or parked by the daily token limit%s"
+                       % (realm, pool_unavailable_detail(realm, model)))
+
+def pool_unavailable_detail(realm, model=None):
+    """把该区域每个账号不可用的原因拼成一句，附在「没有可用账号」后面。
+
+    这句话以前只列了四种可能（停用 / 冷却 / 过期 / 日限额），而 v1.6.16 之后
+    账号还会被熔断与降权窗口挡住——恰好这两种一个字都没提。于是生产上出现过
+    一场很难解释的报错：上游成片丢连接，几个账号各连踩 3 次触发 30 分钟熔断，
+    池子瞬间空掉、请求 11ms 就回 503，而看板上那些账号仍然显示「可用」，
+    排查的人只能对着「明明有 9 个账号」的池子猜。
+
+    这里不改变判定，只把判定结果说出来：每个不可用账号「八位 UID + 原因」。
+    """
+    if POOL is None:
+        return ""
+    accounts = [a for a in POOL.accounts if a.realm == realm]
+    if not accounts:
+        return "；该区域没有任何账号"
+    reasons = []
+    for account in accounts:
+        try:
+            reason = account.unavailable_reason(model=model)
+        except Exception:
+            reason = ""
+        if reason:
+            reasons.append("%s %s" % ((account.uid or "?")[:8], reason))
+    if not reasons:
+        return ""
+    return "；各账号：%s" % "，".join(reasons)
+
 def extract_session_key(headers, payload):
     key = (
         headers.get("X-Conversation-Id") or
@@ -4110,12 +9094,17 @@ def extract_session_key(headers, payload):
         return str(key).strip()
     return None
 
+# CJK 计数走单遍 C 扫描：先 sub 掉 CJK 再按长度差计数，与原来的逐字符 Python
+# 循环逐值相等（64KB ASCII 实测 18.7ms -> 1.25ms）。别换 findall，实测更慢。
+# 调用点：aggregate_stream、_chat_stream_response 的 usage 兜底、
+# /v1/messages/count_tokens。
+CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 def estimate_tokens(text):
     if not text:
         return 0
     if not isinstance(text, str):
         text = str(text)
-    cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
+    cjk = len(text) - len(CJK_RE.sub("", text))
     other = len(text) - cjk
     return cjk + max(1, int(other / 3.6)) if text else 0
 
@@ -4126,9 +9115,12 @@ def aggregate_stream(raw_iter, model, resp_id):
     usage = None
     started = time.time()
     first_chunk_at = None
+    saw_done = False
     for line in raw_iter:
         data = strip_data_prefix(line.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
+            if data == "[DONE]":
+                saw_done = True
             continue
         try:
             chunk = json.loads(data)
@@ -4210,6 +9202,15 @@ def aggregate_stream(raw_iter, model, resp_id):
             k: v for k, v in tool_calls_map.items()
             if (v.get("function") or {}).get("name")
         }
+    # A stream cut off by max_tokens / a dropped connection leaves the last
+    # tool call with half-written JSON. Drop those calls instead of handing
+    # the client unparsable arguments; only non-empty unparsable strings
+    # count as truncated, so no-argument tools survive.
+    if tool_calls_map and (finish == "length" or not saw_done):
+        tool_calls_map = {
+            k: v for k, v in tool_calls_map.items()
+            if not is_truncated_arguments((v.get("function") or {}).get("arguments"))
+        }
     if tool_calls_map:
         ordered_tcs = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
         message["tool_calls"] = ordered_tcs
@@ -4239,554 +9240,11 @@ def aggregate_stream(raw_iter, model, resp_id):
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
     }
     if usage:
+        normalize_usage_cache_aliases(usage)
         out["usage"] = usage
     out["elapsed_ms"] = int((time.time() - started) * 1000)
     out["first_chunk_at"] = first_chunk_at
     return out
-
-
-# ---------------------------------------------------------------------------
-# Anthropic Messages API <-> WorkBuddy Chat Completions translation
-# ---------------------------------------------------------------------------
-# WorkBuddy's upstream only exposes a Chat Completions-shaped stream.  Keep
-# the Anthropic adapter here, next to the existing stream aggregator, so the
-# two public protocols share account selection, retries, usage recording and
-# model/realm checks without sharing their wire formats.
-class AnthropicRequestError(ValueError):
-    """A client-side request error that should use Anthropic's error shape."""
-
-
-ANTHROPIC_IMAGE_MEDIA_TYPES = {
-    "image/jpeg", "image/png", "image/gif", "image/webp",
-}
-# count_tokens is a local approximation, not a model tokenizer.  Without
-# decoded image dimensions, use one fixed allowance rather than treating a
-# potentially huge base64 payload (or URL) as prompt text.
-ANTHROPIC_IMAGE_TOKEN_ESTIMATE = 1024
-
-
-def _anthropic_text_block_text(block):
-    if not isinstance(block, dict):
-        return None
-    value = block.get("text")
-    return value if isinstance(value, str) else None
-
-
-def _anthropic_image_part(block):
-    source = block.get("source") if isinstance(block, dict) else None
-    if not isinstance(source, dict):
-        raise AnthropicRequestError("image content requires a source object")
-    source_type = str(source.get("type") or "").strip().lower()
-    if source_type == "base64":
-        media_type = str(source.get("media_type") or source.get("mediaType") or "").strip().lower()
-        data = source.get("data")
-        if not isinstance(data, str) or not data.strip():
-            raise AnthropicRequestError("base64 image source requires media_type and data")
-        data = data.strip()
-        # A few compatibility clients put the complete data URL in `data`
-        # instead of raw base64.  Do not prefix it twice.
-        if data.lower().startswith("data:image/"):
-            return {"type": "image_url", "image_url": {"url": data}}
-        if media_type not in ANTHROPIC_IMAGE_MEDIA_TYPES:
-            raise AnthropicRequestError(
-                "unsupported image media_type: %s" % (media_type or "unknown")
-            )
-        # JSON base64 occasionally arrives wrapped across lines.  Removing
-        # whitespace keeps the resulting data URL consumable by the upstream.
-        data = re.sub(r"\s+", "", data)
-        return {"type": "image_url", "image_url": {
-            "url": "data:%s;base64,%s" % (media_type, data),
-        }}
-    if source_type == "url":
-        url = source.get("url")
-        if not isinstance(url, str) or not url.strip():
-            raise AnthropicRequestError("url image source requires a url")
-        return {"type": "image_url", "image_url": {"url": url.strip()}}
-    raise AnthropicRequestError("unsupported image source type: %s" % (source_type or "unknown"))
-
-
-def _anthropic_content_to_openai(content, allow_images=True):
-    """Convert Anthropic text/image blocks to Chat Completions content."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, dict):
-        content = [content]
-    if not isinstance(content, list):
-        raise AnthropicRequestError("message content must be a string or an array of content blocks")
-
-    parts = []
-    for block in content:
-        if isinstance(block, str):
-            parts.append({"type": "text", "text": block})
-            continue
-        if not isinstance(block, dict):
-            raise AnthropicRequestError("content blocks must be objects")
-        block_type = str(block.get("type") or "").strip().lower()
-        if block_type == "text":
-            text = _anthropic_text_block_text(block)
-            if text is None:
-                raise AnthropicRequestError("text content requires a text string")
-            parts.append({"type": "text", "text": text})
-        elif block_type == "image":
-            if not allow_images:
-                raise AnthropicRequestError("images are not allowed in system content")
-            parts.append(_anthropic_image_part(block))
-        elif block_type in ("image_url", "input_image"):
-            # Non-Anthropic clients sometimes send OpenAI-shaped image blocks
-            # through an Anthropic-compatible endpoint.  Accepting these is
-            # harmless and makes the adapter usable with mixed SDK stacks.
-            if not allow_images:
-                raise AnthropicRequestError("images are not allowed in system content")
-            image_url = block.get("image_url") or block.get("url")
-            if isinstance(image_url, dict):
-                image_url = image_url.get("url")
-            if not isinstance(image_url, str) or not image_url.strip():
-                raise AnthropicRequestError("image_url content requires a url")
-            parts.append({"type": "image_url", "image_url": {
-                "url": image_url.strip(),
-            }})
-        elif block_type in ("thinking", "redacted_thinking"):
-            # Thinking is handled separately for assistant history.  It is not
-            # a user-visible prompt block and must not be sent as ordinary text.
-            continue
-        elif block_type in ("document", "search_result", "server_tool_use", "web_search_tool_result"):
-            raise AnthropicRequestError("unsupported content block type: %s" % block_type)
-        elif block_type:
-            raise AnthropicRequestError("unsupported content block type: %s" % block_type)
-        else:
-            raise AnthropicRequestError("content block is missing type")
-    if not parts:
-        return ""
-    if all(part.get("type") == "text" for part in parts):
-        return "".join(part.get("text") or "" for part in parts)
-    return parts
-
-
-def _anthropic_system_text(system):
-    if system is None:
-        return ""
-    converted = _anthropic_content_to_openai(system, allow_images=False)
-    if isinstance(converted, str):
-        return converted
-    return "".join(part.get("text") or "" for part in converted
-                   if isinstance(part, dict) and part.get("type") == "text")
-
-
-def _anthropic_tool_result_content(content):
-    """Keep tool images structured; reject unsupported blocks like documents."""
-    return _anthropic_content_to_openai(content)
-
-
-def _anthropic_assistant_blocks(content):
-    """Return (text, reasoning, OpenAI tool_calls) for an assistant turn."""
-    if isinstance(content, str):
-        return content, "", []
-    if isinstance(content, dict):
-        content = [content]
-    if not isinstance(content, list):
-        raise AnthropicRequestError("assistant content must be a string or an array")
-    text_parts = []
-    reasoning_parts = []
-    tool_calls = []
-    for block in content:
-        if isinstance(block, str):
-            text_parts.append(block)
-            continue
-        if not isinstance(block, dict):
-            raise AnthropicRequestError("assistant content blocks must be objects")
-        block_type = str(block.get("type") or "").strip().lower()
-        if block_type == "text":
-            text = _anthropic_text_block_text(block)
-            if text is None:
-                raise AnthropicRequestError("text content requires a text string")
-            text_parts.append(text)
-        elif block_type == "thinking":
-            thinking = block.get("thinking")
-            if isinstance(thinking, str):
-                reasoning_parts.append(thinking)
-        elif block_type == "redacted_thinking":
-            # The encrypted redacted value cannot be replayed to WorkBuddy.
-            continue
-        elif block_type == "tool_use":
-            name = str(block.get("name") or "").strip()
-            call_id = str(block.get("id") or "").strip() or _new_id("call_")
-            if not name:
-                raise AnthropicRequestError("tool_use requires a name")
-            arguments = block.get("input")
-            if arguments is None:
-                arguments = {}
-            if not isinstance(arguments, dict):
-                raise AnthropicRequestError("tool_use input must be an object")
-            tool_calls.append({
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(arguments, ensure_ascii=False,
-                                              separators=(",", ":")),
-                },
-            })
-        elif block_type:
-            raise AnthropicRequestError("unsupported assistant content block type: %s" % block_type)
-        else:
-            raise AnthropicRequestError("assistant content block is missing type")
-    return "".join(text_parts), "".join(reasoning_parts), tool_calls
-
-
-def _anthropic_tools_to_openai(tools):
-    if tools is None:
-        return None
-    if not isinstance(tools, list):
-        raise AnthropicRequestError("tools must be an array")
-    converted = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            raise AnthropicRequestError("each tool must be an object")
-        name = str(tool.get("name") or "").strip()
-        if not name:
-            raise AnthropicRequestError("each tool requires a name")
-        schema = tool.get("input_schema")
-        if not isinstance(schema, dict):
-            raise AnthropicRequestError("tool %s requires an input_schema object" % name)
-        fn = {
-            "name": name,
-            "description": str(tool.get("description") or ""),
-            "parameters": schema,
-        }
-        if "strict" in tool:
-            fn["strict"] = tool["strict"]
-        converted.append({"type": "function", "function": fn})
-    return converted
-
-
-def _anthropic_tool_choice_to_openai(choice):
-    if choice is None:
-        return None
-    if not isinstance(choice, dict):
-        raise AnthropicRequestError("tool_choice must be an object")
-    kind = str(choice.get("type") or "").strip().lower()
-    if kind == "auto":
-        return "auto"
-    if kind == "any":
-        return "required"
-    if kind == "none":
-        return "none"
-    if kind == "tool":
-        name = str(choice.get("name") or "").strip()
-        if not name:
-            raise AnthropicRequestError("tool_choice type 'tool' requires a name")
-        return name
-    raise AnthropicRequestError("unsupported tool_choice type: %s" % (kind or "unknown"))
-
-
-def _anthropic_reasoning_effort(payload, model):
-    """Resolve explicit effort without silently ignoring conflicting controls."""
-    output_config = payload.get("output_config")
-    if output_config is not None and not isinstance(output_config, dict):
-        raise AnthropicRequestError("output_config must be an object")
-    output_config = output_config if output_config is not None else {}
-    for field, output_format in (("output_config.format", output_config.get("format")),
-                                 ("output_format", payload.get("output_format"))):
-        if output_format is not None:
-            # The upstream body's Chat shape alone does not prove support for
-            # constrained decoding.  Do not promise schema validation by dropping
-            # the field or by inventing a response_format mapping.
-            raise AnthropicRequestError(
-                "%s is not supported: WorkBuddy does not provide "
-                "validated JSON Schema output" % field
-            )
-
-    levels = ("low", "medium", "high", "xhigh", "max")
-    effort = None
-    if output_config.get("effort") is not None:
-        effort = output_config["effort"]
-        if not isinstance(effort, str) or effort not in levels:
-            raise AnthropicRequestError(
-                "output_config.effort must be low, medium, high, xhigh or max"
-            )
-    for key in ("reasoning_effort", "reasoningEffort"):
-        if payload.get(key) is None:
-            continue
-        given = payload[key]
-        if not isinstance(given, str) or given not in levels + ("none",):
-            raise AnthropicRequestError("%s has an unsupported effort value" % key)
-        if effort is not None and given != effort:
-            raise AnthropicRequestError("conflicting effort fields: %s" % key)
-        effort = given
-    if effort is None:
-        return None
-
-    thinking = payload.get("thinking")
-    thinking_type = str(thinking.get("type") or "").lower() if isinstance(thinking, dict) else ""
-    if ((thinking_type == "disabled" and effort != "none") or
-            (thinking_type in ("enabled", "adaptive") and effort == "none")):
-        raise AnthropicRequestError("effort conflicts with thinking.type")
-    meta = model_catalog_meta(model)
-    reasoning = meta.get("reasoning") or {}
-    fixed = reasoning.get("effort")
-    supported = reasoning.get("supportedEfforts")
-    if fixed and effort != fixed:
-        raise AnthropicRequestError("effort %s is not supported by model %s (fixed effort: %s)" % (
-            effort, model, fixed,
-        ))
-    if effort != "none" and isinstance(supported, list) and supported and effort not in supported:
-        raise AnthropicRequestError("effort %s is not supported by model %s (supported: %s)" % (
-            effort, model, ", ".join(str(value) for value in supported),
-        ))
-    if effort == "none" and reasoning.get("canDisableThinking") is False:
-        raise AnthropicRequestError("effort none is not supported by model %s" % model)
-    return effort
-
-
-def _anthropic_messages_to_chat(payload, require_max_tokens=True):
-    """Validate and convert one Anthropic Messages request to Chat shape."""
-    if not isinstance(payload, dict):
-        raise AnthropicRequestError("request body must be a JSON object")
-    model = str(payload.get("model") or "").strip()
-    if not model:
-        raise AnthropicRequestError("model is required")
-    effort = _anthropic_reasoning_effort(payload, model)
-    raw_messages = payload.get("messages")
-    if not isinstance(raw_messages, list) or not raw_messages:
-        raise AnthropicRequestError("messages must be a non-empty array")
-    if require_max_tokens:
-        try:
-            max_tokens = int(payload.get("max_tokens"))
-        except (TypeError, ValueError):
-            raise AnthropicRequestError("max_tokens is required and must be a positive integer")
-        if max_tokens <= 0:
-            raise AnthropicRequestError("max_tokens must be a positive integer")
-    else:
-        raw_max_tokens = payload.get("max_tokens")
-        if raw_max_tokens is None:
-            max_tokens = None
-        else:
-            try:
-                max_tokens = int(raw_max_tokens)
-            except (TypeError, ValueError):
-                raise AnthropicRequestError("max_tokens must be a positive integer")
-            if max_tokens <= 0:
-                raise AnthropicRequestError("max_tokens must be a positive integer")
-
-    messages = []
-    system_parts = []
-    system = _anthropic_system_text(payload.get("system"))
-    if system:
-        system_parts.append(system)
-
-    for source in raw_messages:
-        if not isinstance(source, dict):
-            raise AnthropicRequestError("each message must be an object")
-        role = str(source.get("role") or "").strip().lower()
-        if role in ("system", "developer"):
-            # Anthropic's public schema places system instructions in the
-            # top-level `system` field, but Claude Code and compatibility
-            # clients can still carry them as message turns.  Normalize them
-            # here instead of forwarding an invalid role to WorkBuddy.
-            system_text = _anthropic_system_text(source.get("content"))
-            if system_text:
-                system_parts.append(system_text)
-            continue
-        if role not in ("user", "assistant"):
-            raise AnthropicRequestError("message role must be user or assistant")
-        content = source.get("content")
-        if role == "assistant":
-            text, reasoning, tool_calls = _anthropic_assistant_blocks(content)
-            message = {"role": "assistant", "content": text}
-            if reasoning:
-                message["reasoning_content"] = reasoning
-                message["reasoning"] = reasoning
-            if tool_calls:
-                message["tool_calls"] = tool_calls
-            messages.append(message)
-            continue
-
-        blocks = content if isinstance(content, list) else [content]
-        pending = []
-        saw_tool_result = False
-        for block in blocks:
-            if isinstance(block, dict) and str(block.get("type") or "").strip().lower() == "tool_result":
-                if pending:
-                    messages.append({"role": "user", "content": _anthropic_content_to_openai(pending)})
-                    pending = []
-                tool_id = str(block.get("tool_use_id") or "").strip()
-                if not tool_id:
-                    raise AnthropicRequestError("tool_result requires a tool_use_id")
-                result = _anthropic_tool_result_content(block.get("content"))
-                if block.get("is_error"):
-                    if isinstance(result, list):
-                        result = [{"type": "text", "text": "Tool error: "}] + result
-                    else:
-                        result = "Tool error: " + result
-                messages.append({"role": "tool", "tool_call_id": tool_id, "content": result})
-                saw_tool_result = True
-            else:
-                pending.append(block)
-        if pending or not saw_tool_result:
-            messages.append({"role": "user", "content": _anthropic_content_to_openai(pending)})
-
-    if system_parts:
-        messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
-
-    body = {"model": model, "messages": messages}
-    if effort is not None:
-        body["reasoning_effort"] = effort
-    if max_tokens is not None:
-        body["max_tokens"] = max_tokens
-    for key in ("temperature", "top_p", "top_k", "stream", "thinking"):
-        if key in payload:
-            body[key] = payload[key]
-    if "stop_sequences" in payload:
-        stops = payload.get("stop_sequences")
-        if not isinstance(stops, list) or not all(isinstance(item, str) for item in stops):
-            raise AnthropicRequestError("stop_sequences must be an array of strings")
-        body["stop"] = stops
-    tools = _anthropic_tools_to_openai(payload.get("tools"))
-    if tools is not None:
-        body["tools"] = tools
-    choice = _anthropic_tool_choice_to_openai(payload.get("tool_choice"))
-    if choice is not None:
-        body["tool_choice"] = choice
-    if isinstance(payload.get("tool_choice"), dict):
-        body["parallel_tool_calls"] = not bool(
-            payload["tool_choice"].get("disable_parallel_tool_use")
-        )
-    return body
-
-
-def _anthropic_input_tokens(chat_payload):
-    """Approximate messages, tool schemas and a fixed allowance per image."""
-    try:
-        messages = []
-        image_tokens = 0
-        for message in chat_payload.get("messages") or []:
-            estimated = dict(message)
-            content = message.get("content")
-            if isinstance(content, list):
-                parts = []
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "image_url":
-                        image_tokens += ANTHROPIC_IMAGE_TOKEN_ESTIMATE
-                        parts.append({"type": "image_url"})
-                    else:
-                        parts.append(part)
-                estimated["content"] = parts
-            messages.append(estimated)
-        raw = json.dumps({"messages": messages, "tools": chat_payload.get("tools") or []},
-                          ensure_ascii=False,
-                          separators=(",", ":"))
-        return max(1, estimate_tokens(raw) + image_tokens)
-    except Exception:
-        return 1
-
-
-def _anthropic_stop_reason(finish_reason):
-    mapping = {
-        "stop": "end_turn",
-        "length": "max_tokens",
-        "tool_calls": "tool_use",
-        "function_call": "tool_use",
-        "content_filter": "refusal",
-        "refusal": "refusal",
-    }
-    return mapping.get(finish_reason, finish_reason or "end_turn")
-
-
-def _anthropic_usage(chat_usage, input_tokens=0, output_text="", reasoning=""):
-    chat_usage = dict(chat_usage or {})
-    # Share the gateway's field precedence while retaining this adapter's
-    # tolerance for malformed optional details from compatibility upstreams.
-    for key in ("completion_tokens_details", "prompt_tokens_details"):
-        if not isinstance(chat_usage.get(key), dict):
-            chat_usage[key] = {}
-    usage = _extract_usage(chat_usage)
-    # Read these raw fields so an absent counter stays distinct from a real
-    # zero; the canonical extractor defaults missing counters to zero.
-    prompt = chat_usage.get("prompt_tokens")
-    completion = chat_usage.get("completion_tokens")
-    try:
-        prompt = int(prompt)
-    except (TypeError, ValueError):
-        prompt = None
-    try:
-        completion = int(completion)
-    except (TypeError, ValueError):
-        completion = None
-    if prompt is None or prompt < 0:
-        prompt = max(1, int(input_tokens or 0))
-    if completion is None or completion < 0:
-        completion = estimate_tokens((reasoning or "") + (output_text or ""))
-    try:
-        cached = int(usage.get("cached_tokens") or 0)
-    except (TypeError, ValueError):
-        cached = 0
-    cached = max(0, min(prompt, cached))
-    # OpenAI prompt_tokens includes cache hits; Anthropic input_tokens excludes
-    # them.  The upstream does not report Anthropic cache writes or TTLs.
-    return {
-        "input_tokens": max(0, prompt - cached),
-        "output_tokens": max(0, completion),
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": cached,
-    }
-
-
-def _anthropic_response_from_chat(chat_obj, payload, input_tokens=0):
-    choice = ((chat_obj.get("choices") or [{}])[0] or {})
-    message = choice.get("message") or {}
-    text = message.get("content") or ""
-    if not isinstance(text, str):
-        text = str(text)
-    reasoning = message.get("reasoning_content") or ""
-    if not isinstance(reasoning, str):
-        reasoning = str(reasoning)
-    content = []
-    if reasoning:
-        # WorkBuddy has no Anthropic thinking signature.  Keep the block
-        # structurally valid and mark the signature empty instead of leaking
-        # the reasoning into the user-visible text channel.
-        content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
-    if text:
-        content.append({"type": "text", "text": text})
-    for tool_call in message.get("tool_calls") or []:
-        fn = tool_call.get("function") or {}
-        arguments = fn.get("arguments") or "{}"
-        try:
-            tool_input = json.loads(arguments) if isinstance(arguments, str) else arguments
-        except Exception:
-            tool_input = {"_raw_arguments": str(arguments)}
-        if not isinstance(tool_input, dict):
-            tool_input = {"_raw_arguments": json.dumps(tool_input, ensure_ascii=False)}
-        content.append({
-            "type": "tool_use",
-            "id": tool_call.get("id") or _new_id("call_"),
-            "name": fn.get("name") or "",
-            "input": tool_input,
-        })
-    usage = _anthropic_usage(chat_obj.get("usage"), input_tokens,
-                             text, reasoning)
-    return {
-        "id": _new_id("msg_"),
-        "type": "message",
-        "role": "assistant",
-        "model": chat_obj.get("model") or payload.get("model"),
-        "content": content,
-        "stop_reason": _anthropic_stop_reason(choice.get("finish_reason")),
-        "stop_sequence": None,
-        "usage": usage,
-    }
-
-
-def _anthropic_sse_event(event_type, data):
-    payload = dict(data or {})
-    payload.setdefault("type", event_type)
-    return ("event: %s\ndata: %s\n\n" % (
-        event_type, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    )).encode("utf-8")
-
-
 # ---------------------------------------------------------------------------
 # Responses API (/v1/responses) <-> Chat Completions translation
 # ---------------------------------------------------------------------------
@@ -4876,21 +9334,21 @@ CUSTOM_TOOL_HINT = (
 
 
 # ---------------------------------------------------------------------------
-# namespace 工具拒絕
+# namespace 工具拒绝
 #
-# Codex 會把 MCP server / 外掛工具用 type="namespace" 的形式送出來。實測行為：
-#   反代「接受」namespace 工具 -> app 把 MCP／外掛工具當成不可執行
+# Codex 会把 MCP server / 外挂工具用 type="namespace" 的形式送出来。实测行为：
+#   反代「接受」namespace 工具 -> app 把 MCP／外挂工具当成不可执行
 #                                -> 每一次呼叫都回 "unsupported call"
-#   反代「拒絕」namespace 工具 -> app 自動 fallback 成 flat function 清單
-#                                -> 全部工具恢復正常
-# （此行為在 Command Code proxy.mjs 的 CC_REJECT_NAMESPACE_TOOLS 實驗裡有記載，
-#   Agent Router 也是靠直接拒絕這類請求才正常的。）
+#   反代「拒绝」namespace 工具 -> app 自动 fallback 成 flat function 清单
+#                                -> 全部工具恢复正常
+# （此行为在 Command Code proxy.mjs 的 CC_REJECT_NAMESPACE_TOOLS 实验里有记载，
+#   Agent Router 也是靠直接拒绝这类请求才正常的。）
 #
-# 所以在這裡主動回一個格式明確的 400，逼 app 走 fallback。
-# 想還原成「照單全收」就把 REJECT_NAMESPACE_TOOLS 改成 False。
+# 所以在这里主动回一个格式明确的 400，逼 app 走 fallback。
+# 想还原成「照单全收」就把 REJECT_NAMESPACE_TOOLS 改成 False。
 # ---------------------------------------------------------------------------
 
-REJECT_NAMESPACE_TOOLS = False  # 保持關閉：正解是展開+還原 namespace
+REJECT_NAMESPACE_TOOLS = False  # 保持关闭：正解是展开+还原 namespace
 
 NAMESPACE_TOOL_MESSAGE = (
     'Unsupported tool type "namespace": this endpoint only supports flat '
@@ -4899,7 +9357,7 @@ NAMESPACE_TOOL_MESSAGE = (
 
 
 def find_namespace_tool(tools):
-    """回傳第一個 type=="namespace" 的工具名稱，沒有就回 None。"""
+    """回传第一个 type=="namespace" 的工具名称，没有就回 None。"""
     for t in tools or []:
         if isinstance(t, dict) and str(t.get("type") or "").lower() == "namespace":
             return str(t.get("name") or t.get("server_label") or "(unnamed)")
@@ -4944,19 +9402,19 @@ def _downgrade_custom_tool(tool):
 
 
 # ---------------------------------------------------------------------------
-# namespace 工具：展開 + 還原
+# namespace 工具：展开 + 还原
 #
-# 新版 Codex App 把 MCP／外掛工具用 namespace 形式送出：
+# 新版 Codex App 把 MCP／外挂工具用 namespace 形式送出：
 #   {"type":"namespace","name":"codex_app","tools":[{name:"list_threads",...}]}
 #
-# 上游 Chat Completions 只認 flat function，看不懂 namespace。
-# 但 App 回程是用 (name, namespace) 兩個欄位找執行器 ——
-# 只給 flat name，App 一律回 "unsupported call"（實測 js / list_threads 全滅）。
+# 上游 Chat Completions 只认 flat function，看不懂 namespace。
+# 但 App 回程是用 (name, namespace) 两个栏位找执行器 ——
+# 只给 flat name，App 一律回 "unsupported call"（实测 js / list_threads 全灭）。
 #
 # 三件事：
-#   1. Expand   送上游前把 namespace 展開成 flat function，記住 name -> namespace
-#   2. Normalise 模型回傳的 name 可能是 js / ns__js / ns::js，都要能解析
-#   3. Restore   回程的 function_call / custom_tool_call 補上 namespace 欄位
+#   1. Expand   送上游前把 namespace 展开成 flat function，记住 name -> namespace
+#   2. Normalise 模型回传的 name 可能是 js / ns__js / ns::js，都要能解析
+#   3. Restore   回程的 function_call / custom_tool_call 补上 namespace 栏位
 #
 # 参考：某开源 CodeBuddy/WorkBuddy 反向代理项目的 tool-namespaces 说明
 # ---------------------------------------------------------------------------
@@ -4966,13 +9424,13 @@ _NS_SEP = "__"
 
 
 def expand_namespace_tools(tools, _depth=0):
-    """把 namespace 展開成 flat function 清單，其餘工具原樣保留。
+    """把 namespace 展开成 flat function 清单，其余工具原样保留。
 
-      * 子工具可能在 tools / children / functions 任一欄位
-      * namespace 子工具常常沒有 type 欄位，展開時補成上游認得的 flat function
-      * custom / web_search 等非 function 項目原樣留下，交給既有管線處理
-      * 同名只留第一個
-      * 回傳 (flat_tools, name_to_namespace)
+      * 子工具可能在 tools / children / functions 任一栏位
+      * namespace 子工具常常没有 type 栏位，展开时补成上游认得的 flat function
+      * custom / web_search 等非 function 项目原样留下，交给既有管线处理
+      * 同名只留第一个
+      * 回传 (flat_tools, name_to_namespace)
     """
     flat = []
     mapping = {}
@@ -5035,7 +9493,7 @@ def expand_namespace_tools(tools, _depth=0):
 
 
 def resolve_namespaced_name(name, mapping):
-    """把模型回傳的名字解析回 (bare_name, namespace)。接受 js / ns__js / ns::js。"""
+    """把模型回传的名字解析回 (bare_name, namespace)。接受 js / ns__js / ns::js。"""
     if not name:
         return name, ""
     name = str(name)
@@ -5050,7 +9508,7 @@ def resolve_namespaced_name(name, mapping):
                 return tail, mapping[tail]
             return tail, head
 
-    # ns__tool 用精確比對，避免 namespace 內含 '__'（如 codex_apps__github）時切錯
+    # ns__tool 用精确比对，避免 namespace 内含 '__'（如 codex_apps__github）时切错
     for tool, ns in mapping.items():
         if name == ns + _NS_SEP + tool:
             return tool, ns
@@ -5059,10 +9517,10 @@ def resolve_namespaced_name(name, mapping):
 
 
 def stamp_namespace(item, mapping):
-    """把模型回傳的扁平工具名還原成 (name, namespace)。
+    """把模型回传的扁平工具名还原成 (name, namespace)。
 
-    串流的 response.output_item.done 事件才是客戶端派發工具呼叫的依據，
-    所以每個 function_call / custom_tool_call 項目都要在送出前補上 namespace。
+    串流的 response.output_item.done 事件才是客户端派发工具呼叫的依据，
+    所以每个 function_call / custom_tool_call 项目都要在送出前补上 namespace。
     """
     if not mapping or not isinstance(item, dict):
         return item
@@ -5074,7 +9532,7 @@ def stamp_namespace(item, mapping):
 
 
 def apply_namespace_to_calls(output_items, mapping):
-    """替 Responses 的 function_call / custom_tool_call 補上 namespace。"""
+    """替 Responses 的 function_call / custom_tool_call 补上 namespace。"""
     if not mapping or not isinstance(output_items, list):
         return output_items, 0
     fixed = 0
@@ -5156,10 +9614,10 @@ def web_tools_active(body):
 
 
 def sum_usage(total, part):
-    """把一輪的 token 用量累加起來。
+    """把一轮的 token 用量累加起来。
 
-    代跑網路工具會多跑好幾次上游，那些 token 是真的花掉的，所以記帳要加總，
-    不能讓最後一輪蓋掉前面幾輪。
+    代跑网路工具会多跑好几次上游，那些 token 是真的花掉的，所以记帐要加总，
+    不能让最后一轮盖掉前面几轮。
     """
     if not isinstance(part, dict):
         return total
@@ -5179,9 +9637,9 @@ _CITATION_MD_RE = re.compile(r"\[([^\]\n]{1,200})\]\((https?://[^)\s]+)\)")
 
 
 def build_citations(text, sources):
-    """把模型實際引用到的來源轉成 url_citation annotations。
+    """把模型实际引用到的来源转成 url_citation annotations。
 
-    只標註真的有出現在工具輸出裡的網址 —— 模型自己編的連結不會被當成引用。
+    只标注真的有出现在工具输出里的网址 —— 模型自己编的连结不会被当成引用。
     """
     text = str(text or "")
     if not text or not sources:
@@ -5236,12 +9694,12 @@ def build_citations(text, sources):
 
 def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_start,
                                 drop_tools=False):
-    """執行反代自己代跑的網路工具，把結果餵回模型，回傳新的上游連線。
+    """执行反代自己代跑的网路工具，把结果喂回模型，回传新的上游连线。
 
-    drop_tools=True 表示這是最後一輪：把網路工具從工具清單收回，模型沒有東西
-    可以再呼叫，只能用手上的結果把話講完。舊版在回合用盡時合成一個
-    resp_wrapup（status=completed、output=[]）收尾，那等於把失敗偽裝成正常
-    結束，客戶端看到的就是「講到一半斷掉」——issue #43。
+    drop_tools=True 表示这是最后一轮：把网路工具从工具清单收回，模型没有东西
+    可以再呼叫，只能用手上的结果把话讲完。旧版在回合用尽时合成一个
+    resp_wrapup（status=completed、output=[]）收尾，那等于把失败伪装成正常
+    结束，客户端看到的就是「讲到一半断掉」——issue #43。
     """
     convo = holder.get("convo_messages")
     if convo is None:
@@ -5389,6 +9847,22 @@ def _responses_input_to_messages(payload):
                         _txt = json.dumps(raw_out, ensure_ascii=False)
                     else:
                         _txt = str(raw_out or "")
+                    if isinstance(_txt, list):
+                        # _flatten_content returns structured chat parts when
+                        # the output carries images. Keep them as multimodal
+                        # user content instead of crashing on .strip().
+                        try:
+                            log("[wb-proxy] orphan function_call_output kept as multimodal parts (%d)"
+                                % len(_txt))
+                        except Exception:
+                            pass
+                        messages.append({
+                            "role": "user",
+                            "content": ([{"type": "text", "text":
+                                          "[Message from another task - treat this "
+                                          "as a user instruction]"}] + _txt),
+                        })
+                        continue
                     _txt = (_txt or "").strip()
                     if _txt:
                         messages.append({
@@ -5540,8 +10014,8 @@ def responses_to_chat(payload):
         flat_tools, ns_map = expand_namespace_tools(payload["tools"])
         chat["tools"] = _tools_for_chat(flat_tools)
         chat["_namespace_map"] = ns_map
-    # 客戶端宣告 web_search / web_fetch 時，把那份宣告換成我們的
-    # function（見 wb_webtools.install_tool_defs）。
+    # 客户端宣告 web_search / web_fetch 时，把那份宣告换成我们的
+    # function（见 wb_webtools.install_tool_defs）。
     # 看板开关关闭时原样透传，客户端自己的同名工具不受影响。
     if local_web_tools_enabled():
         wants = wb_webtools.client_wants_web(payload.get("tools"))
@@ -5553,6 +10027,845 @@ def responses_to_chat(payload):
     if payload.get("parallel_tool_calls") is not None:
         chat["parallel_tool_calls"] = payload["parallel_tool_calls"]
     return chat
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Messages API (/v1/messages) <-> Chat Completions
+# ---------------------------------------------------------------------------
+def anthropic_error_type(status):
+    """Map an HTTP status to the Anthropic error.type vocabulary."""
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = 500
+    if status in (400, 422):
+        return "invalid_request_error"
+    if status == 401:
+        return "authentication_error"
+    if status == 403:
+        return "permission_error"
+    if status == 404:
+        return "not_found_error"
+    if status == 429:
+        return "rate_limit_error"
+    if status in (503, 529):
+        return "overloaded_error"
+    return "api_error"
+
+
+def anthropic_error_obj(status, message, error_type=None):
+    return {
+        "type": "error",
+        "error": {
+            "type": error_type or anthropic_error_type(status),
+            "message": str(message or "upstream error"),
+        },
+    }
+
+
+def anthropic_sse_frame(event, payload):
+    body = dict(payload or {})
+    body["type"] = event
+    raw = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    return ("event: %s\ndata: %s\n\n" % (event, raw)).encode("utf-8")
+
+
+def _anthropic_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return ""
+
+
+def _anthropic_content_to_text(value, is_error=None):
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, list):
+        parts = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            typ = str(item.get("type") or "")
+            if typ == "image":
+                part = _anthropic_image_part(item)
+                parts.append(_anthropic_text((part.get("image_url") or {}).get("url")))
+            elif typ == "document":
+                parts.append(_anthropic_document_text(item))
+            else:
+                parts.append(_anthropic_block_text(item))
+        text = "".join(parts)
+    elif isinstance(value, dict):
+        text = _anthropic_block_text(value)
+    else:
+        text = _anthropic_text(value)
+    if is_error is True:
+        return "error: " + text
+    return text
+
+
+def _anthropic_block_text(block):
+    if not isinstance(block, dict):
+        return ""
+    if "text" in block:
+        return _anthropic_text(block.get("text"))
+    if "content" in block:
+        return _anthropic_content_to_text(block.get("content"))
+    return ""
+
+
+def _anthropic_document_text(block):
+    if not isinstance(block, dict):
+        return ""
+    title = _anthropic_text(block.get("title"))
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    stype = str(source.get("type") or "")
+    body = ""
+    if stype == "text":
+        body = _anthropic_text(source.get("data"))
+    elif stype == "content":
+        body = _anthropic_content_to_text(source.get("content"))
+    elif stype == "base64":
+        media = _anthropic_text(source.get("media_type") or "application/octet-stream")
+        body = "[document %s omitted]" % media
+    elif stype == "url":
+        body = _anthropic_text(source.get("url"))
+    elif stype == "file":
+        body = _anthropic_text(source.get("file_id") or source.get("url"))
+    if title:
+        return title + "\n" + body
+    return body
+
+
+def anthropic_tools_to_chat(tools):
+    out = []
+    skipped = []
+    if not isinstance(tools, list):
+        return out, skipped
+    for item in tools:
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("function"), dict):
+            out.append(item)
+            continue
+        name = _anthropic_text(item.get("name") or item.get("type"))
+        schema = item.get("input_schema")
+        if schema is None:
+            schema = item.get("parameters")
+        if schema is None:
+            if name:
+                skipped.append(name)
+            continue
+        fn = {"name": name}
+        if item.get("description") is not None:
+            fn["description"] = item.get("description")
+        fn["parameters"] = schema
+        out.append({"type": "function", "function": fn})
+    return out, skipped
+
+
+def anthropic_effort_from_messages(payload):
+    if not isinstance(payload, dict):
+        return None
+    output_config = payload.get("output_config")
+    if isinstance(output_config, dict):
+        effort = _anthropic_text(output_config.get("effort")).strip()
+        if effort:
+            return effort
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict):
+        return None
+    typ = _anthropic_text(thinking.get("type")).strip().lower()
+    if typ == "disabled":
+        return "none"
+    if typ != "enabled":
+        return None
+    try:
+        budget = int(thinking.get("budget_tokens") or 0)
+    except (TypeError, ValueError):
+        return None
+    if budget <= 0:
+        return None
+    if budget >= 32000:
+        return "xhigh"
+    if budget >= 16000:
+        return "high"
+    if budget >= 8000:
+        return "medium"
+    return "low"
+
+
+class AnthropicRequestError(ValueError):
+    """A client-side request error that should use Anthropic's error shape."""
+
+
+ANTHROPIC_IMAGE_MEDIA_TYPES = {
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+}
+# count_tokens is a local approximation, not a model tokenizer.  Without
+# decoded image dimensions, use one fixed allowance rather than treating a
+# potentially huge base64 payload (or URL) as prompt text.
+ANTHROPIC_IMAGE_TOKEN_ESTIMATE = 1024
+
+
+def _anthropic_text_block_text(block):
+    if not isinstance(block, dict):
+        return None
+    value = block.get("text")
+    return value if isinstance(value, str) else None
+
+
+def _anthropic_image_part(block):
+    source = block.get("source") if isinstance(block, dict) else None
+    if not isinstance(source, dict):
+        raise AnthropicRequestError("image content requires a source object")
+    source_type = str(source.get("type") or "").strip().lower()
+    if source_type == "base64":
+        media_type = str(source.get("media_type") or source.get("mediaType") or "").strip().lower()
+        data = source.get("data")
+        if not isinstance(data, str) or not data.strip():
+            raise AnthropicRequestError("base64 image source requires media_type and data")
+        data = data.strip()
+        # A few compatibility clients put the complete data URL in `data`
+        # instead of raw base64.  Do not prefix it twice.
+        if data.lower().startswith("data:image/"):
+            return {"type": "image_url", "image_url": {"url": data}}
+        if media_type not in ANTHROPIC_IMAGE_MEDIA_TYPES:
+            raise AnthropicRequestError(
+                "unsupported image media_type: %s" % (media_type or "unknown")
+            )
+        # JSON base64 occasionally arrives wrapped across lines.  Removing
+        # whitespace keeps the resulting data URL consumable by the upstream.
+        data = re.sub(r"\s+", "", data)
+        return {"type": "image_url", "image_url": {
+            "url": "data:%s;base64,%s" % (media_type, data),
+        }}
+    if source_type == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise AnthropicRequestError("url image source requires a url")
+        return {"type": "image_url", "image_url": {"url": url.strip()}}
+    raise AnthropicRequestError("unsupported image source type: %s" % (source_type or "unknown"))
+
+
+def _anthropic_content_to_openai(content, allow_images=True):
+    """Convert Anthropic text/image blocks to Chat Completions content."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        raise AnthropicRequestError("message content must be a string or an array of content blocks")
+
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append({"type": "text", "text": block})
+            continue
+        if not isinstance(block, dict):
+            raise AnthropicRequestError("content blocks must be objects")
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type == "text":
+            text = _anthropic_text_block_text(block)
+            if text is None:
+                raise AnthropicRequestError("text content requires a text string")
+            parts.append({"type": "text", "text": text})
+        elif block_type == "image":
+            if not allow_images:
+                raise AnthropicRequestError("images are not allowed in system content")
+            parts.append(_anthropic_image_part(block))
+        elif block_type in ("image_url", "input_image"):
+            # Non-Anthropic clients sometimes send OpenAI-shaped image blocks
+            # through an Anthropic-compatible endpoint.  Accepting these is
+            # harmless and makes the adapter usable with mixed SDK stacks.
+            if not allow_images:
+                raise AnthropicRequestError("images are not allowed in system content")
+            image_url = block.get("image_url") or block.get("url")
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url")
+            if not isinstance(image_url, str) or not image_url.strip():
+                raise AnthropicRequestError("image_url content requires a url")
+            parts.append({"type": "image_url", "image_url": {
+                "url": image_url.strip(),
+            }})
+        elif block_type in ("thinking", "redacted_thinking"):
+            # Thinking is handled separately for assistant history.  It is not
+            # a user-visible prompt block and must not be sent as ordinary text.
+            continue
+        elif block_type == "document" and (block.get("source") or {}).get("type") in ("text", "content"):
+            parts.append({"type": "text", "text": _anthropic_document_text(block)})
+        elif block_type in ("document", "search_result", "server_tool_use", "web_search_tool_result"):
+            raise AnthropicRequestError("unsupported content block type: %s" % block_type)
+        elif block_type:
+            raise AnthropicRequestError("unsupported content block type: %s" % block_type)
+        else:
+            raise AnthropicRequestError("content block is missing type")
+    if not parts:
+        return ""
+    if all(part.get("type") == "text" for part in parts):
+        return "".join(part.get("text") or "" for part in parts)
+    return parts
+
+
+def _anthropic_system_text(system):
+    if isinstance(system, list):
+        return "\n".join(_anthropic_content_to_openai([block], allow_images=False)
+                         for block in system)
+    return _anthropic_content_to_openai(system, allow_images=False)
+
+
+def _anthropic_tool_result_content(content):
+    """Keep tool images structured; reject unsupported blocks like documents."""
+    return _anthropic_content_to_openai(content)
+
+
+def _anthropic_assistant_blocks(content):
+    """Return (text, reasoning, OpenAI tool_calls) for an assistant turn."""
+    if isinstance(content, str):
+        return content, "", []
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        raise AnthropicRequestError("assistant content must be a string or an array")
+    text_parts = []
+    reasoning_parts = []
+    tool_calls = []
+    for block in content:
+        if isinstance(block, str):
+            text_parts.append(block)
+            continue
+        if not isinstance(block, dict):
+            raise AnthropicRequestError("assistant content blocks must be objects")
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type == "text":
+            text = _anthropic_text_block_text(block)
+            if text is None:
+                raise AnthropicRequestError("text content requires a text string")
+            text_parts.append(text)
+        elif block_type == "thinking":
+            thinking = block.get("thinking")
+            if isinstance(thinking, str):
+                reasoning_parts.append(thinking)
+        elif block_type == "redacted_thinking":
+            # The encrypted redacted value cannot be replayed to WorkBuddy.
+            continue
+        elif block_type == "tool_use":
+            name = str(block.get("name") or "").strip()
+            call_id = str(block.get("id") or "").strip() or _new_id("call_")
+            if not name:
+                raise AnthropicRequestError("tool_use requires a name")
+            arguments = block.get("input")
+            if arguments is None:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                raise AnthropicRequestError("tool_use input must be an object")
+            tool_calls.append({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False,
+                                              separators=(",", ":")),
+                },
+            })
+        elif block_type:
+            raise AnthropicRequestError("unsupported assistant content block type: %s" % block_type)
+        else:
+            raise AnthropicRequestError("assistant content block is missing type")
+    return "".join(text_parts), "".join(reasoning_parts), tool_calls
+
+
+def _anthropic_tool_choice_to_openai(choice):
+    if choice is None:
+        return None
+    if not isinstance(choice, dict):
+        raise AnthropicRequestError("tool_choice must be an object")
+    kind = str(choice.get("type") or "").strip().lower()
+    if kind == "auto":
+        return "auto"
+    if kind == "any":
+        return "required"
+    if kind == "none":
+        return "none"
+    if kind == "tool":
+        name = str(choice.get("name") or "").strip()
+        if not name:
+            raise AnthropicRequestError("tool_choice type 'tool' requires a name")
+        return {"type": "function", "function": {"name": name}}
+    raise AnthropicRequestError("unsupported tool_choice type: %s" % (kind or "unknown"))
+
+
+def _anthropic_reasoning_effort(payload, model):
+    """Resolve explicit effort without silently ignoring conflicting controls."""
+    output_config = payload.get("output_config")
+    if output_config is not None and not isinstance(output_config, dict):
+        raise AnthropicRequestError("output_config must be an object")
+    output_config = output_config if output_config is not None else {}
+    for field, output_format in (("output_config.format", output_config.get("format")),
+                                 ("output_format", payload.get("output_format"))):
+        if output_format is not None:
+            # The upstream body's Chat shape alone does not prove support for
+            # constrained decoding.  Do not promise schema validation by dropping
+            # the field or by inventing a response_format mapping.
+            raise AnthropicRequestError(
+                "%s is not supported: WorkBuddy does not provide "
+                "validated JSON Schema output" % field
+            )
+
+    levels = ("low", "medium", "high", "xhigh", "max")
+    effort = None
+    if output_config.get("effort") is not None:
+        effort = output_config["effort"]
+        if not isinstance(effort, str) or effort not in levels:
+            raise AnthropicRequestError(
+                "output_config.effort must be low, medium, high, xhigh or max"
+            )
+    for key in ("reasoning_effort", "reasoningEffort"):
+        if payload.get(key) is None:
+            continue
+        given = payload[key]
+        if not isinstance(given, str) or given not in levels + ("none",):
+            raise AnthropicRequestError("%s has an unsupported effort value" % key)
+        if effort is not None and given != effort:
+            raise AnthropicRequestError("conflicting effort fields: %s" % key)
+        effort = given
+    if effort is None:
+        return None
+
+    thinking = payload.get("thinking")
+    thinking_type = str(thinking.get("type") or "").lower() if isinstance(thinking, dict) else ""
+    if ((thinking_type == "disabled" and effort != "none") or
+            (thinking_type in ("enabled", "adaptive") and effort == "none")):
+        raise AnthropicRequestError("effort conflicts with thinking.type")
+    meta = model_catalog_meta(model)
+    reasoning = meta.get("reasoning") or {}
+    fixed = reasoning.get("effort")
+    supported = reasoning.get("supportedEfforts")
+    if fixed and effort != fixed:
+        raise AnthropicRequestError("effort %s is not supported by model %s (fixed effort: %s)" % (
+            effort, model, fixed,
+        ))
+    if effort != "none" and isinstance(supported, list) and supported and effort not in supported:
+        raise AnthropicRequestError("effort %s is not supported by model %s (supported: %s)" % (
+            effort, model, ", ".join(str(value) for value in supported),
+        ))
+    if effort == "none" and reasoning.get("canDisableThinking") is False:
+        raise AnthropicRequestError("effort none is not supported by model %s" % model)
+    return effort
+
+
+def messages_to_chat(payload, require_max_tokens=True):
+    """Validate and convert one Anthropic Messages request to Chat shape."""
+    if not isinstance(payload, dict):
+        raise AnthropicRequestError("request body must be a JSON object")
+    model = str(payload.get("model") or "").strip()
+    if not model:
+        raise AnthropicRequestError("model is required")
+    effort = _anthropic_reasoning_effort(payload, model)
+    if effort is None:
+        effort = anthropic_effort_from_messages(payload)
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list) or not raw_messages:
+        raise AnthropicRequestError("messages must be a non-empty array")
+    if require_max_tokens:
+        try:
+            max_tokens = int(payload.get("max_tokens"))
+        except (TypeError, ValueError):
+            raise AnthropicRequestError("max_tokens is required and must be a positive integer")
+        if max_tokens <= 0:
+            raise AnthropicRequestError("max_tokens must be a positive integer")
+    else:
+        raw_max_tokens = payload.get("max_tokens")
+        if raw_max_tokens is None:
+            max_tokens = None
+        else:
+            try:
+                max_tokens = int(raw_max_tokens)
+            except (TypeError, ValueError):
+                raise AnthropicRequestError("max_tokens must be a positive integer")
+            if max_tokens <= 0:
+                raise AnthropicRequestError("max_tokens must be a positive integer")
+
+    messages = []
+    system_parts = []
+    system = _anthropic_system_text(payload.get("system"))
+    if system:
+        system_parts.append(system)
+
+    for source in raw_messages:
+        if not isinstance(source, dict):
+            raise AnthropicRequestError("each message must be an object")
+        role = str(source.get("role") or "").strip().lower()
+        if role in ("system", "developer"):
+            # Anthropic's public schema places system instructions in the
+            # top-level `system` field, but Claude Code and compatibility
+            # clients can still carry them as message turns.  Normalize them
+            # here instead of forwarding an invalid role to WorkBuddy.
+            system_text = _anthropic_system_text(source.get("content"))
+            if system_text:
+                messages.append({"role": "system", "content": system_text})
+            continue
+        if role not in ("user", "assistant"):
+            raise AnthropicRequestError("message role %r must be user or assistant" % role)
+        content = source.get("content")
+        if role == "assistant":
+            text, reasoning, tool_calls = _anthropic_assistant_blocks(content)
+            message = {"role": "assistant", "content": text}
+            if reasoning:
+                message["reasoning_content"] = reasoning
+                message["reasoning"] = reasoning
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            messages.append(message)
+            continue
+
+        blocks = content if isinstance(content, list) else [content]
+        pending = []
+        saw_tool_result = False
+        for block in blocks:
+            if isinstance(block, dict) and str(block.get("type") or "").strip().lower() == "tool_result":
+                if pending:
+                    messages.append({"role": "user", "content": _anthropic_content_to_openai(pending)})
+                    pending = []
+                tool_id = str(block.get("tool_use_id") or "").strip()
+                if not tool_id:
+                    raise AnthropicRequestError("tool_result requires a tool_use_id")
+                result = _anthropic_tool_result_content(block.get("content"))
+                if block.get("is_error"):
+                    if isinstance(result, list):
+                        result = [{"type": "text", "text": "Tool error: "}] + result
+                    else:
+                        result = "Tool error: " + result
+                messages.append({"role": "tool", "tool_call_id": tool_id, "content": result})
+                saw_tool_result = True
+            else:
+                pending.append(block)
+        if pending or not saw_tool_result:
+            messages.append({"role": "user", "content": _anthropic_content_to_openai(pending)})
+
+    if system_parts:
+        messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
+
+    body = {"model": model, "messages": messages}
+    if effort is not None:
+        body["reasoning_effort"] = effort
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+    for key in ("temperature", "top_p", "stream"):
+        if key in payload:
+            body[key] = payload[key]
+    if "stop_sequences" in payload:
+        stops = payload.get("stop_sequences")
+        if not isinstance(stops, list) or not all(isinstance(item, str) for item in stops):
+            raise AnthropicRequestError("stop_sequences must be an array of strings")
+        body["stop"] = stops
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("user_id") is not None:
+        body["user"] = metadata["user_id"]
+    tools, skipped = anthropic_tools_to_chat(payload.get("tools"))
+    if skipped:
+        note = "These Anthropic server tools are not available here: " + ", ".join(skipped) + ". Do not call them."
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] += "\n" + note
+        else:
+            messages.insert(0, {"role": "system", "content": note})
+    if tools:
+        body["tools"] = tools
+    choice = _anthropic_tool_choice_to_openai(payload.get("tool_choice"))
+    if choice is not None:
+        body["tool_choice"] = choice
+    if isinstance(payload.get("tool_choice"), dict):
+        body["parallel_tool_calls"] = not bool(
+            payload["tool_choice"].get("disable_parallel_tool_use")
+        )
+    return body
+
+
+def _anthropic_estimate_chat_tokens(chat_payload):
+    """Approximate messages, tool schemas and a fixed allowance per image."""
+    try:
+        messages = []
+        image_tokens = 0
+        for message in chat_payload.get("messages") or []:
+            estimated = dict(message)
+            content = message.get("content")
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        image_tokens += ANTHROPIC_IMAGE_TOKEN_ESTIMATE
+                        parts.append({"type": "image_url"})
+                    else:
+                        parts.append(part)
+                estimated["content"] = parts
+            messages.append(estimated)
+        raw = json.dumps({"messages": messages, "tools": chat_payload.get("tools") or []},
+                          ensure_ascii=False,
+                          separators=(",", ":"))
+        return max(1, estimate_tokens(raw) + image_tokens)
+    except Exception:
+        return 1
+
+
+def _anthropic_stop_reason(finish_reason):
+    mapping = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_calls": "tool_use",
+        "function_call": "tool_use",
+        "content_filter": "refusal",
+        "refusal": "refusal",
+    }
+    return mapping.get(finish_reason, finish_reason or "end_turn")
+
+
+def _anthropic_usage(chat_usage, input_tokens=0, output_text="", reasoning=""):
+    chat_usage = dict(chat_usage or {})
+    # Share the gateway's field precedence while retaining this adapter's
+    # tolerance for malformed optional details from compatibility upstreams.
+    for key in ("completion_tokens_details", "prompt_tokens_details"):
+        if not isinstance(chat_usage.get(key), dict):
+            chat_usage[key] = {}
+    usage = _extract_usage(chat_usage)
+    # Read these raw fields so an absent counter stays distinct from a real
+    # zero; the canonical extractor defaults missing counters to zero.
+    prompt = chat_usage.get("prompt_tokens")
+    completion = chat_usage.get("completion_tokens")
+    try:
+        prompt = int(prompt)
+    except (TypeError, ValueError):
+        prompt = None
+    try:
+        completion = int(completion)
+    except (TypeError, ValueError):
+        completion = None
+    if prompt is None or prompt < 0:
+        prompt = max(1, int(input_tokens or 0))
+    if completion is None or completion < 0:
+        completion = estimate_tokens((reasoning or "") + (output_text or ""))
+    try:
+        cached = int(usage.get("cached_tokens") or 0)
+    except (TypeError, ValueError):
+        cached = 0
+    cached = max(0, min(prompt, cached))
+    # OpenAI prompt_tokens includes cache hits; Anthropic input_tokens excludes
+    # them.  The upstream does not report Anthropic cache writes or TTLs.
+    return {
+        "input_tokens": max(0, prompt - cached),
+        "output_tokens": max(0, completion),
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cached,
+    }
+
+
+def chat_to_messages(chat_obj, payload=None, input_tokens=0):
+    payload = payload or {}
+    choice = ((chat_obj.get("choices") or [{}])[0] or {})
+    message = choice.get("message") or {}
+    text = message.get("content") or ""
+    if not isinstance(text, str):
+        text = str(text)
+    reasoning = message.get("reasoning_content") or ""
+    if not isinstance(reasoning, str):
+        reasoning = str(reasoning)
+    content = []
+    if reasoning:
+        # WorkBuddy has no Anthropic thinking signature.  Keep the block
+        # structurally valid and mark the signature empty instead of leaking
+        # the reasoning into the user-visible text channel.
+        content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
+    if text:
+        content.append({"type": "text", "text": text})
+    for tool_call in message.get("tool_calls") or []:
+        fn = tool_call.get("function") or {}
+        arguments = fn.get("arguments") or "{}"
+        try:
+            tool_input = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except Exception:
+            tool_input = {"_raw_arguments": str(arguments)}
+        if not isinstance(tool_input, dict):
+            tool_input = {"_raw_arguments": json.dumps(tool_input, ensure_ascii=False)}
+        content.append({
+            "type": "tool_use",
+            "id": tool_call.get("id") or _new_id("call_"),
+            "name": fn.get("name") or "",
+            "input": tool_input,
+        })
+    usage = _anthropic_usage(chat_obj.get("usage"), input_tokens,
+                             text, reasoning)
+    return {
+        "id": _new_id("msg_"),
+        "type": "message",
+        "role": "assistant",
+        "model": chat_obj.get("model") or payload.get("model"),
+        "content": content,
+        "stop_reason": _anthropic_stop_reason(choice.get("finish_reason")),
+        "stop_sequence": None,
+        "usage": usage,
+    }
+
+
+
+def _anthropic_upstream_lines(upstream):
+    """Reject empty/error/truncated chat streams in either response mode."""
+    saw_choice = completed = False
+    for line in upstream:
+        raw = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+        data = strip_data_prefix(raw)
+        if data == "[DONE]":
+            completed = True
+            break
+        if not data or data.startswith(":"):
+            continue
+        try:
+            chunk = json.loads(data)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("error"):
+            error = chunk["error"]
+            message = error.get("message") if isinstance(error, dict) else error
+            raise RuntimeError(str(message or "upstream error"))
+        for choice in chunk.get("choices") or []:
+            if isinstance(choice, dict):
+                saw_choice = True
+                completed = completed or bool(choice.get("finish_reason"))
+        yield line
+    if not saw_choice or not completed:
+        raise RuntimeError("upstream stream ended before completion")
+
+
+def stream_messages_events(raw_iter, model, holder=None, input_tokens=0):
+    """Translate validated chat SSE into consecutive Anthropic content blocks."""
+    holder = holder if isinstance(holder, dict) else {}
+    active = None
+    next_index = 0
+    tools = {}
+    text_parts, reasoning_parts = [], []
+    finish_reason = "stop"
+    last_usage = None
+
+    def recorded_usage():
+        if (_extract_usage(last_usage) or {}).get("total_tokens", 0) > 0:
+            return last_usage
+        generated = "".join(text_parts) + "".join(reasoning_parts) + tool_arguments()
+        completion = estimate_tokens(generated)
+        return {
+            "prompt_tokens": max(1, input_tokens), "completion_tokens": completion,
+            "total_tokens": max(1, input_tokens) + completion,
+            "completion_tokens_details": {"reasoning_tokens": estimate_tokens("".join(reasoning_parts))},
+            "prompt_tokens_details": {"cached_tokens": 0},
+        }
+
+    def tool_arguments():
+        return "".join(arg for tool in tools.values() for arg in tool["args"])
+
+    def close_block():
+        nonlocal active
+        if active is None:
+            return
+        if active["type"] == "thinking":
+            yield anthropic_sse_frame("content_block_delta", {
+                "index": active["index"], "delta": {"type": "signature_delta", "signature": ""},
+            })
+        yield anthropic_sse_frame("content_block_stop", {"index": active["index"]})
+        active = None
+
+    def start_block(content):
+        nonlocal active, next_index
+        yield from close_block()
+        active = {"index": next_index, "type": content["type"]}
+        next_index += 1
+        yield anthropic_sse_frame("content_block_start", {
+            "index": active["index"], "content_block": content,
+        })
+
+    def simple_delta(kind, value):
+        if active is None or active["type"] != kind:
+            yield from start_block({"type": kind, kind: ""})
+        yield anthropic_sse_frame("content_block_delta", {
+            "index": active["index"], "delta": {"type": kind + "_delta", kind: value},
+        })
+
+    # Publish accounting before every write: client disconnections can occur
+    # during headers or halfway through a content block.
+    holder["usage"] = recorded_usage()
+    yield anthropic_sse_frame("message_start", {"message": {
+        "id": _new_id("msg_"), "type": "message", "role": "assistant", "model": model,
+        "content": [], "stop_reason": None, "stop_sequence": None,
+        "usage": _anthropic_usage(None, input_tokens),
+    }})
+    yield anthropic_sse_frame("ping", {})
+    for line in _anthropic_upstream_lines(raw_iter):
+        raw = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+        chunk = json.loads(strip_data_prefix(raw))
+        usage = chunk.get("usage")
+        if usage and (last_usage is None or (usage.get("total_tokens") or 0) >= (last_usage.get("total_tokens") or 0)):
+            last_usage = usage
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning:
+                reasoning = str(reasoning)
+                reasoning_parts.append(reasoning)
+                holder["usage"] = recorded_usage()
+                yield from simple_delta("thinking", reasoning)
+            text = delta.get("content")
+            if text:
+                text = str(text)
+                text_parts.append(text)
+                holder["usage"] = recorded_usage()
+                yield from simple_delta("text", text)
+            tool_deltas = list(delta.get("tool_calls") or [])
+            function_call = delta.get("function_call")
+            if isinstance(function_call, dict) and (function_call.get("name") or function_call.get("arguments")):
+                tool_deltas.append({"index": 0, "function": function_call})
+            for position, tool_delta in enumerate(tool_deltas):
+                index = tool_delta.get("index")
+                key = index if index is not None else position
+                tool = tools.setdefault(key, {"id": "", "name": "", "args": []})
+                if tool_delta.get("id"):
+                    tool["id"] = tool_delta["id"]
+                function = tool_delta.get("function") or {}
+                if function.get("name"):
+                    tool["name"] += function["name"]
+                if function.get("arguments"):
+                    tool["args"].append(function["arguments"])
+        holder["usage"] = recorded_usage()
+
+    yield from close_block()
+    for tool in tools.values():
+        if not tool["name"]:
+            if tool["args"]:
+                raise RuntimeError("upstream tool call is missing its name")
+            continue
+        yield from start_block({"type": "tool_use", "id": tool["id"] or _new_id("call_"),
+                                "name": tool["name"], "input": {}})
+        for argument in tool["args"] or ["{}"]:
+            yield anthropic_sse_frame("content_block_delta", {
+                "index": active["index"], "delta": {"type": "input_json_delta", "partial_json": argument},
+            })
+        yield from close_block()
+    has_tools = any(tool["name"] for tool in tools.values())
+    if has_tools and finish_reason == "stop":
+        finish_reason = "tool_calls"
+    elif not has_tools and finish_reason in ("tool_calls", "function_call"):
+        finish_reason = "stop"
+    yield anthropic_sse_frame("message_delta", {
+        "delta": {"stop_reason": _anthropic_stop_reason(finish_reason), "stop_sequence": None},
+        "usage": _anthropic_usage(last_usage, input_tokens, "".join(text_parts) + tool_arguments(),
+                                  "".join(reasoning_parts)),
+    })
+    yield anthropic_sse_frame("message_stop", {})
+
+
 
 def _responses_usage(u):
     if not u:
@@ -5677,9 +10990,10 @@ def stream_responses_events(upstream, model, holder):
     tool_calls_map = {}
     text_buffer = ""
     dsml_tool_calls = []
+    saw_done = False
     custom_names = set(holder.get("custom_names") or ())
     ns_map = holder.get("namespace_map") or {}
-    # 由反代代跑的網路工具呼叫，收集起來不轉發給客戶端
+    # 由反代代跑的网路工具呼叫，收集起来不转发给客户端
     _internal_calls = {}
     # Only reach for same-named calls when this request's definitions were the
     # gateway's own (see web_tools_active); otherwise they belong to the client.
@@ -5722,7 +11036,7 @@ def stream_responses_events(upstream, model, holder):
             "summary": [{"type": "summary_text", "text": "".join(reason_parts)}],
         }
     def _annotations():
-        """引用來源：只認工具真的回傳過的網址。"""
+        """引用来源：只认工具真的回传过的网址。"""
         try:
             return build_citations("".join(text_parts), holder.get("web_sources") or [])
         except Exception:
@@ -5813,7 +11127,7 @@ def stream_responses_events(upstream, model, holder):
                 full_text = clean_text
         if dsml_calls and not tool_calls_map:
             for dc in dsml_calls:
-                # DSML 形狀的網路工具呼叫一樣由反代執行
+                # DSML 形状的网路工具呼叫一样由反代执行
                 if _own_web_tools and wb_webtools.is_internal_tool(dc.get("name")):
                     entry = _internal_calls.setdefault(dc.get("id") or _new_id("call_"),
                                                        {"name": dc.get("name"), "arguments": "{}"})
@@ -5851,8 +11165,8 @@ def stream_responses_events(upstream, model, holder):
                     "output_index": out_idx,
                     "item": fc_item,
                 })
-        # 這一輪如果有代跑的網路工具呼叫，就把完成事件留給下一輪，
-        # 否則客戶端會以為整個回合已經結束（舊版是在回合用盡時補一個合成的
+        # 这一轮如果有代跑的网路工具呼叫，就把完成事件留给下一轮，
+        # 否则客户端会以为整个回合已经结束（旧版是在回合用尽时补一个合成的
         # resp_wrapup，那才是 issue #43 真正的病灶）。
         if _internal_calls:
             holder.setdefault("internal_calls", []).extend(
@@ -5860,8 +11174,8 @@ def stream_responses_events(upstream, model, holder):
                 for v in _internal_calls.values()
             )
             holder["suppress_completion"] = True
-            # 讓 App 畫出原生的「已搜尋網路」卡片：對每個代跑的呼叫送出
-            # web_search_call 項目與生命週期事件。
+            # 让 App 画出原生的「已搜寻网路」卡片：对每个代跑的呼叫送出
+            # web_search_call 项目与生命周期事件。
             for _v in _internal_calls.values():
                 _nm = str(_v.get("name") or "")
                 try:
@@ -5938,21 +11252,24 @@ def stream_responses_events(upstream, model, holder):
                     "prompt_tokens_details": {"cached_tokens": 0},
                 }
                 holder["usage"] = usage
-        status = "completed" if finish != "length" else "incomplete"
+        status = ("completed" if (finish != "length" and not dropped_truncated)
+                  else "incomplete")
         final = resp_obj(status)
         if finish == "length":
             final["incomplete_details"] = {"reason": "max_output_tokens"}
         if not holder.get("suppress_completion"):
             yield ev("response.completed", {"response": final})
 
-    # 只有第一輪開場。第二輪以後再送一次 response.created，客戶端會
-    # 看到同一則回應被開了兩次。
+    # 只有第一轮开场。第二轮以后再送一次 response.created，客户端会
+    # 看到同一则回应被开了两次。
     if not holder.get("suppress_lifecycle"):
         yield ev("response.created", {"response": resp_obj("in_progress")})
         yield ev("response.in_progress", {"response": resp_obj("in_progress")})
     for raw in upstream:
         data = strip_data_prefix(raw.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
+            if data == "[DONE]":
+                saw_done = True
             continue
         try:
             chunk = json.loads(data)
@@ -5987,7 +11304,7 @@ def stream_responses_events(upstream, model, holder):
                 fn_name = fn.get("name") or ""
                 fn_args = fn.get("arguments") or ""
                 call_id = tc.get("id") or ""
-                # web_search / web_fetch 由反代執行，不轉發給客戶端
+                # web_search / web_fetch 由反代执行，不转发给客户端
                 if idx in _internal_calls or (
                         _own_web_tools and fn_name
                         and wb_webtools.is_internal_tool(fn_name)):
@@ -6023,9 +11340,9 @@ def stream_responses_events(upstream, model, holder):
                     else:
                         item["type"] = "function_call"
                         item["arguments"] = ""
-                    # namespace 必須在 output_item.added 就帶上（照 CiderCC-UwU
-                    # proxy.mjs openItem 的做法）。事後才補只會改到 done，
-                    # 客戶端早就從 added 事件派發過了。
+                    # namespace 必须在 output_item.added 就带上（照 CiderCC-UwU
+                    # proxy.mjs openItem 的做法）。事后才补只会改到 done，
+                    # 客户端早就从 added 事件派发过了。
                     stamp_namespace(item, ns_map)
                     yield ev("response.output_item.added", {
                         "output_index": out_idx,
@@ -6138,16 +11455,79 @@ def stream_responses_events(upstream, model, holder):
                             break
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
+    # Truncated streams (max_tokens, dropped connection) can leave tool-call
+    # arguments as half-written JSON. Do not close those calls out as
+    # completed: drop them before finalize so the client never receives a
+    # function_call_arguments.done / output_item.done with unparsable
+    # arguments. Complete calls in the same batch are kept.
+    dropped_truncated = 0
+    if tool_calls_map and (finish == "length" or not saw_done):
+        for idx in sorted(tool_calls_map.keys()):
+            entry = tool_calls_map[idx]
+            if is_truncated_arguments(entry.get("arguments")):
+                tool_calls_map.pop(idx, None)
+                dropped_truncated += 1
     yield from _finalize()
 
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
+def _if_none_match_hit(header_value, etag):
+    """If-None-Match 头是否命中给定的 ETag。
+
+    RFC 7232 §3.2：字段值是一个逗号分隔的 entity-tag 列表，且 If-None-Match
+    用弱比较——W/ 前缀忽略，所以 W/"x" 与 "x" 等同；"*" 匹配任何已存在的表示。
+    """
+    for token in header_value.split(","):
+        token = token.strip()
+        if token == "*":
+            return True
+        if token.startswith("W/"):
+            token = token[2:].strip()
+        if token and token == etag:
+            return True
+    return False
+
+
+def _cache_etag(kind, key, built_at):
+    """给带 TTL 缓存的只读接口派生一个强校验符（ETag）。
+
+    由 (接口名, 缓存键, 缓存条目的构建时刻) 三者派生，**不是**对响应字节做哈希：
+
+      - 构建时刻在两次重建之间是恒定的，所以"数字没变"的轮询回 304；缓存一重建
+        它必然变化，客户端立刻拿到新数据。哈希响应字节恰好相反——payload 里有
+        time.time() 派生的字段（/usage 的 started/since、/usage/timeseries 的
+        桶边界与 until），同一份缓存被序列化两次都不逐字节相同，tag 会永远不命中，
+        每次轮询照样重传 10~100KB，还白搭一次全量序列化 + 哈希的 CPU。
+      - (键, 时刻) 都是现成的，一次 sha1 只哈希几十字节的键文本；哈希整个响应体
+        则要先把 JSON 序列化出来，在 5 秒一轮的热路径上反而更贵。
+
+    键文本进摘要而不是直接拼进 tag：缓存键里含调用方给的 realm，它可能带引号 /
+    反斜杠（`?realm=a"b` 一路原样进键），拼出来会发出一个畸形的 ETag 头；摘要
+    则永远是合法的 etagc 字符。摘要只取 16 个十六进制位：它只需要在"同一实例的
+    少量缓存条目"之间区分，不是安全边界。
+    """
+    stamp = "%x" % int(built_at * 1_000_000)
+    digest = hashlib.sha1(("%s\x1f%s" % (kind, key)).encode("utf-8")).hexdigest()[:16]
+    return '"%s-%s"' % (stamp, digest)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # 关掉 Nagle（对连接设 TCP_NODELAY）：响应头和响应体是两次独立 write，Nagle
+    # 会把第二次小写攒在手里等第一次的 ACK，碰上客户端 delayed ACK 就是每个小响应
+    # 白付 ~40ms（路由器实测同一 keep-alive 连接的连续小响应：中位数 50.0ms ->
+    # 1.41ms；面板几乎所有 <64KB 的 JSON 都中招，Tailscale 常驻连接上每笔都付
+    # 一次）。StreamRequestHandler.setup() 原生支持这个开关，werkzeug/uvicorn
+    # 同做法，一行生效。
+    disable_nagle_algorithm = True
     # Which configured API key the caller used, set by _key_ok(). Its bound
     # realm decides the upstream exit for this request alone.
     key_entry = None
+    # 本次 _json() 响应要附带的校验符（由 _json_cached() 设置）。放成实例属性
+    # 而不是参数，是因为测试里大量 Handler 桩只覆写了 _json(code, obj) 这两个
+    # 位置参数——加参数会让它们全部报错，而属性默认 None 对它们完全无感。
+    _json_etag = None
     # The stdlib default caps the request line at 64KB and answers an opaque
     # bare "414 Request-URI Too Long" for anything longer. Raise it and reply in
     # the normal JSON error shape so an over-long URL is diagnosable.
@@ -6159,6 +11539,9 @@ class Handler(BaseHTTPRequestHandler):
         # it inherited the realm binding of whatever API key used the connection
         # before it - sending that request to the wrong upstream exit.
         self.key_entry = None
+        # 校验符同理：留着上一轮的 tag，下一次 _json() 就会把别的请求的 ETag
+        # 发出去（keep-alive 上同一个 Handler 实例服务一整条连接）。
+        self._json_etag = None
         # Body-tracking state must also start clean for every request, otherwise
         # a later drain would skip a body that has not been read yet.
         self._body_consumed = False
@@ -6210,7 +11593,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.6.14"
+    server_version = "wb-proxy/1.6.19"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -6232,6 +11615,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # 只有 _json_cached() 覆盖的只读接口才有校验符；其余调用点保持原样，
+        # 一个头都不多发。
+        etag = self._json_etag
+        if etag is not None:
+            # no-cache 而不是 no-store：允许浏览器存一份，但每次使用前必须回源
+            # 校验。配合 ETag，校验命中就是一次 304（无 body），而不是重传
+            # 10~100KB 的 JSON；no-store 会让浏览器连存都不存，条件请求无从谈起。
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("ETag", etag)
         # self.path is unset when parse_request() never ran (an over-long
         # request line is rejected before it), so fall back to "".
         if cors_origin_allowed(getattr(self, "path", "") or ""):
@@ -6246,6 +11638,57 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
+    def _json_cached(self, code, data_fn, etag_fn):
+        """带 TTL 缓存的只读接口：_json() + 条件请求（命中 If-None-Match 回 304）。
+
+        data_fn() 取数、etag_fn() 取"当前缓存条目的校验符"，两者在这里配对调用，
+        而且是**取数前后各取一次戳**：只有两次相同，才敢把这个 tag 发出去。这个
+        相等就是"这份响应体确实出自该 tag 所描述的那条缓存条目"的证明——
+
+          - 两次读取之间若发生了一次重建，戳就会变，于是这一次不发校验符，走普通
+            200；客户端下一轮就重新同步（下一轮取数前取到的就是新条目的戳，前后
+            一致，tag 生效）。代价是每次重建后多一次全量响应，换来的是绝不会发出
+            一个不描述本次响应体的 tag。
+          - 反过来（先取数、后取戳）才有真问题：拿到的是新条目的戳配旧条目的数据，
+            客户端会带着这个 tag 回来，命中 304，于是把过期数字一直显示到下一次
+            重建为止。
+
+        两个可调用对象都无参，参数由调用方用闭包带上；顺序由这里保证，调用方不
+        必（也不该）自己拼这个顺序。任何解析/取值异常都退化成"没有校验符"的普通
+        200，绝不让响应路径崩掉。
+        """
+        try:
+            before = etag_fn()
+        except Exception:
+            before = None
+        data = data_fn()
+        try:
+            after = etag_fn()
+        except Exception:
+            after = None
+        etag = after if (after is not None and after == before) else None
+        if etag is not None:
+            try:
+                inm = self.headers.get("If-None-Match")
+            except Exception:
+                # 没有 headers 对象（测试桩 / 未走 parse_request）时按不匹配处理。
+                inm = None
+            if inm is not None and _if_none_match_hit(inm, etag):
+                # 304 不带 body，也不带 Content-Length：RFC 7230 §3.3.3 规定 304
+                # 在空行处结束，再报一个全量长度反而会诱使客户端 / 代理去等一个
+                # 永远不会来的 body。校验符和 Cache-Control 必须原样重发
+                # （RFC 7232 §4.1），否则缓存会丢掉状态、下次又整份重取。
+                self.send_response(304)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
+            self._json_etag = etag
+        try:
+            return self._json(code, data)
+        finally:
+            # 无论 _json() 是否抛异常，都不能把这次请求的 tag 留给下一次。
+            self._json_etag = None
     def _discard_body(self):
         """Drain the request body so the connection stays in sync.
 
@@ -6375,45 +11818,16 @@ class Handler(BaseHTTPRequestHandler):
         # the drain below waits for data that will never arrive.
         self._handle_expect_continue()
         self._discard_body()
-        self._json(code, {"error": {"message": message, "type": err_type, "code": code}})
-    def _anthropic_error(self, code, message, err_type=None, retry_after=None):
-        """Reply with Anthropic's top-level error envelope."""
-        error_types = {
-            400: "invalid_request_error",
-            401: "authentication_error",
-            403: "permission_error",
-            404: "not_found_error",
-            409: "conflict_error",
-            413: "request_too_large",
-            429: "rate_limit_error",
-        }
-        err_type = err_type or error_types.get(code, "api_error")
+        error = {"message": message, "type": err_type, "code": code}
+        hint = gateway_hint(code, message)
+        if hint:
+            error["gateway_hint"] = hint
+        self._json(code, {"error": error})
+    def _anthropic_error(self, code, message, err_type=None):
+        """Reply with the Anthropic JSON error envelope, not OpenAI's."""
         self._handle_expect_continue()
         self._discard_body()
-        body = json.dumps({
-            "type": "error",
-            "error": {"type": err_type, "message": str(message)},
-        }, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        if retry_after is not None:
-            self.send_header("Retry-After", str(max(1, int(retry_after))))
-        if cors_origin_allowed(getattr(self, "path", "") or ""):
-            self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            self.close_connection = True
-    def _anthropic_rate_limited(self, exc):
-        wait = max(1, int(getattr(exc, "wait", 60) or 60))
-        detail = getattr(exc, "detail", "") or ""
-        message = "upstream rate limit reached; retry in %ds" % wait
-        if detail:
-            message += " - " + detail[:200]
-        return self._anthropic_error(429, message, "rate_limit_error", retry_after=wait)
+        return self._json(code, anthropic_error_obj(code, message, err_type))
     def _rate_limited(self, exc):
         """429 with Retry-After, so clients back off instead of hammering.
 
@@ -6452,6 +11866,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+    def _anthropic_rate_limited(self, exc):
+        """429 with Retry-After in the Anthropic error envelope."""
+        wait = max(1, int(getattr(exc, "wait", 60) or 60))
+        text = (getattr(exc, "message", "") or
+                "upstream rate limit reached for this model; retry in %ds" % wait)
+        if getattr(exc, "detail", "") and not getattr(exc, "message", ""):
+            text += " - " + str(exc.detail)[:200]
+        self._handle_expect_continue()
+        self._discard_body()
+        body = json.dumps(anthropic_error_obj(429, text, "rate_limit_error"),
+                          ensure_ascii=False).encode("utf-8")
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Retry-After", str(wait))
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _download(self, filename, obj):
         """Send a JSON document as a browser download.
         Content-Disposition is quoted because the filename is generated from
@@ -6551,7 +11985,7 @@ class Handler(BaseHTTPRequestHandler):
                 "请改用对应出口的 Key，或把该 Key 的出口改为「跟随面板切换」。"
                 % (model, served, name, used))
     def _banned_model_error(self, model):
-        """被封鎖的模型直接報錯，不碰上游、不扣任何點數。"""
+        """被封锁的模型直接报错，不碰上游、不扣任何点数。"""
         if not is_model_banned(model):
             return ""
         return banned_model_message(model)
@@ -6603,20 +12037,6 @@ class Handler(BaseHTTPRequestHandler):
             pass
         self._error(401, "invalid api key - " + hint, "invalid_request_error")
         return False
-    def _anthropic_authorized(self):
-        if self._key_ok():
-            return True
-        hint = ("send it as 'x-api-key: <key>' or 'Authorization: Bearer <key>'; "
-                "copy the value from the panel's 设置 page")
-        try:
-            if not any(k.get("enabled") for k in configured_keys()) and not API_KEY:
-                hint = ("no key is configured - open the dashboard and add one, "
-                        "or restart with --api-key")
-        except Exception:
-            pass
-        self._anthropic_error(401, "invalid api key - " + hint,
-                              "authentication_error")
-        return False
     # ---- web panel access ----
     def _panel_token(self):
         """Session token from the X-Panel-Token header.
@@ -6637,11 +12057,23 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path.startswith("/usage") or path.startswith("/v1/usage"):
             return True
+        if path.startswith("/activity"):
+            return True
         if path.startswith("/tasks") or path.startswith("/scheduler"):
             return True
         if path.startswith("/settings"):
             return True
+        if path.startswith("/updates"):
+            return True
         if path.startswith("/logs"):
+            return True
+        # The pricing table is the panel's own view of the estimate, not part
+        # of the OpenAI-compatible surface: its writes (/pricing/refresh,
+        # /pricing/mapping) were already panel-only, and the read side returns
+        # the same management state plus resolved project-local file paths.
+        if path.startswith("/pricing"):
+            return True
+        if path.startswith("/agents"):
             return True
         return False
     def do_OPTIONS(self):
@@ -6666,10 +12098,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_health()
         if path == "/realm":
             return self._get_realm()
-        if path.startswith("/v1/models/") and path.count("/") == 3:
-            return self._get_anthropic_model(path.rsplit("/", 1)[-1])
         if path in ("/v1/models", "/models"):
             return self._get_v1_models()
+        if path.startswith("/v1/models/"):
+            return self._get_anthropic_model(urllib.parse.unquote(path[len("/v1/models/"):]))
         if path in ("/usage", "/v1/usage"):
             return self._get_v1_usage(query)
         if path == "/usage/recent":
@@ -6678,6 +12110,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_account_credits_detail(query)
         if path == "/accounts/credits":
             return self._get_accounts_credits()
+        if path == "/accounts/credits/grants":
+            return self._get_account_credits_grants()
         if path == "/accounts":
             return self._get_accounts(query)
         if path == "/accounts/export":
@@ -6688,8 +12122,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_usage_analytics(query)
         if path == "/usage/by-account":
             return self._get_usage_by_account()
+        if path == "/usage/remaining":
+            return self._get_usage_remaining()
         if path == "/usage/perf":
             return self._get_usage_perf(query)
+        if path == "/usage/timeseries":
+            return self._get_usage_timeseries(query)
+        if path == "/activity/history":
+            return self._get_activity_history(query)
         if path == "/tasks":
             return self._get_tasks(query)
         if path == "/scheduler":
@@ -6698,6 +12138,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_pricing()
         if path == "/settings":
             return self._get_settings()
+        if path == "/updates":
+            return self._get_updates()
         if path == "/proxy/slots":
             if not self._panel_ok():
                 return self._error(
@@ -6710,6 +12152,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_logs_export()
         if path == "/settings/reveal":
             return self._get_settings_reveal(query)
+        if path == "/agents":
+            return self._get_agents()
+        if path == "/agents/available":
+            # 看板启动时用这个廉价判定决定要不要显示入口：不 import
+            # wb_agents、不做任何探测（issue #246）。
+            return self._json(200, {"enabled": self._agents_client_allowed()})
         return self._error(404, "not found", "invalid_request_error")
     def _get_dashboard(self):
         return self._dashboard()
@@ -6755,6 +12203,21 @@ class Handler(BaseHTTPRequestHandler):
     def _get_realm(self):
         return self._json(200, {"current": CURRENT_REALM, "options": ["intl", "cn"]})
 
+    def _anthropic_authorized(self):
+        if self._key_ok():
+            return True
+        hint = ("send it as 'x-api-key: <key>' or 'Authorization: Bearer <key>'; "
+                "copy the value from the panel's 设置 page")
+        try:
+            if not any(k.get("enabled") for k in configured_keys()) and not API_KEY:
+                hint = ("no key is configured - open the dashboard and add one, "
+                        "or restart with --api-key")
+        except Exception:
+            pass
+        self._anthropic_error(401, "invalid api key - " + hint,
+                              "authentication_error")
+        return False
+
     def _is_anthropic_request(self):
         # The official SDK always sends this version header.  Do not infer the
         # dialect from x-api-key alone because OpenAI-compatible clients also
@@ -6775,31 +12238,6 @@ class Handler(BaseHTTPRequestHandler):
             "created_at": created_at,
         }
 
-    def _get_v1_models(self):
-        anthropic = self._is_anthropic_request()
-        if anthropic:
-            if not self._anthropic_authorized():
-                return
-        elif not self._authorized():
-            return
-        req_realm = self._request_realm() or CURRENT_REALM
-        try:
-            entries = fetch_models(realm=req_realm)
-        except Exception as exc:
-            if anthropic:
-                return self._anthropic_error(502, str(exc), "api_error")
-            return self._error(502, str(exc))
-        if anthropic:
-            data = [self._anthropic_model_entry(mid, meta) for mid, meta in entries]
-            return self._json(200, {
-                "data": data,
-                "has_more": False,
-                "first_id": data[0]["id"] if data else None,
-                "last_id": data[-1]["id"] if data else None,
-            })
-        data = [model_entry(mid, meta) for mid, meta in entries]
-        return self._json(200, {"object": "list", "data": data, "realm": req_realm or CURRENT_REALM})
-
     def _get_anthropic_model(self, model_id):
         if not self._is_anthropic_request():
             return self._error(404, "not found", "invalid_request_error")
@@ -6815,14 +12253,48 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self._anthropic_model_entry(mid, meta))
         return self._anthropic_error(404, "model %s not found" % model_id,
                                      "not_found_error")
+    def _get_v1_models(self):
+        anthropic = self._is_anthropic_request()
+        if anthropic:
+            if not self._anthropic_authorized():
+                return
+        elif not self._authorized():
+            return
+        req_realm = self._request_realm() or CURRENT_REALM
+        try:
+            entries = fetch_models(realm=req_realm)
+        except Exception as exc:
+            if anthropic:
+                return self._anthropic_error(502, str(exc), "api_error")
+            return self._error(502, str(exc))
+        try:
+            wb_modelsdev.refresh_async(ACCOUNTS_DIR, log=log)
+        except Exception:
+            pass
+        if anthropic:
+            data = [self._anthropic_model_entry(mid, meta) for mid, meta in entries]
+            return self._json(200, {
+                "data": data,
+                "has_more": False,
+                "first_id": data[0]["id"] if data else None,
+                "last_id": data[-1]["id"] if data else None,
+            })
+        data = [model_entry(mid, meta) for mid, meta in entries]
+        return self._json(200, {"object": "list", "data": data, "realm": req_realm or CURRENT_REALM})
 
     def _get_v1_usage(self, query):
         if not self._authorized():
             return
         req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
         req_range, req_since, req_until = range_query(query)
-        return self._json(200, usage_snapshot(realm=req_realm, range=req_range,
-                                              since=req_since, until=req_until))
+        # 取数与取校验符必须看到同一套参数（否则 tag 落到另一条缓存条目上），
+        # 但"先取戳、再取数、再取一次戳"的配对顺序由 _json_cached 保证。
+        return self._json_cached(
+            200,
+            lambda: usage_snapshot(realm=req_realm, range=req_range,
+                                   since=req_since, until=req_until),
+            lambda: usage_snapshot_etag(realm=req_realm, range=req_range,
+                                        since=req_since, until=req_until))
 
     def _get_usage_recent(self, query):
         if not self._authorized():
@@ -6838,6 +12310,29 @@ class Handler(BaseHTTPRequestHandler):
         req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
         return self._json(200, recent_usage(limit, realm=req_realm, page=page))
 
+    def _get_activity_history(self, query):
+        """账号每日活动的结构化历史（issue #34）。只读，供面板的签到记录用。
+
+        筛选条件写错时返回 400 而不是静默忽略：调用方拿着一个被忽略的
+        result=failed 会以为「这几天没有失败」，实际上它拿回的是全部结果。
+        """
+        if not self._authorized():
+            return
+
+        def first(name):
+            values = query.get(name) or [""]
+            return (values[0] if values else "") or ""
+
+        try:
+            payload = wb_activity.query(range_key=first("range") or None,
+                                        uid=first("uid"),
+                                        task=first("task"),
+                                        result=first("result"),
+                                        limit=first("limit") or None)
+        except ValueError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        return self._json(200, payload)
+
     def _get_accounts_credits(self):
         if not self._authorized():
             return
@@ -6845,6 +12340,17 @@ class Handler(BaseHTTPRequestHandler):
         for a in (POOL.accounts if POOL else []):
             a.fetch_credits()
         return self._json(200, {"accounts": account_views()})
+
+    def _get_account_credits_grants(self):
+        """积分获取历史：只读账号积分快照，不发上游请求。
+
+        要更新的数字先走「一键刷新积分」（POST /accounts/credits），这里只把
+        最近一次快照里的积分包摊平成一张表；载荷带上快照时刻，面板据此提醒
+        数据有多旧。
+        """
+        if not self._authorized():
+            return
+        return self._json(200, credit_grants())
 
     def _get_account_credits_detail(self, query):
         if not self._authorized():
@@ -6885,9 +12391,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Fold the usage log before building the view, so the 日限额 badge and
         # the parked count describe right now instead of the last request.
-        apply_daily_token_limit()
-        apply_daily_credit_limit()
-        apply_model_daily_token_limit()
+        apply_daily_guards()
         return self._json(200, {
             "accounts": account_views(realm=query.get('realm', [None])[0] or CURRENT_REALM),
             "storage": ACCOUNTS_DIR,
@@ -6943,13 +12447,46 @@ class Handler(BaseHTTPRequestHandler):
             return
         req_realm = query.get("realm", [None])[0] or None
         req_range, req_since, req_until = range_query(query)
-        return self._json(200, compute_usage_analytics(realm=req_realm, range=req_range,
-                                                       since=req_since, until=req_until))
+        return self._json_cached(
+            200,
+            lambda: compute_usage_analytics(realm=req_realm, range=req_range,
+                                            since=req_since, until=req_until),
+            lambda: usage_analytics_etag(realm=req_realm, range=req_range,
+                                         since=req_since, until=req_until))
 
     def _get_usage_by_account(self):
         if not self._authorized():
             return
-        return self._json(200, {"accounts": usage_by_account()})
+        return self._json_cached(200,
+                                 lambda: {"accounts": usage_by_account()},
+                                 usage_by_account_etag)
+
+    def _get_usage_remaining(self):
+        if not self._authorized():
+            return
+        # 载荷挂短 TTL（WB_REMAINING_TTL，默认 15 秒）+ ETag：面板 5 秒一轮的
+        # 轮询在 TTL 内命中同一条缓存 → 校验符不变 → 304，重建与重传都省掉。
+        return self._json_cached(200, remaining_usage, remaining_usage_etag)
+
+    def _get_usage_timeseries(self, query):
+        if not self._authorized():
+            return
+        req_realm = (query.get('realm', [None])[0]
+                     or self.headers.get('X-Realm') or CURRENT_REALM)
+        req_range, req_since, req_until = range_query(query)
+        bucket = (query.get("bucket") or [None])[0]
+        try:
+            bucket_seconds = int(bucket) if bucket else None
+        except (TypeError, ValueError):
+            bucket_seconds = None
+        return self._json_cached(
+            200,
+            lambda: usage_timeseries(realm=req_realm, range=req_range,
+                                     since=req_since, until=req_until,
+                                     bucket_seconds=bucket_seconds),
+            lambda: usage_timeseries_etag(realm=req_realm, range=req_range,
+                                          since=req_since, until=req_until,
+                                          bucket_seconds=bucket_seconds))
 
     def _get_usage_perf(self, query):
         if not self._authorized():
@@ -6960,8 +12497,12 @@ class Handler(BaseHTTPRequestHandler):
             sample = 5000
         req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
         req_range, req_since, req_until = range_query(query)
-        return self._json(200, perf_stats(sample, realm=req_realm, range=req_range,
-                                          since=req_since, until=req_until))
+        return self._json_cached(
+            200,
+            lambda: perf_stats(sample, realm=req_realm, range=req_range,
+                               since=req_since, until=req_until),
+            lambda: perf_stats_etag(sample, realm=req_realm, range=req_range,
+                                    since=req_since, until=req_until))
 
     def _get_tasks(self, query):
         if not self._authorized():
@@ -7015,6 +12556,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self._json(200, runtime_settings_view())
 
+    def _get_updates(self):
+        """What the running build is, and whether a newer stable release exists.
+
+        Read-only and cheap: it reports the last check's outcome, never runs
+        one. The panel's "check now" is the POST below.
+        """
+        if not self._authorized():
+            return
+        if UPDATES:
+            return self._json(200, UPDATES.status())
+        return self._json(200, {
+            "current_version": running_version(),
+            "latest_version": None, "update_available": False,
+            "enabled": wb_settings.update_check_enabled(ACCOUNTS_DIR),
+            "checking": False, "last_attempt": None, "last_success": None,
+            "last_error": "", "release_url": "", "published_at": "",
+            "msg": "更新检查未运行",
+        })
+
     def _get_logs(self, query):
         if not self._authorized():
             return
@@ -7065,10 +12625,61 @@ class Handler(BaseHTTPRequestHandler):
                 body = fh.read()
         except Exception as exc:
             return self._error(500, f"dashboard.html unavailable: {exc}")
+        # The static file carries a placeholder; replace it with the instance
+        # default so the first paint already uses the right language.
+        language = wb_settings.ui_language(ACCOUNTS_DIR)
+        body = body.replace(
+            b'data-ui-language="__WB_UI_LANGUAGE__"',
+            ('data-ui-language="%s"' % language).encode("utf-8"),
+        )
+        # 面板首页是纯静态资源（服务端逐字节原样发出、不含任何机密），所以可以
+        # 允许浏览器存储副本、每次打开再回源校验：校验命中回 304（无 body），
+        # 省下整页（约 470KB）的重复下载，手机 / Tailscale 远程访问体感最明显。
+        #
+        # 校验符必须覆盖**所有**影响响应体的输入，不只是文件本身：body 还取决于
+        # 上面注入的 ui_language——用户改一次界面语言，文件没动、body 却变了；
+        # 若 tag 只看文件，客户端带旧 tag 回来会拿到 304 + 旧语言的页面。所以 tag
+        # 由 (文件 mtime_ns, size, language) 三者派生：前两个代表文件字节（本文件
+        # 只在应用更新时被整体替换、从不原地修改），第三个就是本次实际注入的值，
+        # 三者组合变化 ⇔ 响应字节变化。mtime 用纳秒精度，同一秒内的两次替换也能
+        # 得到不同 tag。
+        etag = None
+        try:
+            st = os.stat(DASHBOARD_HTML)
+            # 强校验符（不带 W/ 前缀）：响应是「文件字节 + 本次语言」的精确副本，
+            # tag 变 ⇔ 字节变。
+            etag = '"%x-%x-%s"' % (st.st_mtime_ns, st.st_size, language)
+        except Exception:
+            # stat 取不到（或时间戳无法表示）不是致命错误：退化为一律按普通
+            # 200 处理，只是这一次没有条件请求支持，绝不让面板页本身打不开。
+            etag = None
+        # 只认 If-None-Match，不发送、也不理会 If-Modified-Since。Last-Modified
+        # 只能描述文件的 mtime，而响应体还取决于语言：日期无法表达这个输入，
+        # 一旦发布出去，偏好日期的客户端就会拿它校验，语言一变就拿到过期的
+        # 304。ETag 覆盖全部输入、单靠它就足够完备，所以干脆不提供日期——
+        # 不发布它，客户端就没有用它的理由（RFC 7232 §2.2 里 Last-Modified 只是
+        # SHOULD，响应体并非单一文件、没有可一致表达的修改日期，只发 ETag 完备）。
+        if etag is not None:
+            inm = self.headers.get("If-None-Match")
+            if inm is not None and _if_none_match_hit(inm, etag):
+                # 304 不带 body：浏览器手里已有一份，一个字节都不用再传。也不带
+                # Content-Length：304 按 RFC 7230 §3.3.3 在空行处结束，再报全量
+                # 长度反而会诱使客户端 / 代理等待一个永远不会来的 body。校验符和
+                # Cache-Control 必须原样重发（RFC 7232 §4.1），否则缓存会丢掉状态。
+                self.send_response(304)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        # no-cache 而不是 no-store：允许存储，但每次使用前必须回源校验；配合
+        # 上面的校验符，校验命中的代价是一次 304 而不是整页约 470KB。不加
+        # max-age：没有它浏览器每次打开都会校验，应用更新后新版页面立即生效。
+        self.send_header("Cache-Control", "no-cache")
+        if etag is not None:
+            self.send_header("ETag", etag)
         self.end_headers()
         self.wfile.write(body)
     def _read_chunked_body(self, max_bytes=MAX_PAYLOAD_BYTES):
@@ -7152,19 +12763,35 @@ class Handler(BaseHTTPRequestHandler):
             # which is the most natural shape for a hand-written file.
             return data
         return {}
-    def _payload_or_error(self, allow_list=False, error_style="openai"):
+    def _payload_or_error(self, allow_list=False):
         """Read the body, replying with the right error and returning None."""
-        fail = self._anthropic_error if error_style == "anthropic" else self._error
         try:
             return self._read_payload(allow_list=allow_list)
         except BodyTooLarge as exc:
-            fail(413, "payload too large (%d bytes > %d limit)"
-                 % (exc.length, MAX_PAYLOAD_BYTES), "request_too_large"
-                 if error_style == "anthropic" else "invalid_request_error")
+            message = ("payload too large (%d bytes > %d limit)"
+                       % (exc.length, MAX_PAYLOAD_BYTES))
+            if self._anthropic_route():
+                self._anthropic_error(413, message, "invalid_request_error")
+            else:
+                self._error(413, message, "invalid_request_error")
             return None
         except BadJSON:
-            fail(400, "invalid JSON body", "invalid_request_error")
+            if self._anthropic_route():
+                self._anthropic_error(400, "invalid JSON body", "invalid_request_error")
+            else:
+                self._error(400, "invalid JSON body", "invalid_request_error")
             return None
+    def _anthropic_route(self):
+        """True when the request path is one of the Anthropic Messages routes.
+
+        Errors raised before the route dispatcher runs (body read, size cap)
+        have to answer in the Anthropic envelope, or a Claude Code client sees
+        an OpenAI-shaped error it cannot parse.
+        """
+        return self.path.split("?")[0] in (
+            "/v1/messages", "/messages",
+            "/v1/messages/count_tokens", "/messages/count_tokens",
+        )
     def _handle_settings_save(self):
         """Persist panel-managed settings from the web settings tab."""
         payload = self._payload_or_error()
@@ -7178,12 +12805,20 @@ class Handler(BaseHTTPRequestHandler):
             # The panel only ever shows a masked key, so a blank value means
             # "keep what is stored" for that row rather than "clear it".
             existing = {entry.get("id"): entry for entry in configured_keys()}
+            # A submission that carries an explicit delete list is an upsert:
+            # only the ids it names are retired. That is what stops a stale or
+            # incomplete list (a second tab, a save racing the post-save
+            # reload) from wiping a key the user never removed. An older panel
+            # sends no such field and keeps the replace-by-omission contract.
+            delete_ids = payload.get("deleted_api_key_ids")
+            upsert = isinstance(delete_ids, list)
             cleaned = []
             for item in raw:
                 if not isinstance(item, dict):
                     return self._error(400, "each api key must be an object",
                                        "invalid_request_error")
                 entry_id = str(item.get("id") or "").strip()
+                stored = existing.get(entry_id) or {}
                 value = str(item.get("key") or "").strip()
                 if not value and entry_id and entry_id in existing:
                     value = existing[entry_id].get("key") or ""
@@ -7197,7 +12832,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not value:
                     return self._error(400, "a key entry is empty - fill it in or remove the row",
                                        "invalid_request_error")
-                realm = str(item.get("realm") or "").strip().lower()
+                # A field the submission omits keeps whatever is stored, the
+                # same rule `models` already follows: an older or partial
+                # client must not silently clear a key's exit binding, its
+                # name, or its disabled state.
+                if "realm" in item:
+                    realm = str(item.get("realm") or "").strip().lower()
+                else:
+                    realm = str(stored.get("realm") or "").strip().lower()
                 if realm not in ("", "intl", "cn"):
                     return self._error(400, "realm must be intl, cn or empty",
                                        "invalid_request_error")
@@ -7207,18 +12849,29 @@ class Handler(BaseHTTPRequestHandler):
                 if "models" in item:
                     models = item.get("models")
                 else:
-                    models = existing.get(entry_id, {}).get("models")
-                created_at = item.get("created_at") or (existing.get(entry_id, {}).get("created_at") if entry_id in existing else None) or time.strftime("%Y/%m/%d %H:%M")
+                    models = stored.get("models")
+                if "name" in item:
+                    name = str(item.get("name") or "").strip()
+                else:
+                    name = str(stored.get("name") or "").strip()
+                if "enabled" in item:
+                    enabled = item.get("enabled", True) is not False
+                else:
+                    enabled = stored.get("enabled", True) is not False
+                created_at = item.get("created_at") or (stored.get("created_at") if entry_id in existing else None) or time.strftime("%Y/%m/%d %H:%M")
                 cleaned.append({
                     "id": entry_id,
-                    "name": str(item.get("name") or "").strip(),
+                    "name": name,
                     "key": value,
                     "realm": realm,
                     "models": models,
-                    "enabled": item.get("enabled", True) is not False,
+                    "enabled": enabled,
                     "created_at": created_at,
                 })
-            wb_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
+            wb_settings.set_api_keys(
+                ACCOUNTS_DIR, cleaned,
+                delete_ids=(delete_ids if upsert else None),
+            )
             reply["api_keys_saved"] = len(cleaned)
         if "auth_disabled" in payload:
             wb_settings.set_auth_disabled(ACCOUNTS_DIR, payload.get("auth_disabled"))
@@ -7283,12 +12936,13 @@ class Handler(BaseHTTPRequestHandler):
         if touched:
             if POOL and "reserve_credits" in touched:
                 POOL.apply_reserve_credits()
-            if "daily_token_limit" in touched:
-                apply_daily_token_limit(refresh=True)
-            if "daily_credit_limit" in touched:
-                apply_daily_credit_limit(refresh=True)
-            if "model_daily_token_limit" in touched:
-                apply_model_daily_token_limit(refresh=True)
+            if any(k in touched for k in ("daily_token_limit", "daily_credit_limit",
+                                          "model_daily_token_limit")):
+                # One pass refreshes all three: a limit edit is rare, and the
+                # guards publish from the same fold anyway.
+                apply_daily_guards(refresh=True)
+            if "expiring_window_days" in touched and POOL:
+                POOL.apply_expiring_window()
 
         if "pricing_enabled" in payload:
             raw = payload.get("pricing_enabled")
@@ -7324,6 +12978,34 @@ class Handler(BaseHTTPRequestHandler):
                 # A running wait picks the new interval up on the spot.
                 PRICING.set_interval(stored)
             reply["pricing_refresh_minutes"] = stored
+        if "credits_refresh_hours" in payload:
+            # How stale a credit balance may get before the background refresher
+            # updates it. Zero turns the refresher off.
+            raw = payload.get("credits_refresh_hours")
+            if isinstance(raw, bool) or raw is None:
+                return self._error(400, "credits_refresh_hours must be a number",
+                                   "invalid_request_error")
+            try:
+                hours = float(raw)
+            except (TypeError, ValueError):
+                return self._error(400, "credits_refresh_hours must be a number",
+                                   "invalid_request_error")
+            if hours < 0:
+                return self._error(400, "credits_refresh_hours cannot be negative",
+                                   "invalid_request_error")
+            reply["credits_refresh_hours"] = \
+                wb_settings.set_credits_refresh_hours(ACCOUNTS_DIR, hours)
+            if CREDITS_REFRESHER:
+                CREDITS_REFRESHER.wake()
+        if "ui_language" in payload:
+            # Instance-wide default language. The dashboard overrides this per
+            # browser with localStorage; this value is the fallback when no
+            # browser-local preference exists.
+            raw = payload.get("ui_language")
+            if not isinstance(raw, str) or raw not in ("zh", "zh-Hant", "en"):
+                return self._error(400, "ui_language must be zh, zh-Hant or en",
+                                   "invalid_request_error")
+            reply["ui_language"] = wb_settings.set_ui_language(ACCOUNTS_DIR, raw)
         if "pricing_variant_inherit" in payload:
             # Strictly a JSON boolean, like the other switches: "false" as a
             # string would be truthy and silently keep the feature on.
@@ -7365,6 +13047,95 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_local_web_tools(ACCOUNTS_DIR, raw)
             reply["local_web_tools"] = raw
+        if "remaining_priority_enabled" in payload:
+            raw = payload.get("remaining_priority_enabled")
+            if not isinstance(raw, bool):
+                return self._error(400, "remaining_priority_enabled must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_remaining_priority_enabled(ACCOUNTS_DIR, raw)
+            reply["remaining_priority_enabled"] = raw
+            if not raw and POOL is not None:
+                # 关掉就立刻清掉池里上一次推的权重，不等下一个请求；打开则
+                # 由下一个请求照常推（此刻就算推也要先折一次剩余估算，没必要
+                # 为一个开关多付这一趟）。
+                POOL.apply_remaining_weights(None)
+        if "accounts_collapsed" in payload:
+            # A disclosure state, and the only thing this branch may touch: the
+            # submission carries just this key, so the settings it does not name
+            # survive the write.
+            raw = payload.get("accounts_collapsed")
+            if not isinstance(raw, bool):
+                return self._error(400, "accounts_collapsed must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_accounts_collapsed(ACCOUNTS_DIR, raw)
+            reply["accounts_collapsed"] = raw
+        if "accounts_separate_tab" in payload:
+            # Same shape again: strictly a JSON boolean, because "false" as a
+            # string would be truthy and silently split the nav.
+            raw = payload.get("accounts_separate_tab")
+            if not isinstance(raw, bool):
+                return self._error(400, "accounts_separate_tab must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_accounts_separate_tab(ACCOUNTS_DIR, raw)
+            reply["accounts_separate_tab"] = raw
+        if "key_before_hidden" in payload:
+            # Same shape as accounts_collapsed: one disclosure state per
+            # submission, and strictly a JSON boolean, because "false" as a
+            # string would be truthy and silently fold the row away.
+            raw = payload.get("key_before_hidden")
+            if not isinstance(raw, bool):
+                return self._error(400, "key_before_hidden must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_key_before_hidden(ACCOUNTS_DIR, raw)
+            reply["key_before_hidden"] = raw
+        if "hidden_pages" in payload:
+            # A list of page keys, and the only thing this branch may touch: the
+            # submission carries just this key, so the settings it does not name
+            # survive the write. A bare string would iterate character by
+            # character and hide nothing but garbage, so anything that is not a
+            # list of strings is rejected outright rather than normalised away.
+            raw = payload.get("hidden_pages")
+            if not isinstance(raw, list) or any(not isinstance(k, str) for k in raw):
+                return self._error(400, "hidden_pages must be a list of page keys",
+                                   "invalid_request_error")
+            # Reply with the normalised list, not the raw one: keys the request
+            # spelled wrong are dropped on the way in, so the panel echoes back
+            # what was actually stored.
+            reply["hidden_pages"] = wb_settings.set_hidden_pages(ACCOUNTS_DIR, raw)
+        if "update_check_enabled" in payload:
+            # Strictly a JSON boolean, like the switches above: "false" as a
+            # string would be truthy and silently start the daily GitHub call.
+            raw = payload.get("update_check_enabled")
+            if not isinstance(raw, bool):
+                return self._error(400, "update_check_enabled must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_update_check_enabled(ACCOUNTS_DIR, raw)
+            reply["update_check_enabled"] = raw
+            if UPDATES and raw:
+                # Turning it on should not wait out the rest of the poll sleep.
+                UPDATES.wake()
+        if "upstream" in payload:
+            raw = payload.get("upstream")
+            if not isinstance(raw, dict):
+                return self._error(400, "upstream must be an object",
+                                   "invalid_request_error")
+            try:
+                patch = wb_settings.validate_upstream_patch(raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            wb_settings.set_upstream_config(ACCOUNTS_DIR, patch)
+            reply["upstream"] = wb_settings.upstream_config(ACCOUNTS_DIR)
+        if "prompt" in payload:
+            raw = payload.get("prompt")
+            if not isinstance(raw, dict):
+                return self._error(400, "prompt must be an object",
+                                   "invalid_request_error")
+            try:
+                patch = wb_settings.validate_prompt_patch(raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            wb_settings.set_prompt_config(ACCOUNTS_DIR, patch)
+            reply["prompt"] = wb_settings.prompt_config(ACCOUNTS_DIR)
         new_key = payload.get("api_key")
         if new_key is not None:
             new_key = str(new_key).strip()
@@ -7461,13 +13232,218 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"candidates": discover_proxy_slots()})
         return self._error(404, "not found", "invalid_request_error")
 
+    # ---- one-click agent integration (wb_agents) ----
+
+    def _agents_client_allowed(self):
+        """本请求的来源地址能不能用一键配置（判定见模块级 agents_client_allowed）。"""
+        return agents_client_allowed(getattr(self, "client_address", None))
+
+    def _agents_base_url_hint(self):
+        """Best guess at the URL a local client should point at.
+
+        Derived from the bound socket; a 0.0.0.0 bind is unreachable for a
+        client, so it is reported as 127.0.0.1 instead.
+        """
+        host, port = "", 0
+        try:
+            host, port = self.server.server_address[:2]
+        except Exception:
+            pass
+        host = str(host or "").strip() or "127.0.0.1"
+        if host in ("0.0.0.0", "::", ""):
+            host = "127.0.0.1"
+        return "http://%s:%d/v1" % (host, int(port or 0))
+
+    def _agents_models(self):
+        """Flat model list for the picker; bundled intl+cn catalog, deduped.
+
+        Live sources stay out of this path on purpose: the panel must answer
+        even when the upstream is down, so a failure here is simply a shorter
+        list, never an error.
+        """
+        models = []
+        seen = set()
+        try:
+            try:
+                entries = fetch_models()
+            except Exception:
+                entries = []
+            if entries:
+                sources = ((mid, meta) for mid, meta in entries)
+            else:
+                sources = (
+                    (item.get("id"), item)
+                    for item in (list(getattr(wb_catalog, "STATIC_INTL_MODELS", []))
+                                 + list(getattr(wb_catalog, "STATIC_CN_MODELS", [])))
+                    if isinstance(item, dict)
+                )
+            for mid, meta in sources:
+                mid = str(mid or "").strip()
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+                meta = meta if isinstance(meta, dict) else {}
+                entry = {"id": mid}
+                ctx = meta.get("maxInputTokens")
+                window = meta.get("contextWindow")
+                if isinstance(window, dict) and window.get("defaultLength"):
+                    ctx = window.get("defaultLength")
+                if not ctx and isinstance(window, dict):
+                    lengths = window.get("supportedLengths") or []
+                    ctx = lengths[-1] if lengths else None
+                if ctx:
+                    try:
+                        entry["context_window"] = int(ctx)
+                    except (TypeError, ValueError):
+                        pass
+                out = meta.get("maxOutputTokens")
+                if out:
+                    try:
+                        entry["max_output"] = int(out)
+                    except (TypeError, ValueError):
+                        pass
+                name = meta.get("name")
+                if name:
+                    entry["name"] = name
+                models.append(entry)
+        except Exception:
+            pass
+        return models
+
+    def _get_agents(self):
+        if not self._agents_client_allowed():
+            # 远程看板（服务端 / Docker / OpenWrt）：一键配置改的是网关所在
+            # 机器的配置目录，到不了用户自己的电脑，直接按不可用返回。
+            return self._json(200, {
+                "enabled": False,
+                "reason": "agent config is only available from the machine running the gateway",
+            })
+        wb_agents = agents_module()
+        keys = []
+        try:
+            for entry in configured_keys():
+                if entry.get("enabled"):
+                    keys.append({
+                        "id": entry.get("id"),
+                        "name": entry.get("name") or "",
+                        "enabled": True,
+                    })
+        except Exception:
+            keys = []
+        return self._json(200, {
+            "enabled": True,
+            "clients": list(wb_agents.overview(ACCOUNTS_DIR).values()),
+            "models": self._agents_models(),
+            "keys": keys,
+            "global_key_set": bool(API_KEY),
+            "auth_required": auth_required(),
+            "gateway": {"base_url": self._agents_base_url_hint()},
+        })
+
+    def _agents_resolve_key(self, payload, warnings):
+        """Pick the gateway key to hand to the client, per the payload.
+
+        Returns the key string, or None when the request should fail. The
+        failure message is appended to `warnings` only for the soft-fallback
+        case; hard failures raise via the caller's 400 mapping.
+        """
+        key_id = str(payload.get("key_id") or "").strip()
+        if key_id == "__global":
+            return API_KEY or None
+        keys = configured_keys()
+        if key_id:
+            for entry in keys:
+                if entry.get("id") == key_id:
+                    return entry.get("key") or None
+            raise wb_agents.AgentConfigError(
+                "no configured key with id %r" % key_id)
+        # Default: the global key when set, else the first enabled panel key.
+        if API_KEY:
+            return API_KEY
+        for entry in keys:
+            if entry.get("enabled"):
+                return entry.get("key") or None
+        return None
+
+    def _handle_agents_apply(self, payload):
+        wb_agents = agents_module()
+        client_id = str(payload.get("client") or payload.get("client_id") or "").strip()
+        if not client_id:
+            return self._error(400, "client is required", "invalid_request_error")
+        base_url = str(payload.get("base_url") or "").strip()
+        if not re.match(r"^https?://", base_url):
+            return self._error(
+                400, "base_url must start with http:// or https://",
+                "invalid_request_error")
+        model = str(payload.get("model") or "").strip() or None
+        models = payload.get("models")
+        if not models:
+            # Fall back to the gateway's discovered catalog so clients that embed
+            # model definitions (OpenCode, DSH, Crush) receive the full model list
+            # even when the front-end omitted the field.
+            models = self._agents_models()
+        if not isinstance(models, list):
+            return self._error(400, "models must be a list",
+                               "invalid_request_error")
+        # A runaway picker must not turn into a megabyte config file.
+        models = models[:80]
+        cleaned_models = []
+        for item in models:
+            if isinstance(item, dict) and item.get("id"):
+                cleaned_models.append(item)
+            elif isinstance(item, str) and item.strip():
+                cleaned_models.append({"id": item.strip()})
+        warnings = []
+        try:
+            api_key = self._agents_resolve_key(payload, warnings)
+        except wb_agents.AgentConfigError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        if not api_key:
+            if auth_required():
+                return self._error(
+                    400, "no gateway key available - 请先配置 API Key",
+                    "invalid_request_error")
+            api_key = "wb-local"
+            warnings.append("gateway has no key configured; wrote placeholder "
+                            "'wb-local' (auth is off, so any value works)")
+        try:
+            result = wb_agents.integrate(
+                ACCOUNTS_DIR, client_id, base_url, api_key,
+                model=model, models=cleaned_models)
+        except wb_agents.AgentConfigError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        except Exception as exc:
+            return self._error(500, "agents apply failed: %s" % exc)
+        result["warnings"] = warnings
+        log("agents apply: client=%s base_url=%s model=%s files=%d"
+            % (client_id, base_url, model or "-", len(result.get("files") or [])),
+            tag="agents")
+        return self._json(200, result)
+
+    def _handle_agents_restore(self, payload):
+        wb_agents = agents_module()
+        client_id = str(payload.get("client") or payload.get("client_id") or "").strip()
+        if not client_id:
+            return self._error(400, "client is required", "invalid_request_error")
+        try:
+            result = wb_agents.restore(ACCOUNTS_DIR, client_id)
+        except wb_agents.AgentConfigError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        except Exception as exc:
+            return self._error(500, "agents restore failed: %s" % exc)
+        log("agents restore: client=%s files=%d"
+            % (client_id, len(result.get("restored") or [])), tag="agents")
+        return self._json(200, result)
+
     def _handle_panel(self, path):
         """Panel login, logout and the settings screen (password + API key)."""
         payload = self._payload_or_error()
         if payload is None:
             return
         if path == "/panel/login":
-            client_ip = self.client_address[0] if hasattr(self, "client_address") and self.client_address else "127.0.0.1"
+            peer_ip = self.client_address[0] if hasattr(self, "client_address") and self.client_address else "127.0.0.1"
+            # 限流键不能直接取对端地址：反代后对端是代理本身，见 login_rate_limit_key
+            client_ip = login_rate_limit_key(peer_ip, getattr(self, "headers", None))
             now = time.time()
             with _login_lock:
                 _prune_login_attempts(now)
@@ -7529,6 +13505,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_tasks_run(payload)
         if path == "/tasks/travel":
             return self._route_tasks_travel(payload)
+        if path == "/tasks/streak-bonus":
+            return self._route_tasks_streak_bonus(payload)
         if path == "/scheduler/trigger":
             return self._route_scheduler_trigger(payload)
         if path == "/scheduler/toggle":
@@ -7553,6 +13531,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_accounts_import_desktop(payload)
         if path == "/accounts/refresh":
             return self._route_accounts_refresh(payload)
+        if path == "/accounts/sync-profile":
+            return self._route_accounts_sync_profile(payload)
         if path == "/accounts/test":
             return self._route_accounts_test(payload)
         if path == "/accounts/set":
@@ -7567,9 +13547,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_accounts_import(payload)
         return self._error(404, "unknown account endpoint", "invalid_request_error")
     def _route_accounts_product(self, payload):
-        """切換出站身分（cli <-> workbuddy），並即時回傳結果。
+        """切换出站身分（cli <-> workbuddy），并即时回传结果。
 
-        官方有兩套身分、兩條配額線。某條滿了可以切到另一條繼續用。
+        官方有两套身分、两条配额线。某条满了可以切到另一条继续用。
         """
         target = str(payload.get("product") or "").strip().lower()
         uid = payload.get("uid")
@@ -7592,9 +13572,9 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             try:
                 if account.set_product(target):
-                    # 立刻落盤：set_product() 只改記憶體，而面板上這一下是操作者
-                    # 的明確選擇，不能等到別的路徑（refresh / 簽到 / 查積分）剛好
-                    # 存檔才生效——切完就重啟容器的人會白白丟掉這次切換。
+                    # 立刻落盘：set_product() 只改记忆体，而面板上这一下是操作者
+                    # 的明确选择，不能等到别的路径（refresh / 签到 / 查积分）刚好
+                    # 存档才生效——切完就重启容器的人会白白丢掉这次切换。
                     try:
                         account.save(ACCOUNTS_DIR)
                     except Exception as exc:
@@ -7694,12 +13674,39 @@ class Handler(BaseHTTPRequestHandler):
             if i < len(targets) - 1:
                 time.sleep(1.5)
         combined_logs.append(f"====== 全部 {len(targets)} 个账号任务执行完毕，累计新增积分: +{total_credit} ======")
+        add_log_entry(f"[任务福利] 批量成长任务执行完成，共 {len(targets)} 个账号，新增积分 +{total_credit}", tag="tasks")
         return self._json(200, {
             "ok": True,
             "credit_added": total_credit,
             "logs": combined_logs,
             "accounts_count": len(targets)
         })
+
+    def _route_tasks_streak_bonus(self, payload):
+        if not POOL:
+            return self._json(200, {"ok": False, "msg": "账号池不可用"})
+        invalidate_tasks_cache()
+        uid = payload.get("uid")
+        if uid and uid != "all":
+            target = POOL.get(uid)
+            if not target or target.realm != "cn":
+                return self._json(200, {"ok": False, "msg": "未找到指定的国内版账号"})
+            targets = [target]
+        else:
+            targets = [a for a in POOL.accounts if a.realm == "cn" and a.enabled]
+        if not targets:
+            return self._json(200, {"ok": False, "msg": "未找到已启用的国内版账号"})
+        from wb_tasks import run_streak_bonus
+        results = []
+        for i, acc in enumerate(targets):
+            uid_str = acc.uid[:8] if acc.uid else "?"
+            nick = acc.nickname or uid_str
+            res = run_streak_bonus(acc)
+            results.append(f"{nick}: {res.get('msg')}")
+            add_log_entry(f"[任务福利] 账号 [{nick}] 连登管家与抽奖: {res.get('msg')}", tag="tasks")
+            if i < len(targets) - 1:
+                time.sleep(1.0)
+        return self._json(200, {"ok": True, "msg": chr(10).join(results)})
 
     def _route_tasks_travel(self, payload):
         if not POOL:
@@ -7732,12 +13739,27 @@ class Handler(BaseHTTPRequestHandler):
             if i < len(targets) - 1:
                 time.sleep(1.0)
         summary_msg = chr(10).join([f"{r['nickname']}: {r['msg']}" for r in results])
+        for r in results:
+            add_log_entry(f"[任务福利] 账号 [{r['nickname']}] 猫猫旅行: {r['msg']}", tag="tasks")
         return self._json(200, {
             "ok": True,
             "results": results,
             "msg": summary_msg,
             "accounts_count": len(targets)
         })
+
+    def _route_update_check(self):
+        """Run one release check now, on the operator's explicit request.
+
+        Inline rather than "started, poll /updates": it is a single bounded
+        GitHub request, and the answer is what the button is for. `manual=True`
+        ignores both the daily switch and the 24h window.
+        """
+        if not UPDATES:
+            return self._json(200, {"ok": False, "msg": "更新检查未运行"})
+        status = UPDATES.check(manual=True)
+        status["ok"] = True
+        return self._json(200, status)
 
     def _route_scheduler_trigger(self, payload):
         if SCHEDULER:
@@ -7830,7 +13852,10 @@ class Handler(BaseHTTPRequestHandler):
         for account in targets:
             if account is None:
                 continue
-            res = account.checkin()
+            res = account.checkin(trigger="manual")
+            nick = account.nickname or account.uid[:8]
+            add_log_entry(f"[任务福利] 账号 [{nick}] 每日签到: {res.get('msg') if res.get('ok') else res.get('error')}",
+                          level="INFO" if res.get("ok") else "WARN", tag="tasks")
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
         return self._json(200, {"results": results, "accounts": account_views()})
 
@@ -7844,7 +13869,12 @@ class Handler(BaseHTTPRequestHandler):
         for account in targets:
             if account is None:
                 continue
-            res = account.daily_chat()
+            res = account.daily_chat(trigger="manual")
+            # 与网页通道打卡那条一样把结果写进运行日志：msg 里带着网页通道是
+            # completed 还是失败原因，面板上光看 toast 的「成功」看不出来。
+            nick = account.nickname or account.uid[:8]
+            log(f"[任务福利] 账号 [{nick}] 每日活跃打卡: {res.get('msg') if res.get('ok') else res.get('error')}",
+                level="INFO" if res.get("ok") else "WARN", tag="tasks")
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
         return self._json(200, {"results": results, "accounts": account_views()})
 
@@ -7863,10 +13893,10 @@ class Handler(BaseHTTPRequestHandler):
         for account in targets:
             if account is None:
                 continue
-            res = account.daily_chat_web()
-            log("account %s: 网页通道打卡 -> %s"
-                % (account.uid[:8], res.get("conversation") if res.get("ok") else res.get("error")),
-                level="INFO" if res.get("ok") else "WARN")
+            res = account.daily_chat_web(trigger="manual")
+            nick = account.nickname or account.uid[:8]
+            log(f"[任务福利] 账号 [{nick}] 网页通道打卡: {res.get('conversation') if res.get('ok') else res.get('error')}",
+                level="INFO" if res.get("ok") else "WARN", tag="tasks")
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
         return self._json(200, {"results": results, "accounts": account_views()})
 
@@ -7945,6 +13975,39 @@ class Handler(BaseHTTPRequestHandler):
             results.append({"uid": account.uid, "ok": ok, "error": account.last_error})
         return self._json(200, {"results": results})
 
+    def _route_accounts_sync_profile(self, payload):
+        """Manual nickname refresh from the web console.
+
+        Opt-in by nature: only runs when the operator asks for it. The
+        upstream response carries phone numbers and other personal fields;
+        wb_accounts.fetch_account_profile parses only uid/nickname.
+        """
+        uid = str(payload.get("uid") or "").strip()
+        realm = payload.get("realm")
+        if uid:
+            targets = [POOL.get(uid)]
+        elif realm and realm != "all":
+            targets = [a for a in POOL.accounts if a.realm == realm]
+        else:
+            targets = list(POOL.accounts)
+        updated = []
+        failed = []
+        for account in targets:
+            if account is None:
+                continue
+            try:
+                nickname = account.sync_nickname()
+            except Exception as exc:
+                failed.append({"uid": account.uid, "error": str(exc)[:200]})
+                log("profile sync failed for %s: %s" % (account.uid[:8], exc),
+                    level="WARN")
+                continue
+            updated.append({"uid": account.uid, "nickname": nickname})
+            log("account %s: nickname synced from the web console"
+                % account.uid[:8], level="INFO")
+        return self._json(200, {"updated": updated, "failed": failed,
+                                "accounts": account_views()})
+
     def _route_accounts_test(self, payload):
         uid = payload.get("uid")
         if not uid:
@@ -7976,7 +14039,14 @@ class Handler(BaseHTTPRequestHandler):
                 reply_text = (msg.get("content") or msg.get("reasoning_content") or "OK").strip()
                 if len(reply_text) > 80:
                     reply_text = reply_text[:77] + "..."
-                account.clear_error()
+                # A served request, so it takes the semantic success path. That
+                # clears the account-level streak/breaker/degrade counters, which
+                # clear_error() never touched: a green panel test used to leave
+                # soft_streak standing, and the next 429 resumed the ladder from
+                # it. Only the tested model's cooldown is dropped here - sibling
+                # models keep theirs, and a 402 balance park keeps its own lift
+                # path (revive_balance_cooldown on a credits refresh).
+                account.note_success(model=test_model)
                 log(f"account test: uid={account.uid[:8]} model={test_model} wall={wall_ms}ms ok=True", tag="accounts")
                 return self._json(200, {
                     "ok": True,
@@ -8109,8 +14179,8 @@ class Handler(BaseHTTPRequestHandler):
         # so it cannot replay a prior turn. Silently ignoring the field would
         # answer a follow-up as if it were a fresh conversation - the client
         # gets a normal-looking reply with the context missing. Say so instead.
-        # 拒絕 namespace 工具，逼 Codex fallback 成 flat 工具清單。
-        # 不這樣做的話，MCP／外掛工具全部會被 app 判定為不可執行。
+        # 拒绝 namespace 工具，逼 Codex fallback 成 flat 工具清单。
+        # 不这样做的话，MCP／外挂工具全部会被 app 判定为不可执行。
         if payload.get("previous_response_id"):
             return self._error(
                 400,
@@ -8209,8 +14279,8 @@ class Handler(BaseHTTPRequestHandler):
                   "realm": realm}
         first_ms = None
         try:
-            # 一輪跑完如果模型要的是 web_search / web_fetch，就由反代
-            # 執行、把結果餵回去再跑一輪。客戶端從頭到尾只看到一則連續的回應。
+            # 一轮跑完如果模型要的是 web_search / web_fetch，就由反代
+            # 执行、把结果喂回去再跑一轮。客户端从头到尾只看到一则连续的回应。
             rounds = 0
             total_usage = None
             while True:
@@ -8222,13 +14292,13 @@ class Handler(BaseHTTPRequestHandler):
                         first_ms = int((time.time() - t_start) * 1000)
                     self.wfile.write(clean_responses_frame(frame))
                     self.wfile.flush()
-                # 每一輪的 token 都是真的花掉的，記帳要加總
+                # 每一轮的 token 都是真的花掉的，记帐要加总
                 total_usage = sum_usage(total_usage, holder.get("usage"))
                 internal = holder.get("internal_calls") or []
                 if not internal:
                     break
                 rounds += 1
-                # 用完就收回工具，讓模型自己收尾；這裡不合成任何事件。
+                # 用完就收回工具，让模型自己收尾；这里不合成任何事件。
                 give_up = rounds > wb_webtools.MAX_WEB_ROUNDS
                 try:
                     upstream.close()
@@ -8261,8 +14331,8 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return
         finally:
-            # 代跑多輪時 upstream 會被換掉，外層的 with 只認得最開始那一條，
-            # 最後一條要在這裡收掉。
+            # 代跑多轮时 upstream 会被换掉，外层的 with 只认得最开始那一条，
+            # 最后一条要在这里收掉。
             try:
                 upstream.close()
             except Exception:
@@ -8275,13 +14345,13 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None):
-        # 跟串流那條一樣：客戶端宣告 web_search / web_fetch 時由反代代跑。
-        # 中間那幾輪對客戶端不可見，最後才組成一個 Responses 物件回傳；不這樣
-        # 做的話 web_search 的 function_call 會直接漏給客戶端，客戶端只會回
+        # 跟串流那条一样：客户端宣告 web_search / web_fetch 时由反代代跑。
+        # 中间那几轮对客户端不可见，最后才组成一个 Responses 物件回传；不这样
+        # 做的话 web_search 的 function_call 会直接漏给客户端，客户端只会回
         # 一句 unsupported call。
         sources = []
         rounds = 0
-        # 開關關閉時不攔同名呼叫：那是客戶端自己的工具。
+        # 开关关闭时不拦同名呼叫：那是客户端自己的工具。
         web_tools = web_tools_active(base_body)
         while True:
             try:
@@ -8319,42 +14389,12 @@ class Handler(BaseHTTPRequestHandler):
                      account=account.uid, key=self._key_id(), effort=effort)
         return self._json(200, result)
 
-    @staticmethod
-    def _anthropic_upstream_lines(upstream):
-        """Reject an empty/error/truncated chat stream in either response mode."""
-        saw_choice = completed = False
-        for line in upstream:
-            raw = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
-            data = strip_data_prefix(raw)
-            if data == "[DONE]":
-                completed = True
-                break
-            if not data or data.startswith(":"):
-                continue
-            try:
-                chunk = json.loads(data)
-            except (ValueError, TypeError):
-                continue
-            if not isinstance(chunk, dict):
-                continue
-            if chunk.get("error"):
-                error = chunk["error"]
-                message = error.get("message") if isinstance(error, dict) else str(error)
-                raise RuntimeError("upstream stream error: %s" % (message or "unknown error"))
-            for choice in chunk.get("choices") or []:
-                if isinstance(choice, dict):
-                    saw_choice = True
-                    completed = completed or bool(choice.get("finish_reason"))
-            yield line
-        if not saw_choice or not completed:
-            raise RuntimeError("upstream stream ended before completion")
-
-    def _handle_anthropic_count_tokens(self, payload):
+    def _handle_messages_count_tokens(self, payload):
         try:
-            chat_request = _anthropic_messages_to_chat(payload, require_max_tokens=False)
+            chat_request = messages_to_chat(payload, require_max_tokens=False)
             forwarded = build_upstream_body(chat_request)
             return self._json(200, {
-                "input_tokens": _anthropic_input_tokens(forwarded),
+                "input_tokens": _anthropic_estimate_chat_tokens(forwarded),
             })
         except AnthropicRequestError as exc:
             return self._anthropic_error(400, str(exc), "invalid_request_error")
@@ -8362,9 +14402,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._anthropic_error(400, "invalid request: %s" % exc,
                                          "invalid_request_error")
 
-    def _handle_anthropic_messages(self, payload):
+    def _handle_messages(self, payload):
         try:
-            chat_request = _anthropic_messages_to_chat(payload)
+            chat_request = messages_to_chat(payload)
             forwarded = build_upstream_body(chat_request)
         except AnthropicRequestError as exc:
             return self._anthropic_error(400, str(exc), "invalid_request_error")
@@ -8373,7 +14413,7 @@ class Handler(BaseHTTPRequestHandler):
                                          "invalid_request_error")
 
         model = chat_request.get("model") or "hy4-preview"
-        input_tokens = _anthropic_input_tokens(forwarded)
+        input_tokens = _anthropic_estimate_chat_tokens(forwarded)
         session_key = extract_session_key(self.headers, payload)
         fp = prompt_fingerprint(forwarded.get("messages"))
         want_stream = bool(payload.get("stream"))
@@ -8433,10 +14473,10 @@ class Handler(BaseHTTPRequestHandler):
 
         with upstream:
             if want_stream:
-                return self._anthropic_stream_response(
+                return self._messages_stream_response(
                     upstream, model, fp, account, t_start, input_tokens, effort)
             try:
-                chat_obj = aggregate_stream(self._anthropic_upstream_lines(upstream), model, None)
+                chat_obj = aggregate_stream(_anthropic_upstream_lines(upstream), model, None)
             except Exception as exc:
                 record_error(model, 502, str(exc),
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -8450,76 +14490,18 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=wall, ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
                          fp=fp, account=account.uid, key=self._key_id(), effort=effort)
-            return self._json(200, _anthropic_response_from_chat(
+            return self._json(200, chat_to_messages(
                 chat_obj, payload, input_tokens=input_tokens))
 
-    def _anthropic_stream_response(self, upstream, model, fp, account,
-                                   t_start, input_tokens, effort=None):
-        """Translate chat SSE into consecutive Anthropic content blocks."""
-        def emit(event_type, data):
-            self.wfile.write(_anthropic_sse_event(event_type, data))
-            self.wfile.flush()
 
-        active = None
-        next_index = 0
-        tools = {}
-        text_parts, reasoning_parts = [], []
-        finish_reason = "stop"
-        last_usage = None
+    def _messages_stream_response(self, upstream, model, fp, account,
+                                  t_start, input_tokens, effort=None):
+        holder = {"usage": {
+            "prompt_tokens": max(1, input_tokens), "completion_tokens": 0,
+            "total_tokens": max(1, input_tokens),
+        }}
         first_ms = None
         outcome = "completed"
-
-        def close_block():
-            nonlocal active
-            if active is None:
-                return
-            if active["type"] == "thinking":
-                # This translated trace has no verifiable Claude signature.
-                emit("content_block_delta", {
-                    "index": active["index"],
-                    "delta": {"type": "signature_delta", "signature": ""},
-                })
-            emit("content_block_stop", {"index": active["index"]})
-            active = None
-
-        def start_block(content):
-            nonlocal active, next_index
-            close_block()
-            active = {"index": next_index, "type": content["type"]}
-            next_index += 1
-            emit("content_block_start", {
-                "index": active["index"], "content_block": content,
-            })
-            return active["index"]
-
-        def simple_delta(kind, value):
-            if not isinstance(value, str):
-                value = str(value)
-            if active is None or active["type"] != kind:
-                start_block({"type": kind, kind: ""})
-            emit("content_block_delta", {
-                "index": active["index"],
-                "delta": {"type": kind + "_delta", kind: value},
-            })
-
-        def tool_arguments():
-            return "".join(arg for tool in tools.values() for arg in tool["args"])
-
-        def recorded_usage():
-            if (_extract_usage(last_usage) or {}).get("total_tokens", 0) > 0:
-                return last_usage
-            generated = "".join(text_parts) + "".join(reasoning_parts) + tool_arguments()
-            completion = estimate_tokens(generated)
-            return {
-                "prompt_tokens": max(1, input_tokens),
-                "completion_tokens": completion,
-                "total_tokens": max(1, input_tokens) + completion,
-                "completion_tokens_details": {
-                    "reasoning_tokens": estimate_tokens("".join(reasoning_parts)),
-                },
-                "prompt_tokens_details": {"cached_tokens": 0},
-            }
-
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -8528,109 +14510,33 @@ class Handler(BaseHTTPRequestHandler):
             if cors_origin_allowed(self.path):
                 self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            emit("message_start", {"message": {
-                "id": _new_id("msg_"), "type": "message", "role": "assistant",
-                "model": model, "content": [], "stop_reason": None,
-                "stop_sequence": None, "usage": _anthropic_usage(None, input_tokens),
-            }})
-            emit("ping", {})
-            for line in self._anthropic_upstream_lines(upstream):
-                raw = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
-                chunk = json.loads(strip_data_prefix(raw))
-                if first_ms is None:
+            for frame in stream_messages_events(upstream, model, holder, input_tokens):
+                if first_ms is None and frame.startswith(b"event: content_block_delta\n"):
                     first_ms = int((time.time() - t_start) * 1000)
-                usage = chunk.get("usage")
-                if usage and (last_usage is None or
-                              (usage.get("total_tokens") or 0) >=
-                              (last_usage.get("total_tokens") or 0)):
-                    last_usage = usage
-                for choice in chunk.get("choices") or []:
-                    delta = choice.get("delta") or {}
-                    if choice.get("finish_reason"):
-                        finish_reason = choice["finish_reason"]
-                    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-                    if reasoning:
-                        reasoning = str(reasoning)
-                        reasoning_parts.append(reasoning)
-                        simple_delta("thinking", reasoning)
-                    text = delta.get("content")
-                    if text:
-                        text = str(text)
-                        text_parts.append(text)
-                        simple_delta("text", text)
-                    tool_deltas = list(delta.get("tool_calls") or [])
-                    function_call = delta.get("function_call")
-                    if isinstance(function_call, dict) and (
-                            function_call.get("name") or function_call.get("arguments")):
-                        tool_deltas.append({"index": 0, "function": function_call})
-                    # Parallel chat tool calls may interleave. Buffer them so
-                    # each Anthropic block is emitted completely before the next.
-                    for position, tool_delta in enumerate(tool_deltas):
-                        index = tool_delta.get("index")
-                        key = index if index is not None else position
-                        tool = tools.setdefault(key, {"id": "", "name": "", "args": []})
-                        if tool_delta.get("id"):
-                            tool["id"] = tool_delta["id"]
-                        function = tool_delta.get("function") or {}
-                        if function.get("name"):
-                            tool["name"] += function["name"]
-                        if function.get("arguments"):
-                            tool["args"].append(function["arguments"])
-
-            close_block()
-            for tool in tools.values():
-                if not tool["name"]:
-                    if tool["args"]:
-                        raise RuntimeError("upstream tool call is missing its name")
-                    continue
-                index = start_block({
-                    "type": "tool_use", "id": tool["id"] or _new_id("call_"),
-                    "name": tool["name"], "input": {},
-                })
-                for argument in tool["args"] or ["{}"]:
-                    emit("content_block_delta", {
-                        "index": index,
-                        "delta": {"type": "input_json_delta", "partial_json": argument},
-                    })
-                close_block()
-            has_tools = any(tool["name"] for tool in tools.values())
-            if has_tools and finish_reason == "stop":
-                finish_reason = "tool_calls"
-            elif not has_tools and finish_reason in ("tool_calls", "function_call"):
-                finish_reason = "stop"
-            usage = _anthropic_usage(last_usage, input_tokens,
-                                     "".join(text_parts) + tool_arguments(),
-                                     "".join(reasoning_parts))
-            emit("message_delta", {
-                "delta": {"stop_reason": _anthropic_stop_reason(finish_reason),
-                          "stop_sequence": None},
-                # Replace provisional counts with the upstream totals, including
-                # cache reads. Official SDKs merge these into message_start usage.
-                "usage": usage,
-            })
-            emit("message_stop", {})
+                self.wfile.write(frame)
+                self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             outcome = "client_aborted"
         except Exception as exc:
             wall = int((time.time() - t_start) * 1000)
             record_error(model, 502, "stream aborted: %s" % exc,
-                         elapsed_ms=wall, account=account.uid, usage=last_usage,
+                         elapsed_ms=wall, account=account.uid, usage=holder.get("usage"),
                          stream=True, ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
                          fp=fp, outcome="upstream_aborted", key=self._key_id())
             try:
-                emit("error", {"error": {"type": "api_error",
-                                        "message": "stream aborted: %s" % exc}})
+                self.wfile.write(anthropic_sse_frame("error", {
+                    "error": {"type": "api_error", "message": "stream aborted: %s" % exc}}))
+                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
             return
         wall = int((time.time() - t_start) * 1000)
-        record_usage(model, recorded_usage(), stream=True, elapsed_ms=wall,
+        record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
                      ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
                      fp=fp, account=account.uid, outcome=outcome,
                      key=self._key_id(), effort=effort)
-        return
 
     def do_POST(self):
         path = self.path.split("?")[0]
@@ -8638,6 +14544,13 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/updates/check":
+            # Panel-only management write, like the pricing ones. No body to
+            # read: the action takes no parameters, so a button that posts
+            # nothing must not be answered with "invalid JSON body".
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            return self._route_update_check()
         if path in ("/pricing/refresh", "/pricing/mapping"):
             # Panel-only management writes (the pricing table is the panel's
             # own view of the estimate). Registered here because the generic
@@ -8661,10 +14574,31 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             return self._handle_proxy_slots(path, payload)
+        if path in ("/agents/apply", "/agents/restore"):
+            if not self._panel_ok():
+                return self._error(
+                    401, "panel password required", "invalid_request_error"
+                )
+            if not self._agents_client_allowed():
+                return self._error(
+                    403,
+                    "agent config is only available from the machine running the gateway",
+                    "invalid_request_error",
+                )
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            if path == "/agents/apply":
+                return self._handle_agents_apply(payload)
+            return self._handle_agents_restore(payload)
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
+        is_messages_route = path in (
+            "/v1/messages", "/messages",
+            "/v1/messages/count_tokens", "/messages/count_tokens",
+        )
         is_account_route = (
             path.startswith("/accounts/")
             or path == "/realm"
@@ -8672,46 +14606,56 @@ class Handler(BaseHTTPRequestHandler):
             or path.startswith("/scheduler")
             or path.startswith("/logs")
         )
-        is_anthropic_route = path in (
-            "/v1/messages", "/messages",
-            "/v1/messages/count_tokens", "/messages/count_tokens",
-        )
-        if not is_account_route and path not in ("/v1/chat/completions", "/chat/completions",
-                                                "/v1/completions", "/completions",
-                                                "/v1/responses", "/responses",
-                                                "/v1/messages", "/messages",
-                                                "/v1/messages/count_tokens", "/messages/count_tokens"):
+        if not is_account_route and not is_messages_route and path not in (
+                "/v1/chat/completions", "/chat/completions",
+                "/v1/completions", "/completions",
+                "/v1/responses", "/responses"):
             return self._error(404, "not found", "invalid_request_error")
-        if is_anthropic_route:
-            if not self._anthropic_authorized():
-                return
+        if is_messages_route:
+            if not self._key_ok():
+                return self._anthropic_error(
+                    401, "missing or invalid API key", "authentication_error")
         elif not self._authorized():
             return
-        payload = self._payload_or_error(
-            allow_list=(path == "/accounts/import"),
-            error_style="anthropic" if is_anthropic_route else "openai",
-        )
+        payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
             return
         if is_account_route:
             return self._handle_accounts(path, payload)
-        if path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
-            return self._dispatch_chat_post(path, payload)
-        # Upstream chat routes can hold a thread for up to 600s.
+        if is_messages_route:
+            if BLOCK_BACKGROUND_REQUESTS:
+                reason = background_request_reason(payload)
+                if reason:
+                    log("background request blocked: model=%s trigger=(%s)"
+                        % (payload.get("model"), reason), level="INFO")
+                    return self._anthropic_error(400, background_request_message(reason),
+                                                 "invalid_request_error")
+            if path.endswith("/count_tokens"):
+                return self._handle_messages_count_tokens(payload)
+            if not _chat_slots.acquire(timeout=CHAT_SLOT_WAIT_SECONDS):
+                message = ("gateway is at its concurrent chat limit "
+                           "(%d in flight); retry shortly" % MAX_CONCURRENT_CHAT)
+                record_error(payload.get("model") or "unknown", 503, message,
+                             stream=payload.get("stream"), key=self._key_id())
+                return self._anthropic_error(503, message, "overloaded_error")
+            try:
+                return self._handle_messages(payload)
+            finally:
+                _chat_slots.release()
+        # Both OpenAI-shaped routes below can hold a thread for up to 600s.
         # Take a slot for the duration; release it in finally so every early
         # return (including client disconnects) gives the slot back.
         if not _chat_slots.acquire(timeout=CHAT_SLOT_WAIT_SECONDS):
-            fail = self._anthropic_error if is_anthropic_route else self._error
-            return fail(503, "gateway is at its concurrent chat limit "
-                             "(%d in flight); retry shortly" % MAX_CONCURRENT_CHAT)
+            return self._error(503, "gateway is at its concurrent chat limit "
+                                    "(%d in flight); retry shortly" % MAX_CONCURRENT_CHAT)
         try:
             return self._dispatch_chat_post(path, payload)
         finally:
             _chat_slots.release()
 
     def _dispatch_chat_post(self, path, payload):
-        # 先擋背景請求：Codex 自己發的（記憶整理／環境建議／自動複核）
-        # 不算「使用者實際使用」，一律本地拒絕，不碰上游。
+        # 先挡背景请求：Codex 自己发的（记忆整理／环境建议／自动复核）
+        # 不算「使用者实际使用」，一律本地拒绝，不碰上游。
         if BLOCK_BACKGROUND_REQUESTS:
             reason = background_request_reason(payload)
             if reason:
@@ -8720,16 +14664,8 @@ class Handler(BaseHTTPRequestHandler):
                         % (payload.get("model"), reason), level="INFO")
                 except Exception:
                     pass
-                if path in ("/v1/messages", "/messages",
-                            "/v1/messages/count_tokens", "/messages/count_tokens"):
-                    return self._anthropic_error(400, background_request_message(reason),
-                                                 "invalid_request_error")
                 return self._error(400, background_request_message(reason),
                                    "invalid_request_error")
-        if path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
-            return self._handle_anthropic_count_tokens(payload)
-        if path in ("/v1/messages", "/messages"):
-            return self._handle_anthropic_messages(payload)
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
         # Diagnostics: what the client actually asked for, and what we forward.
@@ -8764,7 +14700,8 @@ class Handler(BaseHTTPRequestHandler):
             if key_blocked:
                 return self._error(400, key_blocked, "invalid_request_error")
             upstream, account, effort = open_upstream(
-                payload, session_key=session_key, target_realm=req_realm)
+                payload, session_key=session_key, target_realm=req_realm,
+                prebuilt_body=forwarded)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -8907,6 +14844,15 @@ class Handler(BaseHTTPRequestHandler):
                      fp=fp, account=account.uid, key=self._key_id(), effort=effort)
         return self._json(200, result)
 
+def running_version():
+    """The version this process reports, e.g. "1.6.19".
+
+    tests/_test_release_engineering.py pins the two version literals and asserts
+    they agree, so the update checker reads the running one from the handler
+    instead of becoming a third copy that could drift away from both.
+    """
+    return Handler.server_version.split("/", 1)[-1]
+
 def main():
     args = _parse_cli_args()
     _apply_cli_overrides(args)
@@ -8945,7 +14891,7 @@ def _parse_cli_args():
     return args
 
 def _apply_cli_overrides(args):
-    global USAGE_DIR, USAGE_LOG
+    global USAGE_DIR, USAGE_LOG, LIMIT_EVENTS_FILE, ESTIMATE_DAILY_FILE
     # LAN mode binds every interface. The key is generated below, once
     # ACCOUNTS_DIR is resolved, so it can be persisted and reused.
     if args.lan and args.host == "127.0.0.1":
@@ -8956,6 +14902,15 @@ def _apply_cli_overrides(args):
     if args.usage_dir:
         USAGE_DIR = os.path.abspath(args.usage_dir)
         USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
+        # 事件日志（remaining 预算样本的来源）必须跟着 --usage-dir 走：这个
+        # 常量在 import 时按默认目录算过，漏掉它真机上会一直写 ENOENT
+        # （2026-10-10 实测 /usr/lib/workbuddy2api/usage/limit-events.jsonl）。
+        LIMIT_EVENTS_FILE = os.path.join(USAGE_DIR, "limit-events.jsonl")
+        # 按天归档的估算数据同理（少了它，跨天归档会一直写默认目录/ENOENT）。
+        ESTIMATE_DAILY_FILE = os.path.join(USAGE_DIR, "estimate-daily.json")
+    # 账号活动历史与用量日志同目录，并且要在任何后台线程起来之前定下来：调度器
+    # 的第一轮巡检不能落在 --usage-dir 生效之前，否则记录会写进默认目录。
+    wb_activity.set_data_dir(USAGE_DIR)
 
 def _probe_running_instance(args):
     # Refuse to start a second copy. On Windows SO_REUSEADDR lets two sockets
@@ -9032,9 +14987,11 @@ def _bootstrap_runtime(args):
     POOL.load()
     POOL.apply_proxy_slots()
     POOL.apply_reserve_credits()
-    apply_daily_token_limit()
-    apply_daily_credit_limit()
-    apply_model_daily_token_limit()
+    # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
+    # just loaded. Runs before the listener exists, so no request can hold a
+    # slot yet and the semaphore swap is safe.
+    resize_chat_slots(POOL.count_ready())
+    apply_daily_guards()
     load_persisted_realm()
     global SCHEDULER
     from wb_scheduler import Scheduler
@@ -9052,6 +15009,22 @@ def _bootstrap_runtime(args):
     PRICING = wb_pricing.PriceRefresher(
         wb_settings.pricing_refresh_minutes(ACCOUNTS_DIR))
     PRICING.start()
+    # Credit balances back the expiring-credits dispatch preference, and only
+    # the sign-in / daily-activity tasks used to refresh them. The refresher
+    # keeps them current in the background so no request pays for a lookup.
+    global CREDITS_REFRESHER
+    CREDITS_REFRESHER = wb_accounts.CreditsRefresher(POOL)
+    CREDITS_REFRESHER.start()
+    global UPDATES
+    # Release discovery only: the checker asks GitHub what the newest stable
+    # release is and reports it. It never downloads, replaces or restarts
+    # anything, and with the daily switch off (the default) it sends nothing.
+    UPDATES = wb_updates.UpdateChecker(
+        current_version=running_version(),
+        settings_dir=ACCOUNTS_DIR,
+        log=lambda msg: add_log_entry("[更新] %s" % msg, tag="update"),
+    )
+    UPDATES.start()
     return api_key_generated
 
 def _report_first_run(args):
@@ -9151,9 +15124,20 @@ def _log_startup_summary(args, api_key_generated):
         print()
         sys.stdout.flush()
 
+class GatewayServer(ThreadingHTTPServer):
+    """主服务的 HTTP 服务类：只为把 listen backlog 从 stdlib 默认的 5 提到 128。
+
+    backlog=5 在突发并发下（面板打开一页就是 ~7 个并发请求，多标签更糟）会让
+    内核来不及 accept 的 SYN 被丢弃、客户端按 1s 粒度重传，表现为一部分请求整整
+    慢 1 秒（路由器实测：64 并发突发 43/64 卡 >=1s、最长 2.8s；backlog=128 后
+    0/64、最长 0.18s）。listen() 在 TCPServer.__init__ 里就被调用，所以必须是
+    类属性——实例化之后再改就晚了。
+    """
+    request_queue_size = 128
+
 def _serve_forever(args):
     try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
+        server = GatewayServer((args.host, args.port), Handler)
     except OSError as exc:
         # Port stolen between the probe above and this bind, or held by
         # something that does not answer /health: report it in plain words

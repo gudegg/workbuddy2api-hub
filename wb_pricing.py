@@ -1197,6 +1197,25 @@ def set_settings_dir(path):
     _settings_dir_override = path
 
 
+# 请求路径上每一行都要问一次总开关，而 settings_path 每次都要把固定文件名
+# join 到 accounts 目录上——现场那份逐行剖面里 os.path.join 排第二，其中约
+# 三分之一就是这里。它只是一次 join，同一个目录永远给同一个字符串，所以按
+# 目录缓存一次即可：目录变了键就变，不需要别的失效条件。
+_settings_path_cache = {}
+_MEMO_LIMIT = 512
+
+
+def _memo_put(cache, key, value):
+    """写一个小的派生值缓存（按对象身份或按目录字符串做键），超上限就整体清空。
+
+    只放由对象内容决定的派生值，所以清空只会让下一次多算一遍，正确性不依赖
+    任何驱逐策略；并发下最坏是两个线程各算一遍，交回的是等价的两份。
+    """
+    if len(cache) > _MEMO_LIMIT:
+        cache.clear()
+    cache[key] = value
+
+
 def _cached_switch(cache, lock, reader, accounts_dir, default):
     """读一个存在 settings.json 里的开关，按 (path, mtime, size) 缓存。
 
@@ -1209,8 +1228,16 @@ def _cached_switch(cache, lock, reader, accounts_dir, default):
         if not path:
             return default
         try:
-            settings = wb_settings.settings_path(path)
-            key = (settings, os.path.getmtime(settings), os.path.getsize(settings))
+            settings = _settings_path_cache.get(path)
+            if settings is None:
+                settings = wb_settings.settings_path(path)
+                _memo_put(_settings_path_cache, path, settings)
+            # 一次 stat 同时取 mtime 和 size：请求路径上每一行都要问一次这个
+            # 开关，getmtime + getsize 是两次系统调用。缓存键与原来完全一致
+            # （getmtime/getsize 就是 st_mtime/st_size），所以外部改设置仍然
+            # 当场可见——这个开关不能有 TTL。
+            info = os.stat(settings)
+            key = (settings, info.st_mtime, info.st_size)
         except OSError:
             key = (path, None, None)
         with lock:
@@ -1418,17 +1445,39 @@ def set_data_dir(path):
         _timeline_cache.update({"key": None, "data": None})
 
 
+# 聚合一份两万行的日志时，每一行都要问几次「策略表 / 时间线 / 覆盖表在哪」，
+# 每个问题都是一次 os.path.join，而数据目录在一次聚合里根本不会变。四个派生
+# 路径按目录字符串缓存——键就是 data_dir() 本身，所以目录一变（面板换数据
+# 目录、测试里每个用例一个临时目录）自然落到新键上，返回的字符串与逐个
+# os.path.join 拼出来的完全一致。
+_paths_cache = {}
+
+
+def _data_paths():
+    """(策略表, 时间线, usage 日志, 覆盖表) —— 当前数据目录下的四个路径。"""
+    base = data_dir()
+    hit = _paths_cache.get(base)
+    if hit is not None:
+        return hit
+    hit = (os.path.join(base, "pricing-policies.jsonl"),
+           os.path.join(base, "pricing-timeline.jsonl"),
+           os.path.join(base, "usage.jsonl"),
+           os.path.join(base, "pricing-overrides.json"))
+    _memo_put(_paths_cache, base, hit)
+    return hit
+
+
 def policies_path():
-    return os.path.join(data_dir(), "pricing-policies.jsonl")
+    return _data_paths()[0]
 
 
 def timeline_path():
-    return os.path.join(data_dir(), "pricing-timeline.jsonl")
+    return _data_paths()[1]
 
 
 def usage_log_path():
     """The usage log, which wb_proxy keeps in the same folder."""
-    return os.path.join(data_dir(), "usage.jsonl")
+    return _data_paths()[2]
 
 
 def overrides_path():
@@ -1437,7 +1486,7 @@ def overrides_path():
     与源码里的 OVERRIDES 分开：面板写的是运行期覆盖，落在 usage/ 数据目录
     里，升级镜像不会丢，也不会被镜像覆盖。
     """
-    return os.path.join(data_dir(), "pricing-overrides.json")
+    return _data_paths()[3]
 
 
 _runtime_overrides_cache = {"key": None, "data": {}}
@@ -1498,11 +1547,47 @@ def save_runtime_override(model, or_id):
     return data
 
 
+# 仪表盘聚合整份 usage 日志时，每一行都要问一次「策略表 / 时间线文件变了
+# 吗」，一次询问就是一次 stat——路由器上这是这趟扫描最大的一项开销。答案按
+# 路径缓存一个很短的 TTL：本进程之外写下的变更最迟 _FILE_KEY_TTL 秒内一定
+# 被看见（一次聚合里 stat 从每行数次降到每秒一次），而本进程自己的写入立刻
+# 作废缓存（见 _forget_file_key），所以「刚记完价的那一行」一行都不等。
+_FILE_KEY_TTL = 1.0
+_file_key_cache = {}
+_file_key_lock = threading.Lock()
+
+
+def _forget_file_key(path):
+    """作废一个本进程刚写过的文件的 stat 缓存。
+
+    写入方在写完之后立刻调用，把「自己写的变更」从 TTL 里摘出来：策略表在
+    取价后的下一行就要能被读到，不能等满一个 TTL。
+    """
+    with _file_key_lock:
+        _file_key_cache.pop(path, None)
+
+
 def _file_key(path):
+    """(path, mtime, size)，按路径缓存 TTL；取不到时 None。"""
+    now = time.monotonic()
+    with _file_key_lock:
+        hit = _file_key_cache.get(path)
+        if hit is not None and hit[0] > now:
+            return hit[1]
     try:
-        return (path, os.path.getmtime(path), os.path.getsize(path))
+        # 一次 stat 同时取 mtime 和 size，比 getmtime + getsize 少一次系统调用。
+        info = os.stat(path)
+        key = (path, info.st_mtime, info.st_size)
     except OSError:
-        return None
+        key = None
+    with _file_key_lock:
+        if len(_file_key_cache) > 32:
+            # 正常进程里只有数据目录下那两三个文件；这里只为「路径会换」的场合
+            # 兜底（换过数据目录、测试里每个用例一个临时目录）。清掉只会让下
+            # 一次多 stat 一次，正确性不受任何驱逐策略影响。
+            _file_key_cache.clear()
+        _file_key_cache[path] = (now + _FILE_KEY_TTL, key)
+    return key
 
 
 def _read_jsonl(path):
@@ -1809,8 +1894,22 @@ def gap_items(or_models, by_norm=None, extra_ids=None, variants=None, priced=())
     return items, summary
 
 
+# 一份两万行的日志里，同一个策略要被 policy_entry 重建上万次，而它只由策略行
+# 自己的内容决定，一次都不会变（cost_for_row 自己一次、_details_for 再一次，
+# 现场是每行两次）。按策略对象的身份缓存：策略表刷新后 load_policies 重读文件
+# 交回的是全新的行对象，键自然不同，旧缓存再也命中不到；缓存里同时握着策略
+# 对象本身，所以身份不可能在对象被回收后被复用（命中时还会再确认一次）。
+# 缓存的 entry 只被 compute_row 与 _details_for 读，从不交给调用方，也没有人
+# 改它（rates 由 _details_for 另拷一份），所以外面看到的还是各自独立的 dict。
+_entry_memo = {}
+
+
 def policy_entry(policy):
     """A policy record turned back into the entry the cost engine expects."""
+    key = id(policy)
+    hit = _entry_memo.get(key)
+    if hit is not None and hit[0] is policy:
+        return hit[1]
     entry = {
         "display": policy.get("model"),
         "source": "openrouter",
@@ -1826,6 +1925,7 @@ def policy_entry(policy):
     }
     if policy.get("bands"):
         entry["bands"] = policy["bands"]
+    _memo_put(_entry_memo, key, (policy, entry))
     return entry
 
 
@@ -1893,6 +1993,7 @@ def record_policies(doc, at=None, merge=False):
                 for row in fresh:
                     fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             _policies_cache.update({"key": None, "data": None})
+            _forget_file_key(path)
         changed = False
         if assignment and assignment != previous:
             path = timeline_path()
@@ -1901,6 +2002,7 @@ def record_policies(doc, at=None, merge=False):
                 fh.write(json.dumps({"at": stamp, "policies": assignment},
                                     ensure_ascii=False) + "\n")
             _timeline_cache.update({"key": None, "data": None})
+            _forget_file_key(path)
             changed = True
     return len(fresh), changed, assignment
 
@@ -1958,7 +2060,27 @@ def prune_policies(protect=()):
                     fh.write(json.dumps(policy, ensure_ascii=False) + "\n")
         os.replace(tmp, path)
         _policies_cache.update({"key": None, "data": None})
+        _forget_file_key(path)
     return removed
+
+
+# load_timeline() 对同一份文件内容交回的是同一个列表对象，所以「是不是同一份
+# 时间线」直接用对象身份判断即可。policy_ref_at 每行都要二分一次，而每行把整条
+# 时间线的 at 重新取一遍再转 float 是白花的（现场 46 行 × 每行一次，实测是聚合
+# 里可观的一块）；时刻列随列表一起缓存，改文件后 load_timeline 交回新对象，
+# 这里自然重算。
+_timeline_ats_cache = {"rows": None, "ats": None}
+
+
+def _timeline_ats(timeline):
+    """这条时间线的时刻列，随它自己的对象缓存一次。"""
+    cached = _timeline_ats_cache
+    if cached["rows"] is timeline:
+        return cached["ats"]
+    ats = [_as_float(r.get("at")) for r in timeline]
+    with _policy_lock:
+        _timeline_ats_cache.update({"rows": timeline, "ats": ats})
+    return ats
 
 
 def policy_ref_at(epoch_sec, model):
@@ -1975,7 +2097,7 @@ def policy_ref_at(epoch_sec, model):
     if not timeline:
         return None, False
     stamp = _as_float(epoch_sec)
-    index = bisect.bisect_right([_as_float(r.get("at")) for r in timeline], stamp) - 1
+    index = bisect.bisect_right(_timeline_ats(timeline), stamp) - 1
     if index < 0:
         index = 0
     rows = timeline[index].get("policies") or {}
@@ -2054,13 +2176,40 @@ def _no_details():
     return {key: None for key in _DETAIL_KEYS}
 
 
+# 明细整块只由 entry、它落在的那一档、meta 和行上的模型名决定——前三个在策略表
+# （或出厂快照文件）刷新前一直是同一批对象（策略行的 entry 由 policy_entry 缓存
+# 交回，所以同一策略的行拿到的是同一个 entry）。按它们的身份缓存一份模板，
+# 命中时只把 rates 拷一份出来：与逐字段重建的结果逐键一致（含键序），而每个
+# 调用方拿到的 rates 仍是自己的副本，和从前一样。
+#
+# 唯一读外部状态的是 match_source 对「没有 via 的老策略行」的推断，那种行的
+# 解释会随覆盖表变化，所以它们一次都不进缓存（缓存键里没有覆盖表的状态，
+# 也就不可能给出一份过期的解释）；记着 via 的行根本不查覆盖表，缓存才成立。
+#
+# 键是身份，值里必须同时握着这三个对象：身份只在对象活着的时候唯一，缓存自己
+# 拿住引用，键才不会被回收后的新对象复用（这正是策略表刷新时换上的那批新行）。
+_details_memo = {}
+
+
 def _details_for(cost, entry, meta, model):
     """这一行实际用的价摊开：档位说明、三档单价、汇率、匹配来源。"""
     if not cost.get("known") or not isinstance(entry, dict):
         return _no_details()
+    rates = cost.get("rates")
+    recorded = entry.get("via")
+    key = None
+    if recorded in ("variant", "override", "direct"):
+        key = (id(entry), id(meta), id(rates), cost.get("band"), model)
+        hit = _details_memo.get(key)
+        if hit is not None:
+            # hit 是 (entry, meta, rates, 模板)：模板照抄一份，rates 按源表另拷。
+            out = dict(hit[3])
+            out["rates"] = dict(hit[2] or {})
+            return out
     via, inherited, override_from, derived = match_source(entry, model)
-    return {
-        "rates": dict(cost.get("rates") or {}),
+    template = {
+        # 源表：交给调用方的那一份在下面另拷，缓存里留的是原对象。
+        "rates": rates or {},
         "unit": _as_float(entry.get("unit")) or 1000000.0,
         "currency": entry.get("currency") or "USD",
         "usd_cny": _as_float((meta or {}).get("usd_cny")),
@@ -2071,9 +2220,14 @@ def _details_for(cost, entry, meta, model):
         "band_note": band_note(entry, cost.get("band")),
         "via_derived": derived,
     }
+    if key is not None:
+        _memo_put(_details_memo, key, (entry, meta, rates, template))
+    out = dict(template)
+    out["rates"] = dict(rates or {})
+    return out
 
 
-def cost_for_row(row):
+def cost_for_row(row, details=True, enabled=None):
     """A usage row -> {"cny", "known", "band", "source", "source_at", "backfilled"}
     外加悬停要用的价格明细（rates / unit / currency / usd_cny / or_id / via /
     inherited_from / override_from / band_note / via_derived）。
@@ -2089,13 +2243,24 @@ def cost_for_row(row):
     总开关关闭时整块功能停摆：不查策略、不查快照、不折算，直接按「未定价」
     返回并打上 disabled 标记，面板据此显示「—」；与真正没有价的模型走同一条
     路径，但汇总侧能区分「没价」和「功能关着」，不会误报未定价清单。
+
+    `details=False` 是聚合扫描（/usage 快照、指标页整表）用的：那两处每行
+    只读 `known` / `cny`（外加 disabled 标记），悬停明细构造出来就被丢掉，
+    而每行都要为此付 policy_entry + _details_for 的钱。逐行展示路径（最近
+    请求的悬停气泡）不传这个参数，明细照旧。
+
+    `enabled` 是同一件事对总开关的延伸：聚合扫描在循环外把开关问一次传进来
+    （None 表示逐行自己查，逐行路径「每行都查、改设置当场生效」的原语义不
+    变）。聚合因此看到的是扫描开始那一刻的开关值：设置改动从下一次扫描起
+    生效——整表本来就是一次快照，这与其它字段的口径一致。
     """
-    if not row or not pricing_enabled():
+    if not row or not (pricing_enabled() if enabled is None else enabled):
         cost = {"cny": 0.0, "known": False, "band": None, "source": "builtin",
                 "source_at": None, "backfilled": False}
         if row:
             cost["disabled"] = True
-        cost.update(_no_details())
+        if details:
+            cost.update(_no_details())
         return cost
     model = row.get("model")
     pid = row.get("cost_policy")
@@ -2108,7 +2273,8 @@ def cost_for_row(row):
         cost["source"] = pid
         cost["source_at"] = _as_float(policy.get("first_seen"))
         cost["backfilled"] = backfilled
-        cost.update(_details_for(cost, policy_entry(policy), policy, model))
+        if details:
+            cost.update(_details_for(cost, policy_entry(policy), policy, model))
         return cost
     doc = load_pricing()
     entry = (doc.get("models") or {}).get(model)
@@ -2116,7 +2282,8 @@ def cost_for_row(row):
     cost["source"] = "builtin"
     cost["source_at"] = None
     cost["backfilled"] = False
-    cost.update(_details_for(cost, entry, doc.get("meta"), model))
+    if details:
+        cost.update(_details_for(cost, entry, doc.get("meta"), model))
     return cost
 
 

@@ -14,7 +14,7 @@ from email.message import Message
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _test_anthropic_http as http_fixture
+import _test_anthropic_fork_http as http_fixture
 
 P = http_fixture.P
 wb_accounts = http_fixture.wb_accounts
@@ -103,6 +103,19 @@ class AnthropicGuardTests(unittest.TestCase):
             self.assertEqual(row["outcome"], "failed")
             self.assertEqual(row["key"], "guard-key")
             self.assertEqual(row.get("total_tokens", 0), 0)
+
+    def test_background_requests_are_blocked_on_both_anthropic_routes(self):
+        payload = json.dumps({
+            "model": "deepseek-v4.1-flash", "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}],
+            "client_metadata": {"request_kind": "auto_review", "thread_source": "user"},
+        }).encode("utf-8")
+        with mock.patch.object(P, "BLOCK_BACKGROUND_REQUESTS", True):
+            for path in ("/v1/messages", "/v1/messages/count_tokens"):
+                status, _, body = self.http.post(path=path, raw=payload)
+                self.assertEqual(status, 400, body)
+                self.assertEqual(json.loads(body)["error"]["type"], "invalid_request_error")
+        self.assertEqual(self.http.forwarded, [])
 
     def test_allowed_model_records_request_key_in_both_response_modes(self):
         self.configure_key(models=["deepseek*"])
@@ -204,9 +217,15 @@ class AnthropicGuardTests(unittest.TestCase):
                     self.assertEqual(status, 503, body)
                     error = json.loads(body)
                     self.assertEqual(error.get("type"), "error")
-                    self.assertEqual(error["error"]["type"], "api_error")
+                    self.assertEqual(error["error"]["type"], "overloaded_error")
         self.assertEqual(self.http.forwarded, [])
-        self.assertEqual(self.http.usage_rows(), [])
+        rows = self.http.usage_rows()
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["outcome"], "failed")
+            self.assertEqual(row["status"], 503)
+            self.assertEqual(row["key"], "guard-key")
+            self.assertEqual(row.get("total_tokens", 0), 0)
         self.assertFalse(semaphore.acquire(blocking=False))
         semaphore.release()
 

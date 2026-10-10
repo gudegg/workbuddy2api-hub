@@ -30,6 +30,16 @@ LEGACY_PRICING_REFRESH_HOURS_KEY = "pricing_refresh_hours"
 PRICING_REFRESH_MINUTES_KEY = "pricing_refresh_minutes"
 # A month, the old cap converted: 720 hours = 43200 minutes.
 MAX_PRICING_REFRESH_MINUTES = 24 * 30 * 60
+# How stale an account's credit balance may get before the background
+# refresher updates it, in hours. Only the sign-in / daily-activity tasks used
+# to refresh balances, so a dispatch decision could rest on a balance days old.
+# 12 hours is deliberately slack: the preference is measured in days, so half a
+# day of drift moves an account by at most half a day inside a 7-day window,
+# and the wider TTL keeps the refresher from spending upstream billing calls it
+# does not need.
+DEFAULT_CREDITS_REFRESH_HOURS = 12.0
+MAX_CREDITS_REFRESH_HOURS = 24 * 30
+CREDITS_REFRESH_HOURS_KEY = "credits_refresh_hours"
 # Whether a model name may inherit its price from a suffix-stripped base
 # (deepseek-r1-0528-lkeap → deepseek-r1-0528). Missing key reads as on.
 PRICING_VARIANT_INHERIT_KEY = "pricing_variant_inherit"
@@ -37,6 +47,59 @@ PRICING_VARIANT_INHERIT_KEY = "pricing_variant_inherit"
 # reads as on: an install that predates the setting behaves exactly as it did,
 # and only an explicit false turns the feature off.
 PRICING_ENABLED_KEY = "pricing_enabled"
+# Whether the panel's account section is collapsed. Missing, or anything that is
+# not the boolean true, reads as expanded: a fresh install and a value a hand
+# edit or an older client left behind both keep the default view, and only an
+# explicit true hides the accounts.
+ACCOUNTS_COLLAPSED_KEY = "accounts_collapsed"
+# Whether the panel's per-API-key table folds away its `(切换前)` row - the
+# legacy tail of requests logged before the key field existed. Same
+# normalisation as the disclosure above: only an explicit boolean true hides
+# the row, so a hand edit or an older client cannot drop it by accident.
+KEY_BEFORE_HIDDEN_KEY = "key_before_hidden"
+# Which top-bar pages the panel keeps out of the nav, as a list of page keys
+# ("tasks", "logs", ...). Deliberately not validated against a page registry:
+# the pages live in dashboard.html, and the panel ignores a key it does not
+# know, so adding or renaming a page upstream never needs a change here. A
+# missing key, a hand-written string or any other malformed value reads as
+# "nothing hidden" - the fail-safe direction for a display preference.
+HIDDEN_PAGES_KEY = "hidden_pages"
+# Page keys are the same lowercase identifiers switchMainTab() switches on.
+PAGE_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+# The one page that is never hidden, whatever the request or the file says: it
+# is where this switch itself lives, so hiding it would leave the panel with no
+# way back. Dropped during normalisation, so the stored file cannot hold it
+# either and no client of this API can lock itself out.
+PAGE_KEEP_VISIBLE = "settings"
+# Bound on the stored list. The panel sends at most one entry per page, so this
+# only limits what a hand edit can put in the file.
+MAX_HIDDEN_PAGES = 32
+# Whether the panel's account sections get a main tab of their own instead of
+# sharing the gateway page. Missing, or anything that is not the boolean true,
+# reads as off: an install that predates the setting keeps the single
+# "网关与账号" tab it has always had, and only an explicit true splits it into
+# 网关 + 账号. Same `is True` normalisation as the two switches above, so a
+# hand-edited "false", a 1 or an object cannot split the nav by accident.
+ACCOUNTS_SEPARATE_TAB_KEY = "accounts_separate_tab"
+
+# Instance-wide default UI language. The dashboard can override this per
+# browser with localStorage; this key is the fallback when no override exists.
+UI_LANGUAGE_KEY = "ui_language"
+UI_LANGUAGE_DEFAULT = "zh"
+UI_LANGUAGE_VALUES = ("zh", "zh-Hant", "en")
+
+# Whether the gateway checks GitHub for a newer release once a day. Missing key
+# reads as off - the opposite of the switches above - because turning it on
+# makes the gateway send a request on its own schedule.
+UPDATE_CHECK_ENABLED_KEY = "update_check_enabled"
+# The last-check bookkeeping for that daily check. One small object, never a
+# general update-state store: see update_check_state().
+UPDATE_CHECK_STATE_KEY = "update_check"
+
+# 剩余用量优先调度：把「估计剩余快耗尽」的 (账号, 模型) 先交出去（剩余越少
+# 权重越高）。缺失键读作关：估算本身是从撞线样本反推的，优先它是一次刻意的
+# 取舍（那些组合会明显多接流量），所以老安装保持原样的纯轮询。
+REMAINING_PRIORITY_ENABLED_KEY = "remaining_priority_enabled"
 
 _lock = threading.RLock()
 
@@ -51,19 +114,45 @@ def _digest(password, salt_hex, rounds=PBKDF2_ROUNDS):
     ).hex()
 
 
+# settings.json 的解析结果按 (path, mtime, size) 缓存：请求热路径上它被读约 10
+# 次（prompt_config×2 / api_keys×2 / limits_data×3 / auto_switch_product /
+# upstream_config×2），单次 156~273µs，合计 1.6~2.7ms/请求。所有写入都走 save()
+# 的 os.replace 原子替换，mtime/size 必变，所以面板改动仍然即时生效；save() 里
+# 再主动失效一次，连 mtime 精度粗（FAT 只有 2s）的同尺寸改写也不会读到旧值。
+# 调用方拿到的是顶层浅拷贝：与原实现「每次重新解析、返回值随便改」的语义一致
+# （现网所有 setter 都只改顶层键再 save()，嵌套值按约定只读），改返回值也不会
+# 弄脏缓存。
+_load_cache = {"key": None, "value": {}}
+
+
 def load(accounts_dir):
-    """Return the persisted settings, or an empty dict on a fresh install."""
+    """Return the persisted settings, or an empty dict on a fresh install.
+
+    Cached on (path, mtime, size); the returned dict is a fresh top-level copy
+    so callers keep the previous "mutate freely" semantics.
+    """
     path = settings_path(accounts_dir)
     try:
+        info = os.stat(path)
+        key = (path, info.st_mtime, info.st_size)
+    except OSError:
+        key = (path, None, None)
+    with _lock:
+        if _load_cache["key"] == key:
+            return dict(_load_cache["value"])
+    data = {}
+    try:
         with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return data
+            parsed = json.load(fh)
+        if isinstance(parsed, dict):
+            data = parsed
     except FileNotFoundError:
         pass
     except Exception:
         pass
-    return {}
+    with _lock:
+        _load_cache.update({"key": key, "value": data})
+    return dict(data)
 
 
 def save(accounts_dir, data):
@@ -75,7 +164,28 @@ def save(accounts_dir, data):
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
+        # 写完主动失效：不依赖文件系统 mtime 的精度（FAT 只有 2s），保证同尺寸
+        # 改写的下一个 load() 一定重新读盘。
+        _load_cache["key"] = None
         return path
+
+
+def deep_merge(base, patch):
+    """Recursively merge patch into base; unknown sibling keys survive.
+
+    The panel form only submits the keys it manages. Replacing a whole group
+    would silently drop hand-written or future keys, so nested objects merge
+    key by key. Returns a new dict; the inputs are not mutated.
+    """
+    if not isinstance(base, dict) or not isinstance(patch, dict):
+        return patch
+    out = dict(base)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
 
 
 def panel_password_is_default(accounts_dir):
@@ -316,22 +426,57 @@ def api_keys(accounts_dir, include_deleted=False):
     return []
 
 
-def set_api_keys(accounts_dir, keys):
-    """Replace the whole key list. Returns the saved (live) list.
+def _retired_key_entry(old):
+    """The soft-deleted form of a stored key: name and dates kept, secret gone."""
+    return {
+        "id": old["id"],
+        "name": old["name"],
+        "key": "",
+        "realm": old.get("realm") or "",
+        "models": old.get("models") or [],
+        "enabled": False,
+        "created_at": old.get("created_at") or "",
+        "deleted_at": old.get("deleted_at") or time.strftime("%Y/%m/%d %H:%M"),
+    }
 
-    Removal is a soft delete. The caller is the panel, which can only submit
-    the rows it can see and cannot see deleted ones, so an id that vanishes
-    from the submission is marked deleted instead of dropped: the usage log
-    attributes spend by id, and losing the id would dump a key's whole history
-    into "(未知 key)". The secret is wiped at that same moment, so a deleted
-    key can never authenticate again.
+
+def set_api_keys(accounts_dir, keys, delete_ids=None):
+    """Save the key list. Returns the saved (live) list.
+
+    Removal is a soft delete: the usage log attributes spend by id, so losing
+    an id would dump a key's whole history into "(未知 key)", and the secret is
+    wiped at the same moment so a deleted key can never authenticate again.
+
+    Two modes decide which stored keys get soft-deleted:
+
+    - `delete_ids is None`: replace semantics. Any stored key absent from
+      `keys` is retired. This is what an older panel relies on - it deletes a
+      row by leaving it out of the submission - so it stays the default.
+    - `delete_ids` is a list: upsert semantics. Only those ids are retired; a
+      stored key the submission does not mention is left untouched. The panel
+      uses this because its submission is whatever its in-memory rows happen
+      to be, and a list that is stale or incomplete (a second browser tab, a
+      save that raced the post-save reload, a reload that failed) must not
+      retire a key the user never removed.
     """
     with _lock:
         previous = api_keys(accounts_dir, include_deleted=True)
+        upsert = delete_ids is not None
+        drop = {str(entry_id) for entry_id in (delete_ids or [])}
+        # Upsert mode: a stored live secret, so a submitted row that lost its id
+        # (a stale panel resubmitting a key it already saved) can adopt the
+        # stored id and update that key in place instead of minting a new one
+        # and splitting its usage history in two.
+        live_secret_id = {}
+        if upsert:
+            for old in previous:
+                if old["key"] and not old.get("deleted_at"):
+                    live_secret_id.setdefault(old["key"], old["id"])
         cleaned = []
         seen = set()
         seen_ids = set()
         for raw in keys or []:
+            raw_id = str((raw or {}).get("id") or "").strip() if isinstance(raw, dict) else ""
             entry = _clean_key_entry(raw)
             if entry is None:
                 continue
@@ -339,6 +484,8 @@ def set_api_keys(accounts_dir, keys):
                 if entry["key"] in seen:
                     continue
                 seen.add(entry["key"])
+            if upsert and entry["key"] and raw_id not in live_secret_id.values():
+                entry["id"] = live_secret_id.get(entry["key"], entry["id"])
             entry["id"] = _unique_key_id(entry["id"], seen_ids)
             seen_ids.add(entry["id"])
             cleaned.append(entry)
@@ -346,16 +493,21 @@ def set_api_keys(accounts_dir, keys):
             if old["id"] in seen_ids:
                 continue
             seen_ids.add(old["id"])
-            cleaned.append({
-                "id": old["id"],
-                "name": old["name"],
-                "key": "",
-                "realm": old.get("realm") or "",
-                "models": old.get("models") or [],
-                "enabled": False,
-                "created_at": old.get("created_at") or "",
-                "deleted_at": old.get("deleted_at") or time.strftime("%Y/%m/%d %H:%M"),
-            })
+            # Upsert mode keeps a stored key the submission never mentioned.
+            # An already-deleted row is kept too: it is read-only history.
+            if upsert and old["id"] not in drop:
+                # A submitted row may already carry this exact secret (the
+                # stale submission re-sent it under a fresh id). Two live rows
+                # with one secret is the duplicate this mode exists to avoid,
+                # so the stale stored copy is retired instead.
+                if old["key"] and old["key"] in seen:
+                    cleaned.append(_retired_key_entry(old))
+                    continue
+                if old["key"]:
+                    seen.add(old["key"])
+                cleaned.append(old)
+                continue
+            cleaned.append(_retired_key_entry(old))
         data = load(accounts_dir)
         data["api_keys"] = cleaned
         # The single-key fields are now derived; drop them so there is one
@@ -416,15 +568,29 @@ def set_auth_disabled(accounts_dir, disabled):
 # global value, so an install that never touches it behaves exactly as before,
 # and one that does only ever has to reason about a single number per guard.
 LIMIT_KEYS = ("reserve_credits", "daily_token_limit",
-              "daily_credit_limit", "model_daily_token_limit")
+              "daily_credit_limit", "model_daily_token_limit",
+              "expiring_window_days")
 LIMIT_REALMS = ("intl", "cn")
 LIMIT_SCOPES = ("global",) + LIMIT_REALMS
 LIMITS_KEY = "limits"
 
+# Guards whose global default is not "off". Every key still reads 0 as off;
+# only the expiring-credits window ships enabled, because 0 would make the
+# preference a silent no-op until someone turned it on by hand.
+LIMIT_DEFAULTS = {"expiring_window_days": 7}
 
-def _empty_limit_entry():
+
+def _default_global(key):
+    """The global value an install reads before it ever saves one."""
+    try:
+        return max(0, int(LIMIT_DEFAULTS.get(key, 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _empty_limit_entry(key=None):
     """One guard: a global default plus a slot per realm (None = inherit)."""
-    return {"global": 0, "intl": None, "cn": None}
+    return {"global": _default_global(key), "intl": None, "cn": None}
 
 
 def _coerce_global(value):
@@ -459,7 +625,7 @@ def _fold_legacy_limits(data):
     limits = {}
     changed = False
     for key in LIMIT_KEYS:
-        entry = _empty_limit_entry()
+        entry = _empty_limit_entry(key)
         if key in data:
             entry["global"] = _coerce_global(data.pop(key))
             changed = True
@@ -475,8 +641,14 @@ def _normalize_limits(raw):
         entry = raw.get(key)
         if not isinstance(entry, dict):
             entry = {}
+        global_raw = entry.get("global")
+        # A missing global falls back to that guard's own default (0 for every
+        # guard but the expiring window); an explicit 0 is a real "off" and is
+        # kept as one, so a saved "off" never silently comes back on.
+        global_value = (_default_global(key) if global_raw is None
+                        else _coerce_global(global_raw))
         limits[key] = {
-            "global": _coerce_global(entry.get("global")),
+            "global": global_value,
             "intl": _coerce_override(entry.get("intl")),
             "cn": _coerce_override(entry.get("cn")),
         }
@@ -527,6 +699,27 @@ def limit_value(accounts_dir, key, realm=None):
     return entry.get("global") or 0
 
 
+def limit_values_many(accounts_dir, keys):
+    """Several guards resolved for every realm, off one settings read.
+
+    limit_values() per key re-reads the file (cached by mtime/size, so a stat)
+    and re-normalizes the whole grouped map every call; the daily guards all
+    want the same map on the request path, so they share one read here. One
+    implementation only: limit_values() is this with a single key.
+    """
+    grouped = limits_data(accounts_dir)
+    out = {}
+    for key in keys:
+        entry = grouped.get(key) or _empty_limit_entry()
+        global_value = entry.get("global") or 0
+        values = {"global": global_value}
+        for realm in LIMIT_REALMS:
+            override = entry.get(realm)
+            values[realm] = global_value if override is None else override
+        out[key] = values
+    return out
+
+
 def limit_values(accounts_dir, key):
     """One guard resolved for every realm plus the global it inherits.
 
@@ -534,13 +727,7 @@ def limit_values(accounts_dir, key):
     the global value when no override is set, so the pool can hand each
     account its own realm without a second settings lookup.
     """
-    entry = limits_data(accounts_dir).get(key) or _empty_limit_entry()
-    global_value = entry.get("global") or 0
-    values = {"global": global_value}
-    for realm in LIMIT_REALMS:
-        override = entry.get(realm)
-        values[realm] = global_value if override is None else override
-    return values
+    return limit_values_many(accounts_dir, (key,))[key]
 
 
 def set_limit(accounts_dir, key, scope, value):
@@ -630,6 +817,58 @@ def model_daily_token_limit(accounts_dir, realm=None):
 def set_model_daily_token_limit(accounts_dir, value):
     """Persist the per-model daily token threshold. Returns the stored value."""
     return set_limit(accounts_dir, "model_daily_token_limit", "global", value)["global"]
+
+
+def expiring_window_days(accounts_dir, realm=None):
+    """Window, in days, inside which an account's soonest-expiring credit
+    package makes the pool hand that account out first, so credits about to
+    lapse are spent before they are lost.
+
+    Zero disables the preference and dispatch falls back to a plain
+    round-robin; the shipped default is 7 days.
+    """
+    return limit_value(accounts_dir, "expiring_window_days", realm)
+
+
+def set_expiring_window_days(accounts_dir, value):
+    """Persist the window. Returns the stored value."""
+    return set_limit(accounts_dir, "expiring_window_days", "global", value)["global"]
+
+
+def credits_refresh_hours(accounts_dir):
+    """How stale a credit balance may get before the background refresher
+    updates it, in hours.
+
+    The dispatch preference reads the balance, and only the sign-in and
+    daily-activity tasks used to refresh it, so an account could be judged on a
+    balance days old - or on whatever was on disk when the process started.
+    Zero disables the refresher. Anything not a number falls back to the
+    default, so a hand-edited settings.json cannot wedge the loop.
+    """
+    with _lock:
+        data = load(accounts_dir)
+        raw = data.get(CREDITS_REFRESH_HOURS_KEY)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CREDITS_REFRESH_HOURS
+    if value < 0:
+        return DEFAULT_CREDITS_REFRESH_HOURS
+    return min(value, MAX_CREDITS_REFRESH_HOURS)
+
+
+def set_credits_refresh_hours(accounts_dir, value):
+    """Persist the refresh TTL. Returns the stored value."""
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        hours = 0.0
+    hours = max(0.0, min(MAX_CREDITS_REFRESH_HOURS, hours))
+    with _lock:
+        data = load(accounts_dir)
+        data[CREDITS_REFRESH_HOURS_KEY] = hours
+        save(accounts_dir, data)
+    return hours
 
 
 def _clamp_refresh_minutes(value):
@@ -755,6 +994,135 @@ def set_pricing_enabled(accounts_dir, enabled):
     return enabled
 
 
+def ui_language(accounts_dir):
+    """Instance-wide default UI language (zh / zh-Hant / en)."""
+    value = load(accounts_dir).get(UI_LANGUAGE_KEY)
+    if isinstance(value, str) and value in UI_LANGUAGE_VALUES:
+        return value
+    return UI_LANGUAGE_DEFAULT
+
+
+def set_ui_language(accounts_dir, value):
+    """Persist the instance-wide default UI language."""
+    if not isinstance(value, str) or value not in UI_LANGUAGE_VALUES:
+        raise ValueError("ui_language must be zh, zh-Hant or en")
+    with _lock:
+        data = load(accounts_dir)
+        data[UI_LANGUAGE_KEY] = value
+        save(accounts_dir, data)
+    return value
+
+
+UPSTREAM_DEFAULTS = {
+    "header_timeout_seconds": 120,
+    "idle_timeout_seconds": 300,
+    "device_token": "",
+    "device_token_file": "",
+}
+
+
+def validate_upstream_patch(raw):
+    """Strict validation for a panel-saved upstream patch."""
+    out = {}
+    for key, value in (raw or {}).items():
+        if key in ("header_timeout_seconds", "idle_timeout_seconds"):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("%s must be a whole number of seconds" % key)
+            if value < 1:
+                raise ValueError("%s cannot be less than 1" % key)
+            out[key] = value
+        elif key in ("device_token", "device_token_file"):
+            if not isinstance(value, str):
+                raise ValueError("%s must be a string" % key)
+            out[key] = value.strip()
+        else:
+            raise ValueError("unknown upstream setting %r" % key)
+    return out
+
+
+def upstream_config(accounts_dir):
+    """Chat socket timeouts and the optional X-Device-Token source."""
+    stored = load(accounts_dir).get("upstream")
+    stored = stored if isinstance(stored, dict) else {}
+    out = {}
+    for key, default in UPSTREAM_DEFAULTS.items():
+        value = stored.get(key, default)
+        if key in ("header_timeout_seconds", "idle_timeout_seconds"):
+            out[key] = (value if isinstance(value, int) and not isinstance(value, bool)
+                        and value >= 1 else default)
+        else:
+            out[key] = value.strip() if isinstance(value, str) else default
+    return out
+
+
+def set_upstream_config(accounts_dir, cfg):
+    """Persist the upstream settings. Returns the stored config."""
+    current = upstream_config(accounts_dir)
+    if isinstance(cfg, dict):
+        current.update({k: v for k, v in cfg.items() if k in UPSTREAM_DEFAULTS})
+    clean = validate_upstream_patch(current)
+    with _lock:
+        data = load(accounts_dir)
+        data["upstream"] = deep_merge(data.get("upstream"), clean)
+        save(accounts_dir, data)
+    return clean
+
+
+PROMPT_DEFAULTS = {
+    "mode": "passthrough",
+    "file": "",
+}
+
+
+def validate_prompt_patch(raw):
+    """Strict validation for a panel-saved prompt patch."""
+    out = {}
+    for key, value in (raw or {}).items():
+        if key == "mode":
+            if not isinstance(value, str):
+                raise ValueError("prompt mode must be a string")
+            mode = value.strip().lower()
+            if mode not in ("passthrough", "custom", "append"):
+                raise ValueError("prompt mode must be passthrough, custom or append")
+            out["mode"] = mode
+        elif key == "file":
+            if not isinstance(value, str):
+                raise ValueError("prompt file must be a string")
+            out["file"] = value.strip()
+        else:
+            raise ValueError("unknown prompt setting %r" % key)
+    return out
+
+
+def prompt_config(accounts_dir):
+    """Gateway system-prompt mode (default passthrough = legacy behaviour)."""
+    stored = load(accounts_dir).get("prompt")
+    stored = stored if isinstance(stored, dict) else {}
+    mode = stored.get("mode", PROMPT_DEFAULTS["mode"])
+    if not isinstance(mode, str) or mode.strip().lower() not in (
+            "passthrough", "custom", "append"):
+        mode = PROMPT_DEFAULTS["mode"]
+    else:
+        mode = mode.strip().lower()
+    file_path = stored.get("file", PROMPT_DEFAULTS["file"])
+    if not isinstance(file_path, str):
+        file_path = PROMPT_DEFAULTS["file"]
+    return {"mode": mode, "file": file_path.strip()}
+
+
+def set_prompt_config(accounts_dir, cfg):
+    """Persist the prompt settings. Returns the stored config."""
+    current = prompt_config(accounts_dir)
+    if isinstance(cfg, dict):
+        current.update({k: v for k, v in cfg.items() if k in PROMPT_DEFAULTS})
+    clean = validate_prompt_patch(current)
+    with _lock:
+        data = load(accounts_dir)
+        data["prompt"] = clean
+        save(accounts_dir, data)
+    return clean
+
+
 def auto_switch_product(accounts_dir):
     """Whether an upstream 429 may rotate an account's outbound identity.
 
@@ -772,6 +1140,30 @@ def set_auto_switch_product(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data["auto_switch_product"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def remaining_priority_enabled(accounts_dir):
+    """Whether pairs close to their estimated remaining quota are served first.
+
+    Off unless the operator turns it on. The remaining-usage estimate is
+    inferred from cap events and the usage log, and preferring the pairs that
+    are close to their estimated limit is a deliberate trade: they take a
+    visibly larger share of the traffic, which is the point of the preference
+    (spend the quota that would otherwise lapse with the window). An install
+    that predates the switch keeps the plain round-robin, so nothing changes
+    until it is explicitly turned on.
+    """
+    return load(accounts_dir).get(REMAINING_PRIORITY_ENABLED_KEY) is True
+
+
+def set_remaining_priority_enabled(accounts_dir, enabled):
+    """Persist the remaining-usage priority switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[REMAINING_PRIORITY_ENABLED_KEY] = enabled
         save(accounts_dir, data)
     return enabled
 
@@ -820,6 +1212,179 @@ def set_local_web_tools(accounts_dir, enabled):
         data["local_web_tools"] = enabled
         save(accounts_dir, data)
     return enabled
+
+
+def accounts_collapsed(accounts_dir):
+    """Whether the panel's account section is collapsed.
+
+    Expanded unless the stored value is the boolean true. `is True` is the whole
+    normalisation: a hand-edited "false", a 1, an object or a missing key all
+    read as expanded, so none of them can hide the accounts by accident. The
+    panel only ever writes a real boolean through set_accounts_collapsed.
+    """
+    return load(accounts_dir).get(ACCOUNTS_COLLAPSED_KEY) is True
+
+
+def set_accounts_collapsed(accounts_dir, collapsed):
+    """Persist the account-section disclosure state. Returns the stored boolean."""
+    collapsed = bool(collapsed)
+    with _lock:
+        data = load(accounts_dir)
+        data[ACCOUNTS_COLLAPSED_KEY] = collapsed
+        save(accounts_dir, data)
+    return collapsed
+
+
+def key_before_hidden(accounts_dir):
+    """Whether the per-API-key table folds away its `(切换前)` row.
+
+    Shown unless the stored value is the boolean true, with the same `is True`
+    normalisation as accounts_collapsed: the row is history worth seeing, so a
+    hand-edited "false", a 1, an object or a missing key must all leave it
+    visible rather than hide it by accident.
+    """
+    return load(accounts_dir).get(KEY_BEFORE_HIDDEN_KEY) is True
+
+
+def set_key_before_hidden(accounts_dir, hidden):
+    """Persist the `(切换前)` row disclosure state. Returns the stored boolean."""
+    hidden = bool(hidden)
+    with _lock:
+        data = load(accounts_dir)
+        data[KEY_BEFORE_HIDDEN_KEY] = hidden
+        save(accounts_dir, data)
+    return hidden
+
+
+def _clean_page_keys(value):
+    """Normalise a stored or patched page list into a clean list of keys.
+
+    Anything that is not a list of well-formed keys is dropped rather than
+    rejected, for the same reason the booleans above normalise instead of
+    raising: the file is hand-editable, and the fail-safe direction for a
+    display preference is "nothing hidden". Duplicates and over-long lists are
+    collapsed so a hand edit cannot turn the panel's nav into a repeat of one
+    entry.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    out = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        key = item.strip()
+        if not PAGE_KEY_RE.match(key) or key == PAGE_KEEP_VISIBLE or key in out:
+            continue
+        out.append(key)
+        if len(out) >= MAX_HIDDEN_PAGES:
+            break
+    return out
+
+
+def hidden_pages(accounts_dir):
+    """The top-bar pages the panel hides. Empty on a fresh install.
+
+    Normalised on every read, so a hand edit that puts a string, an unknown key
+    or a duplicate in the file cannot hide a page twice or hide something the
+    panel would then be unable to put back.
+    """
+    return _clean_page_keys(load(accounts_dir).get(HIDDEN_PAGES_KEY))
+
+
+def set_hidden_pages(accounts_dir, pages):
+    """Persist the hidden-page list. Returns the stored (normalised) list."""
+    cleaned = _clean_page_keys(pages)
+    with _lock:
+        data = load(accounts_dir)
+        data[HIDDEN_PAGES_KEY] = cleaned
+        save(accounts_dir, data)
+    return cleaned
+
+
+def accounts_separate_tab(accounts_dir):
+    """Whether the panel gives the account sections a main tab of their own.
+
+    Off unless the stored value is the boolean true, with the same `is True`
+    normalisation as the disclosures above: the merged "网关与账号" tab is what
+    every install has always shown, so a hand-edited "false", a 1, an object or
+    a missing key must all keep it rather than split the nav by accident.
+    """
+    return load(accounts_dir).get(ACCOUNTS_SEPARATE_TAB_KEY) is True
+
+
+def set_accounts_separate_tab(accounts_dir, separate):
+    """Persist the account-tab switch. Returns the stored boolean."""
+    separate = bool(separate)
+    with _lock:
+        data = load(accounts_dir)
+        data[ACCOUNTS_SEPARATE_TAB_KEY] = separate
+        save(accounts_dir, data)
+    return separate
+
+
+def update_check_enabled(accounts_dir):
+    """Whether the gateway checks for a newer release once a day.
+
+    Off unless the operator turns it on, and off for an install that predates
+    the key: this is the one setting here whose missing value means "no", since
+    enabling it makes the gateway talk to GitHub on its own schedule. The manual
+    check in the panel ignores this switch entirely.
+    """
+    return load(accounts_dir).get(UPDATE_CHECK_ENABLED_KEY) is True
+
+
+def set_update_check_enabled(accounts_dir, enabled):
+    """Persist the daily-check switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[UPDATE_CHECK_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def update_check_state(accounts_dir):
+    """The last-check bookkeeping: when it ran, and the version it saw.
+
+    Deliberately three fields. The 24h cadence needs `last_attempt` to survive a
+    restart, and `latest_version` is what lets the panel answer right after one;
+    everything else about a check lives in memory. Nothing from the HTTP
+    exchange - URL, headers, body - is ever stored here.
+    """
+    stored = load(accounts_dir).get(UPDATE_CHECK_STATE_KEY)
+    stored = stored if isinstance(stored, dict) else {}
+    out = {"last_attempt": 0.0, "last_success": 0.0, "latest_version": ""}
+    for key in ("last_attempt", "last_success"):
+        value = stored.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            out[key] = float(value)
+    version = stored.get("latest_version")
+    if isinstance(version, str):
+        out["latest_version"] = version.strip()[:32]
+    return out
+
+
+def record_update_check(accounts_dir, at=None, success=False, latest_version=""):
+    """Write one check's outcome. Returns the stored state.
+
+    One narrow write path on purpose: a checker that could write arbitrary keys
+    into settings.json would turn it into an update-state database, which is
+    what this is meant not to become.
+    """
+    stamp = float(at if at is not None else time.time())
+    with _lock:
+        data = load(accounts_dir)
+        state = data.get(UPDATE_CHECK_STATE_KEY)
+        state = dict(state) if isinstance(state, dict) else {}
+        state["last_attempt"] = stamp
+        if success:
+            state["last_success"] = stamp
+        version = str(latest_version or "").strip()[:32]
+        if version:
+            state["latest_version"] = version
+        data[UPDATE_CHECK_STATE_KEY] = state
+        save(accounts_dir, data)
+    return update_check_state(accounts_dir)
 
 
 _SLOT_ID_RE = re.compile(r"^slot-(\d+)$")

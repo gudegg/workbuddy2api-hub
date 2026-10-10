@@ -1,11 +1,19 @@
 """Deterministic tests for proxy-slot definitions (no network)."""
 
+import atexit
 import json
 import os
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# One private directory tree, removed when this process exits. It holds the
+# per-section settings/account stores below and the USAGE_DIR the suite hands to
+# wb_proxy, so two runs of it cannot share a directory and a run leaves nothing
+# behind in the checkout.
+_TMP = tempfile.TemporaryDirectory(prefix="wb-slots-")
+atexit.register(_TMP.cleanup)
 
 import wb_settings as S
 
@@ -23,7 +31,7 @@ def check(label, cond, extra=""):
 
 
 print("[1] proxy_slots: empty by default, cleaned on read")
-d = tempfile.mkdtemp(prefix="wb-slots-")
+d = os.path.join(_TMP.name, "default")
 check("no key -> empty list", S.proxy_slots(d) == [])
 
 S.save(
@@ -94,7 +102,7 @@ print()
 print("[5] Account: proxySlot persisted, proxy is resolved runtime value")
 import wb_accounts as A
 
-d2 = tempfile.mkdtemp(prefix="wb-slots-acct-")
+d2 = os.path.join(_TMP.name, "account")
 S.set_proxy_slots(d2, [{"id": "slot-1", "name": "one", "url": "http://slot:1"}])
 
 acc = A.Account(
@@ -184,8 +192,8 @@ print()
 print("[8] proxy_slots_view counts only enabled accounts")
 import importlib
 
-os.environ.setdefault("ACCOUNTS_DIR", d2)
-os.environ.setdefault("USAGE_DIR", tempfile.mkdtemp(prefix="wb-slots-use-"))
+os.environ["ACCOUNTS_DIR"] = d2
+os.environ["WB_PROXY_USAGE_DIR"] = os.path.join(_TMP.name, "usage")
 P = importlib.import_module("wb_proxy")
 P.ACCOUNTS_DIR = d2
 P.POOL = pool
@@ -230,7 +238,7 @@ check(
 
 print()
 print("[10] load keeps a disabled account's binding (issue #89)")
-d3 = tempfile.mkdtemp(prefix="wb-slots-migrate-")
+d3 = os.path.join(_TMP.name, "migrate")
 S.set_proxy_slots(d3, [{"id": "slot-1", "name": "one", "url": "http://slot:1"}])
 mig = A.Account(
     {
@@ -258,7 +266,7 @@ check(
 
 print()
 print("[11] selecting direct clears a stale legacy proxy")
-d4 = tempfile.mkdtemp(prefix="wb-slots-direct-")
+d4 = os.path.join(_TMP.name, "direct")
 S.set_proxy_slots(d4, [{"id": "slot-1", "name": "one", "url": "http://slot:1"}])
 stale = A.Account({
     "uid": "u-stale", "domain": "www.workbuddy.ai", "realm": "intl",

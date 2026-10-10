@@ -1,25 +1,25 @@
 # -*- coding: utf-8 -*-
-"""反代代跑 web_search / web_fetch（開關在 wb_proxy.LOCAL_WEB_TOOLS）
+"""反代代跑 web_search / web_fetch（开关在 wb_proxy.LOCAL_WEB_TOOLS）
 
-背景：Codex App 會宣告 web_search 這種 Responses 的伺服器端工具，但 WorkBuddy
-上游沒有任何搜尋服務——v1.5.3 的 revert 已經量測過，直接把 web_search /
-web_search_preview / web_fetch 丟給 chat endpoint，模型的回答跟完全不給工具
-一樣（零個 tool call）。所以沒有現成的執行器可以轉接，只能由反代自己跑。
+背景：Codex App 会宣告 web_search 这种 Responses 的伺服器端工具，但 WorkBuddy
+上游没有任何搜寻服务——v1.5.3 的 revert 已经量测过，直接把 web_search /
+web_search_preview / web_fetch 丢给 chat endpoint，模型的回答跟完全不给工具
+一样（零个 tool call）。所以没有现成的执行器可以转接，只能由反代自己跑。
 
-v1.5.0 ~ 1.5.2 做過同一件事，被 revert（issue #43）。三個缺陷都在這裡修掉：
+v1.5.0 ~ 1.5.2 做过同一件事，被 revert（issue #43）。三个缺陷都在这里修掉：
 
-  1. 只認 args["query"] 這個字串。模型改送 queries 陣列時會收到一句「你沒問
-     問題」，於是必然重試、必然把回合數耗光。-> query_args() 同時接受
-     query / queries / q，並把多個查詢合併成一次搜尋。
-  2. 去重只看已展開成 chat 形狀的 function，漏掉客戶端原本那份伺服器端宣告，
-     上游因此同時看到兩個同名的 web_search。-> install_tool_defs() 先把同名
-     項目全部拿掉，再放進唯一一份我們的定義。
-  3. 回合用盡時合成一個 resp_wrapup（status=completed、output=[]）收尾，把
-     失敗偽裝成正常結束，客戶端看到的是「講到一半斷掉」。-> 這裡不合成任何
-     東西：呼叫端在最後一輪把工具收回，讓模型自己用文字收尾。
+  1. 只认 args["query"] 这个字串。模型改送 queries 阵列时会收到一句「你没问
+     问题」，于是必然重试、必然把回合数耗光。-> query_args() 同时接受
+     query / queries / q，并把多个查询合并成一次搜寻。
+  2. 去重只看已展开成 chat 形状的 function，漏掉客户端原本那份伺服器端宣告，
+     上游因此同时看到两个同名的 web_search。-> install_tool_defs() 先把同名
+     项目全部拿掉，再放进唯一一份我们的定义。
+  3. 回合用尽时合成一个 resp_wrapup（status=completed、output=[]）收尾，把
+     失败伪装成正常结束，客户端看到的是「讲到一半断掉」。-> 这里不合成任何
+     东西：呼叫端在最后一轮把工具收回，让模型自己用文字收尾。
 
-搜尋後端是 DuckDuckGo 的 HTML 版（不需要 API key）。任何失敗都回一句可讀的
-錯誤給模型，不假造結果。只用 Python 標準庫。
+搜寻后端是 DuckDuckGo 的 HTML 版（不需要 API key）。任何失败都回一句可读的
+错误给模型，不假造结果。只用 Python 标准库。
 """
 
 import html as _html
@@ -33,7 +33,7 @@ import urllib.request
 WEB_SEARCH_NAME = "web_search"
 WEB_FETCH_NAME = "web_fetch"
 
-# 客戶端會用這幾種 type 宣告同一個工具
+# 客户端会用这几种 type 宣告同一个工具
 SEARCH_DECL_TYPES = ("web_search", "web_search_preview", "web_search_preview_2025_03_11")
 FETCH_DECL_TYPES = ("web_fetch",)
 
@@ -48,8 +48,23 @@ HTTP_TIMEOUT = 20
 SEARCH_ENDPOINT = "https://html.duckduckgo.com/html/"
 
 
+class _UnsafeRedirectError(Exception):
+    """Raised when a web tool response redirects into a disallowed address."""
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Apply the same URL policy to every redirect target as the initial URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urljoin(req.full_url, str(newurl or ""))
+        safe_url, problem = _guard_url(target)
+        if problem:
+            raise _UnsafeRedirectError(problem)
+        return super().redirect_request(req, fp, code, msg, headers, safe_url)
+
+
 def max_rounds():
-    """最多代跑幾輪網路工具。環境變數可覆蓋，方便臨時關小。"""
+    """最多代跑几轮网路工具。环境变数可覆盖，方便临时关小。"""
     try:
         n = int(os.environ.get("WB_MAX_WEB_ROUNDS", "") or "")
     except (TypeError, ValueError):
@@ -118,14 +133,14 @@ def _declared(tools, types):
             continue
         if str(t.get("type") or "").strip().lower() in types:
             return True
-        # 有些客戶端會把它包成 function 形狀
+        # 有些客户端会把它包成 function 形状
         if str(t.get("name") or "").strip().lower() in types:
             return True
     return False
 
 
 def client_wants_web(tools):
-    """客戶端宣告了哪幾個網路工具（伺服器端或 function 形狀都算）。"""
+    """客户端宣告了哪几个网路工具（伺服器端或 function 形状都算）。"""
     return {
         "search": _declared(tools, SEARCH_DECL_TYPES + (WEB_SEARCH_NAME,)),
         "fetch": _declared(tools, FETCH_DECL_TYPES + (WEB_FETCH_NAME,)),
@@ -133,11 +148,11 @@ def client_wants_web(tools):
 
 
 def install_tool_defs(chat_tools, wants):
-    """把客戶端的網路工具宣告換成我們的 function。
+    """把客户端的网路工具宣告换成我们的 function。
 
-    同名項目（伺服器端的 {"type": "web_search"}、客戶端自己帶的 function、
-    以及上一輪從我們這裡學到的定義）一律先移除，只留唯一一份；否則上游會
-    同時看到兩個 web_search，模型會挑錯那個去呼叫。
+    同名项目（伺服器端的 {"type": "web_search"}、客户端自己带的 function、
+    以及上一轮从我们这里学到的定义）一律先移除，只留唯一一份；否则上游会
+    同时看到两个 web_search，模型会挑错那个去呼叫。
     """
     names = set()
     if wants.get("search"):
@@ -170,11 +185,11 @@ def is_internal_tool(name):
 
 
 def query_args(args):
-    """從工具參數取出查詢字串。
+    """从工具参数取出查询字串。
 
-    舊版只讀 args["query"] 這個字串，模型改送 queries 陣列時就會被回一句
-    「你沒問問題」——issue #43 就是這樣一路重試到回合用盡。這裡接受
-    query / queries / q，陣列會用 " or " 接起來。
+    旧版只读 args["query"] 这个字串，模型改送 queries 阵列时就会被回一句
+    「你没问问题」——issue #43 就是这样一路重试到回合用尽。这里接受
+    query / queries / q，阵列会用 " or " 接起来。
     """
     if not isinstance(args, dict):
         return ""
@@ -209,7 +224,8 @@ def _http_get(url):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     })
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
         raw = resp.read()
         charset = resp.headers.get_content_charset() or "utf-8"
     try:
@@ -232,7 +248,7 @@ def _strip_tags(text):
 
 
 def _ddg_target(href):
-    """解開 DuckDuckGo 的 /l/?uddg= 轉址。"""
+    """解开 DuckDuckGo 的 /l/?uddg= 转址。"""
     href = _html.unescape(str(href or "").strip())
     if href.startswith("//"):
         href = "https:" + href
@@ -248,7 +264,7 @@ def _ddg_target(href):
 
 
 def search(query, num_results=5):
-    """DuckDuckGo HTML 版搜尋，回傳要餵給模型的可讀字串。"""
+    """DuckDuckGo HTML 版搜寻，回传要喂给模型的可读字串。"""
     query = str(query or "").strip()
     if len(query) < 2:
         return ('Error: web_search needs a query of at least 2 characters; '
@@ -262,6 +278,8 @@ def search(query, num_results=5):
     url = SEARCH_ENDPOINT + "?" + urllib.parse.urlencode({"q": query})
     try:
         page = _http_get(url)
+    except _UnsafeRedirectError as exc:
+        return "Error: search redirect blocked (%s)." % exc
     except urllib.error.HTTPError as exc:
         return "Error: the search backend answered HTTP %s for %r." % (exc.code, query)
     except Exception as exc:
@@ -297,7 +315,7 @@ def search(query, num_results=5):
 
 
 def _guard_url(url):
-    """只允許對外的一般 http(s) 網址。"""
+    """只允许对外的一般 http(s) 网址。"""
     try:
         parsed = urllib.parse.urlparse(str(url or ""))
     except Exception:
@@ -321,6 +339,8 @@ def fetch(url, start_index=0):
         return "Error: %s" % problem
     try:
         page = _http_get(url)
+    except _UnsafeRedirectError as exc:
+        return "Error: redirect blocked (%s)." % exc
     except urllib.error.HTTPError as exc:
         return "Error: %s answered HTTP %s." % (url, exc.code)
     except Exception as exc:
@@ -345,10 +365,10 @@ def fetch(url, start_index=0):
 
 
 def sources_from_result(result):
-    """把搜尋結果裡的 (標題, 網址) 讀回來。
+    """把搜寻结果里的 (标题, 网址) 读回来。
 
-    餵給模型的是文字，但客戶端要畫引用來源需要結構化資料，所以在這裡從我們
-    自己產出的格式反解，不必另外保存狀態。
+    喂给模型的是文字，但客户端要画引用来源需要结构化资料，所以在这里从我们
+    自己产出的格式反解，不必另外保存状态。
     """
     out = []
     pattern = r"(?m)^\d+\.\s*(.+?)\s*\n\s*(https?://\S+)\s*$"
@@ -361,7 +381,7 @@ def sources_from_result(result):
 
 
 def execute(name, args_raw):
-    """執行一次內部網路工具。永不拋例外，永遠回一句能餵回模型的字串。"""
+    """执行一次内部网路工具。永不抛例外，永远回一句能喂回模型的字串。"""
     name = str(name or "").strip()
     if isinstance(args_raw, str):
         try:

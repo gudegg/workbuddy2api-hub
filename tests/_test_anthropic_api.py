@@ -53,13 +53,13 @@ payload = {
 }
 
 print("[1] Anthropic request converts to the existing Chat shape")
-chat = P._anthropic_messages_to_chat(payload)
+chat = P.messages_to_chat(payload)
 check("system becomes a system message", chat["messages"][0] == {
     "role": "system", "content": "You are helpful."
 }, chat["messages"][0])
 check("image becomes an OpenAI data URL",
       chat["messages"][1]["content"][1]["image_url"]["url"] == "data:image/png;base64,abc")
-image_compat = P._anthropic_messages_to_chat({
+image_compat = P.messages_to_chat({
     "model": "m",
     "max_tokens": 8,
     "messages": [{"role": "user", "content": [
@@ -93,7 +93,7 @@ check("tool schema and choice are translated",
       chat["tools"][0]["function"]["parameters"]["type"] == "object" and
       chat["tool_choice"] == "auto" and chat["parallel_tool_calls"] is False)
 
-legacy_system_chat = P._anthropic_messages_to_chat({
+legacy_system_chat = P.messages_to_chat({
     "model": "m",
     "max_tokens": 16,
     "messages": [
@@ -121,7 +121,7 @@ chat_response = {
     }, "finish_reason": "tool_calls"}],
     "usage": {"prompt_tokens": 12, "completion_tokens": 8},
 }
-message = P._anthropic_response_from_chat(chat_response, payload, input_tokens=10)
+message = P.chat_to_messages(chat_response, payload, input_tokens=10)
 check("response has Anthropic message envelope",
       message["type"] == "message" and message["role"] == "assistant")
 check("response blocks include thinking, text and tool_use",
@@ -131,7 +131,7 @@ check("tool_use input is decoded JSON",
       message["content"][-1]["input"] == {"city": "Shanghai"})
 check("finish reason maps to tool_use",
       message["stop_reason"] == "tool_use")
-event = P._anthropic_sse_event("message_start", {"message": message})
+event = P.anthropic_sse_frame("message_start", {"message": message})
 lines = event.decode("utf-8").splitlines()
 event_data = json.loads(lines[1][len("data: "):])
 check("SSE has named event and matching data type",
@@ -140,16 +140,16 @@ check("SSE has named event and matching data type",
 print()
 print("[3] Validation and count-token conversion")
 try:
-    P._anthropic_messages_to_chat({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    P.messages_to_chat({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
     valid_max_tokens = False
 except P.AnthropicRequestError:
     valid_max_tokens = True
 check("messages requires positive max_tokens", valid_max_tokens)
-count_body = P._anthropic_messages_to_chat({
+count_body = P.messages_to_chat({
     "model": "m", "messages": [{"role": "user", "content": "hello"}]
 }, require_max_tokens=False)
 check("count_tokens accepts a request without max_tokens",
-      "max_tokens" not in count_body and P._anthropic_input_tokens(count_body) > 0)
+      "max_tokens" not in count_body and P._anthropic_estimate_chat_tokens(count_body) > 0)
 
 print()
 print("[4] Messages handler accepts the upstream response, account and effort")
@@ -166,7 +166,7 @@ for streaming in (True, False):
     handler._banned_model_error = lambda *args: None
     handler._anthropic_error = lambda *args: ("error", args)
     handler._json = lambda status, body: (status, body)
-    handler._anthropic_stream_response = lambda *args: "streamed"
+    handler._messages_stream_response = lambda *args: "streamed"
     request = {
         "model": "deepseek-v4.1-flash", "max_tokens": 16,
         "stream": streaming,
@@ -177,7 +177,7 @@ for streaming in (True, False):
          patch.object(P, "aggregate_stream", return_value=chat_response), \
          patch.object(P, "record_usage"), \
          patch.object(P, "record_error") as errors:
-        result = handler._handle_anthropic_messages(request)
+        result = handler._handle_messages(request)
     check("%s messages succeeds with the three-value upstream result" %
           ("streaming" if streaming else "non-streaming"),
           result == "streamed" if streaming else result[0] == 200, result)

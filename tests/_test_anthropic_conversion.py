@@ -60,26 +60,26 @@ class AnthropicConversionTests(unittest.TestCase):
     def test_output_effort_is_forwarded_without_clamping_when_metadata_absent(self):
         for effort in ("low", "medium", "high", "xhigh", "max"):
             with self.subTest(effort=effort):
-                body = P._anthropic_messages_to_chat(request(output_config={"effort": effort}))
+                body = P.messages_to_chat(request(output_config={"effort": effort}))
                 self.assertEqual(body.get("reasoning_effort"), effort)
                 self.assertEqual(P.build_upstream_body(body).get("reasoning_effort"), effort)
 
     def test_explicit_effort_respects_supported_and_fixed_catalog_values(self):
         for effort in ("low", "high", "max"):
-            body = P._anthropic_messages_to_chat(request(
+            body = P.messages_to_chat(request(
                 model="deepseek-v4.1-flash", output_config={"effort": effort},
             ))
             self.assertEqual(body.get("reasoning_effort"), effort)
         with self.assertRaisesRegex(P.AnthropicRequestError, "effort.*medium"):
-            P._anthropic_messages_to_chat(request(
+            P.messages_to_chat(request(
                 model="deepseek-v4.1-flash", output_config={"effort": "medium"},
             ))
-        body = P._anthropic_messages_to_chat(request(
+        body = P.messages_to_chat(request(
             model="gemini-3.5-flash", output_config={"effort": "medium"},
         ))
         self.assertEqual(body.get("reasoning_effort"), "medium")
         with self.assertRaisesRegex(P.AnthropicRequestError, "effort.*max"):
-            P._anthropic_messages_to_chat(request(
+            P.messages_to_chat(request(
                 model="gemini-3.5-flash", output_config={"effort": "max"},
             ))
 
@@ -87,9 +87,9 @@ class AnthropicConversionTests(unittest.TestCase):
         for effort in (1, True, "", "turbo", "none"):
             with self.subTest(effort=effort):
                 with self.assertRaisesRegex(P.AnthropicRequestError, "output_config.effort"):
-                    P._anthropic_messages_to_chat(request(output_config={"effort": effort}))
+                    P.messages_to_chat(request(output_config={"effort": effort}))
         with self.assertRaisesRegex(P.AnthropicRequestError, "output_config.*object"):
-            P._anthropic_messages_to_chat(request(output_config=[]))
+            P.messages_to_chat(request(output_config=[]))
 
     def test_nullable_effort_fields_are_treated_as_omitted(self):
         for extra, expected in (
@@ -101,18 +101,18 @@ class AnthropicConversionTests(unittest.TestCase):
               "reasoningEffort": None}, "high"),
         ):
             with self.subTest(extra=extra):
-                body = P._anthropic_messages_to_chat(request(**extra))
+                body = P.messages_to_chat(request(**extra))
                 self.assertEqual(body.get("reasoning_effort"), expected)
                 if expected is None:
                     self.assertNotIn("reasoning_effort", body)
 
     def test_compatibility_effort_aliases_agree_or_report_conflicts(self):
-        body = P._anthropic_messages_to_chat(request(
+        body = P.messages_to_chat(request(
             output_config={"effort": "low"}, reasoning_effort="low", reasoningEffort="low",
         ))
         self.assertEqual(body.get("reasoning_effort"), "low")
         self.assertNotIn("reasoningEffort", body)
-        body = P._anthropic_messages_to_chat(request(reasoningEffort="none"))
+        body = P.messages_to_chat(request(reasoningEffort="none"))
         self.assertEqual(body.get("reasoning_effort"), "none")
         for extra in (
             {"output_config": {"effort": "high"}, "reasoning_effort": "low"},
@@ -121,28 +121,28 @@ class AnthropicConversionTests(unittest.TestCase):
         ):
             with self.subTest(extra=extra):
                 with self.assertRaisesRegex(P.AnthropicRequestError, "conflict"):
-                    P._anthropic_messages_to_chat(request(**extra))
+                    P.messages_to_chat(request(**extra))
 
     def test_json_schema_output_fails_explicitly_instead_of_being_ignored(self):
         with self.assertRaisesRegex(P.AnthropicRequestError, "output_config.format.*not supported"):
-            P._anthropic_messages_to_chat(request(output_config={"format": {
+            P.messages_to_chat(request(output_config={"format": {
                 "type": "json_schema", "schema": {"type": "object"},
             }}))
 
     def test_legacy_json_schema_output_is_also_rejected(self):
         with self.assertRaisesRegex(P.AnthropicRequestError, "output_format.*not supported"):
-            P._anthropic_messages_to_chat(request(output_format={
+            P.messages_to_chat(request(output_format={
                 "type": "json_schema", "schema": {"type": "object"},
             }))
 
     def test_harmless_metadata_and_empty_output_config_remain_compatible(self):
-        body = P._anthropic_messages_to_chat(request(
+        body = P.messages_to_chat(request(
             metadata={"user_id": "synthetic"}, output_config={}, service_tier="auto",
         ))
         self.assertEqual(body["messages"][0]["content"], "hello")
 
     def test_text_tool_results_keep_the_existing_string_shape(self):
-        body = P._anthropic_messages_to_chat(tool_request([
+        body = P.messages_to_chat(tool_request([
             {"type": "text", "text": "first"}, {"type": "text", "text": "second"},
         ], is_error=True))
         self.assertEqual(body["messages"][-1]["content"], "Tool error: firstsecond")
@@ -153,7 +153,7 @@ class AnthropicConversionTests(unittest.TestCase):
             {"type": "image", "source": {"type": "url", "url": "https://example.test/screen.png"}},
         ])
         original = copy.deepcopy(payload)
-        body = P._anthropic_messages_to_chat(payload)
+        body = P.messages_to_chat(payload)
         expected = [
             {"type": "text", "text": "screen"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,YWJj"}},
@@ -167,24 +167,24 @@ class AnthropicConversionTests(unittest.TestCase):
         self.assertEqual(payload, original)
 
     def test_image_tool_error_keeps_the_image_and_adds_a_text_prefix(self):
-        body = P._anthropic_messages_to_chat(tool_request([image()], is_error=True))
+        body = P.messages_to_chat(tool_request([image()], is_error=True))
         content = body["messages"][-1]["content"]
         self.assertEqual(content[0], {"type": "text", "text": "Tool error: "})
         self.assertEqual(content[1]["type"], "image_url")
 
     def test_tool_result_documents_are_rejected_as_unsupported(self):
         with self.assertRaisesRegex(P.AnthropicRequestError, "unsupported.*document"):
-            P._anthropic_messages_to_chat(tool_request([{
+            P.messages_to_chat(tool_request([{
                 "type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "YWJj"},
             }]))
 
     def test_input_estimate_includes_tool_names_descriptions_and_schema(self):
-        plain = P._anthropic_messages_to_chat(request())
-        with_tools = P._anthropic_messages_to_chat(request(tools=[{
+        plain = P.messages_to_chat(request())
+        with_tools = P.messages_to_chat(request(tools=[{
             "name": "lookup", "description": "Detailed tool instructions. " * 40,
             "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
         }]))
-        self.assertGreater(P._anthropic_input_tokens(with_tools), P._anthropic_input_tokens(plain) + 100)
+        self.assertGreater(P._anthropic_estimate_chat_tokens(with_tools), P._anthropic_estimate_chat_tokens(plain) + 100)
 
     def test_image_estimate_uses_fixed_cost_not_encoded_data_length(self):
         for as_tool in (False, True):
@@ -193,9 +193,9 @@ class AnthropicConversionTests(unittest.TestCase):
                 payload = tool_request([image(data)]) if as_tool else request(messages=[{
                     "role": "user", "content": [image(data)],
                 }])
-                body = P._anthropic_messages_to_chat(payload)
+                body = P.messages_to_chat(payload)
                 original = copy.deepcopy(body)
-                estimates.append(P._anthropic_input_tokens(body))
+                estimates.append(P._anthropic_estimate_chat_tokens(body))
                 self.assertEqual(body, original)
             with self.subTest(as_tool=as_tool):
                 self.assertEqual(estimates[0], estimates[1])
@@ -226,9 +226,9 @@ class AnthropicConversionTests(unittest.TestCase):
             ({"completion_tokens_details": {"cached_tokens": 4}}, 4),
             ({"prompt_tokens_details": {"cached_tokens": 3}}, 3),
             ({"prompt_cache_hit_tokens": 5, "completion_tokens_details": {"cached_tokens": 4},
-              "prompt_tokens_details": {"cached_tokens": 3}}, 5),
+              "prompt_tokens_details": {"cached_tokens": 3}}, 3),
             ({"prompt_cache_hit_tokens": 0, "completion_tokens_details": {"cached_tokens": 4},
-              "prompt_tokens_details": {"cached_tokens": 3}}, 4),
+              "prompt_tokens_details": {"cached_tokens": 3}}, 3),
             ({"prompt_cache_hit_tokens": 0, "completion_tokens_details": {"cached_tokens": 0},
               "prompt_tokens_details": {"cached_tokens": 3}}, 3),
         ):
