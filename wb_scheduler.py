@@ -9,6 +9,7 @@
 """
 import threading
 import time
+import random
 import wb_tasks
 from wb_tasks import do_cat_travel
 
@@ -141,7 +142,10 @@ class Scheduler:
         travel_count = 0
         daily_chat_count = 0
 
-        for acc in list(self.pool.accounts):
+        for idx, acc in enumerate(list(self.pool.accounts)):
+            if idx > 0:
+                # 账号间随机错峰防并发风控（2~5秒浮动延时，issue #394）
+                time.sleep(random.uniform(2.0, 5.0))
             uid8 = acc.uid[:8] if acc.uid else "?"
             # 1. 检查 Token 剩余寿命 (小于 2 小时自动刷新保活)
             exp = acc.expires_at or 0
@@ -204,9 +208,8 @@ class Scheduler:
                     res = acc.daily_chat(trigger="scheduler")
                     if res.get("ok"):
                         daily_chat_count += 1
-                        # 桌面端那条几乎不会失败，真正决定积分的网页通道就在 msg
-                        # 里（completed：N 段输出 / 失败原因），日志不带上它的话，
-                        # 面板只显示「成功」，第二天才发现积分没到（issue #236）。
+                        # 成功时也把网页通道那一轮的结果带上（completed：N 段输出），
+                        # 光看「成功」分不清是真跑完了还是只有桌面腿过了（issue #236）。
                         self.log(f"✓ 账号 [{uid8}] 每日活跃对话成功: {res.get('msg')}")
                     else:
                         self.log(f"! 账号 [{uid8}] 每日活跃对话失败: {res.get('error') or res.get('msg')}")

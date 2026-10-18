@@ -58,16 +58,16 @@ assert.ok(names(mainTabs[1]).includes('accounts'), 'accounts 必须在主标签�
 
 // 切到账号页要顺手把签到记录拉起来；开关关掉（默认）时账号区就在
 // 「网关与账号」页，切到网关页同样要拉。
-assert.ok(/if\(tab === 'accounts' \|\| \(!_accountsSeparateTab && tab === 'gateway'\)\)\{ loadActivityHistory\(\); \}/.test(script),
-  '切到账号页（或合并后的网关页）应触发 loadActivityHistory');
+assert.ok(/if\(tab === 'accounts' \|\| \(!_accountsSeparateTab && tab === 'gateway'\)\)\{ loadActivityBoard\(\); \}/.test(script),
+  '切到账号页（或合并后的网关页）应触发 loadActivityBoard');
 
 // 签到记录区块的骨架
 for(const id of ['activityRange', 'activityTask', 'activityResult', 'activityAccount',
                  'activityList', 'activityMore', 'activityMoreInfo', 'activityCount']){
   assert.ok(html.includes('id="' + id + '"'), '签到记录区块缺少 #' + id);
 }
-assert.ok(/id="btnActivityMore"[^>]*onclick="loadActivityHistory\(false, true\)"/.test(html),
-  '「加载更多」应接上 loadActivityHistory(false, true)');
+assert.ok(/id="btnActivityMore"[^>]*onclick="loadActivityBoard\(false, true\)"/.test(html),
+  '「加载更多」应接上 loadActivityBoard(false, true)');
 assert.ok(/id="activityRange"[\s\S]{0,600}?<option value="7d" selected>/.test(html),
   '默认区间应是近 7 天');
 // 筛选值的取值必须与服务端约定一致，写错了服务端会回 400
@@ -121,13 +121,47 @@ assert.ok(/postJSON\('\/settings\/save', \{accounts_separate_tab: value\}\)/.tes
 assert.ok(/if\(tab === 'accounts' && !_accountsSeparateTab\) tab = 'gateway';/.test(script),
   '合并模式下 ?tab=accounts 应退回「网关与账号」页');
 
+/* ---- 1c. 一键切换所有出站身份 --------------------------------------- */
+
+// 按钮在账号工具栏里，紧跟「一键分配代理」
+assert.ok(/id="btnProductAll"[^>]*onclick="cycleAllProducts\(this\)"/.test(html),
+  '账号工具栏缺少「一键切换所有出站身份」按钮');
+assert.ok(/一键分配代理<\/button>\s*<button class="sec" id="btnProductAll"/.test(html),
+  '按钮应排在「一键分配代理」之后');
+// 当前身分要有个能定位的节点，不能只留一段裸文本（否则 JS 改不动它）
+assert.ok(html.includes('<span id="productAllLabel">'), '按钮上的当前身分缺少可定位节点');
+// 批量靠「不带 uid」：带上 uid 就退化成单账号切换
+assert.ok(/postJSON\('\/accounts\/product', \{product: next\}\)/.test(script),
+  '批量切换只应提交 product，不能带 uid');
+// 身分取值与轮转顺序必须与服务端 wb_identity.VALID_PRODUCTS 一致
+assert.ok(/PRODUCT_ORDER = \['workbuddy', 'vscode', 'cli'\]/.test(script),
+  '轮转顺序应与服务端身分取值一致');
+// 各账号身分不一致时不能显示成其中某一种
+assert.ok(/cur \? PRODUCT_SHORT\[cur\] : '混合'/.test(script),
+  '身分不一致时应显示「混合」');
+// 英文词条齐全，否则切到 EN 时这一块是中文
+for(const [zh, en] of [['一键切换所有出站身份：', 'Switch all outbound identities: '],
+                       ['混合', 'mixed'],
+                       ['将把全部账号的出站身份切换为 ', 'Switch the outbound identity of ALL accounts to '],
+                       ['？（含另一个版本）', '? (including the other version)'],
+                       ['已把全部账号的出站身份切换为 ', 'Switched the outbound identity of ALL accounts to ']]){
+  assert.ok(html.includes("'" + zh + "': '" + en + "'"),
+    'DICT 里缺少「' + zh + '」的英文词条');
+}
+
+
 /* ---- 2. 行为：拼查询串、渲染、翻页、出错 ---------------------------- */
 
+let POSTS = [];
 let REQUESTS = [];
 let RESPONSE = {rows: [], total: 0};
 let FETCH_FAILS = false;
 dom.installDom({
-  fetch: (url) => {
+  confirm: () => true,
+  fetch: (url, opts) => {
+    if(opts && opts.method === 'POST'){
+      POSTS.push({url: String(url), body: String(opts.body || '')});
+    }
     REQUESTS.push(String(url));
     if(FETCH_FAILS){
       return Promise.resolve({ok: false, status: 400,
@@ -144,11 +178,13 @@ let api;
 try {
   api = new Function(script + `
     return {
-      loadActivityHistory: loadActivityHistory,
+      loadActivityBoard: loadActivityBoard,
       renderActivityAccounts: renderActivityAccounts,
       switchMainTab: switchMainTab,
       applyAccountsTabLayout: applyAccountsTabLayout,
       accountsSeparateTab: accountsSeparateTab,
+      updateProductAllButton: updateProductAllButton,
+      cycleAllProducts: cycleAllProducts,
     };`)();
 } catch(e) {
   console.log = realLog;
@@ -170,7 +206,7 @@ function check(label, ok, detail){
   el('activityAccount').value = '';
   REQUESTS = [];
   RESPONSE = {rows: [], total: 0};
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   check('默认请求近 7 天、100 行', REQUESTS[0] === '/activity/history?range=7d&limit=100', REQUESTS[0]);
   check('空结果给出空态', listHtml().includes('这个区间里没有签到或活跃记录。'), listHtml());
   check('空结果不显示加载更多', el('activityMore').style.display === 'none');
@@ -182,7 +218,7 @@ function check(label, ok, detail){
   el('activityResult').value = 'failed';
   el('activityAccount').value = 'uid-abcdef1234';
   REQUESTS = [];
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   check('筛选条件进查询串',
     REQUESTS[0] === '/activity/history?range=30d&task=checkin&result=failed&uid=uid-abcdef1234&limit=100',
     REQUESTS[0]);
@@ -198,7 +234,7 @@ function check(label, ok, detail){
     {ts: '2026-10-08T08:00:00+08:00', uid: 'uid-abcdef1234', nickname: '',
      realm: 'intl', task: 'daily_chat', trigger: 'manual', ok: false, message: ''},
   ]};
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   const h = listHtml();
   check('时间按落盘的墙上时间显示', h.includes('10-09 21:03'), h.slice(0, 160));
   check('昵称进账号列', h.includes('老王'));
@@ -217,26 +253,26 @@ function check(label, ok, detail){
   RESPONSE = {total: 250, limit: 100, rows: Array.from({length: 100}, (_, i) => ({
     ts: '2026-10-09T00:00:00+08:00', uid: 'u' + i, nickname: 'a' + i, realm: 'cn',
     task: 'checkin', trigger: 'scheduler', ok: true, message: 'ok'}))};
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   check('还有更多时显示加载更多', el('activityMore').style.display === 'flex');
   check('更多提示带已显示与总数',
     el('activityMoreInfo').textContent === '已显示最新 100 条 / 共 250 条',
     el('activityMoreInfo').textContent);
   REQUESTS = [];
-  await api.loadActivityHistory(false, true);
+  await api.loadActivityBoard(false, true);
   check('加载更多按页加 limit',
     REQUESTS[0] === '/activity/history?range=30d&limit=200', REQUESTS[0]);
   check('加载更多不清空已有表格', listHtml().includes('<tbody>'), listHtml().slice(0, 80));
 
   // 2e. limit 有上限，点到底也不会无限往上加
-  for(let i = 0; i < 12; i++) await api.loadActivityHistory(false, true);
+  for(let i = 0; i < 12; i++) await api.loadActivityBoard(false, true);
   check('limit 封顶在 1000', REQUESTS[REQUESTS.length - 1] === '/activity/history?range=30d&limit=1000',
     REQUESTS[REQUESTS.length - 1]);
 
   // 2f. 换筛选条件要回到第一页，否则第一屏会缺最新记录
   el('activityRange').value = 'today';
   REQUESTS = [];
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   check('换筛选条件重置 limit', REQUESTS[0] === '/activity/history?range=today&limit=100', REQUESTS[0]);
 
   // 2g. 账号下拉取自账号池，重建选项不能把已选中的账号冲掉
@@ -252,7 +288,7 @@ function check(label, ok, detail){
 
   // 2h. 服务端拒绝筛选值（400）时给出提示，并把刷新按钮放开
   FETCH_FAILS = true;
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   check('读取失败时给出提示', listHtml().includes('读取签到记录失败'), listHtml());
   check('失败后刷新按钮恢复可用', el('btnActivityRefresh').disabled === false);
   FETCH_FAILS = false;
@@ -325,6 +361,49 @@ function check(label, ok, detail){
   check('拆开后网关页签改回「网关」', el('navGatewayLabel').textContent === '网关',
     el('navGatewayLabel').textContent);
   check('拆开后开关读回来是开', api.accountsSeparateTab() === true);
+
+  // 2k. 一键切换所有出站身份：按钮显示当前身分，点一下切到下一个并提交全量
+  window.ACCOUNTS = [{uid: 'u1', product: 'workbuddy'}, {uid: 'u2', product: 'workbuddy'}];
+  api.updateProductAllButton();
+  check('身分一致时按钮显示该身分', el('productAllLabel').textContent === 'WB',
+    el('productAllLabel').textContent);
+
+  window.ACCOUNTS = [{uid: 'u1', product: 'workbuddy'}, {uid: 'u2', product: 'cli'}];
+  api.updateProductAllButton();
+  check('身分不一致时显示「混合」', el('productAllLabel').textContent === '混合',
+    el('productAllLabel').textContent);
+  // 缺 product 字段的账号按 WB 算（与行内按钮的判定一致）
+  window.ACCOUNTS = [{uid: 'u1'}, {uid: 'u2', product: 'workbuddy'}];
+  api.updateProductAllButton();
+  check('缺 product 字段按 WB 算', el('productAllLabel').textContent === 'WB',
+    el('productAllLabel').textContent);
+
+  // 混合时点一下 = 统一到轮转的第一项
+  window.ACCOUNTS = [{uid: 'u1', product: 'workbuddy'}, {uid: 'u2', product: 'cli'}];
+  RESPONSE = {accounts: [], rows: [], total: 0};
+  POSTS = [];
+  await api.cycleAllProducts(null);
+  check('混合时切到 WB',
+    POSTS.length === 1 && POSTS[0].url === '/accounts/product'
+    && JSON.parse(POSTS[0].body).product === 'workbuddy', JSON.stringify(POSTS));
+
+  // 一致时按 WB -> VSC -> CLI -> WB 轮转，且不带 uid
+  for(const [from, to] of [['workbuddy', 'vscode'], ['vscode', 'cli'], ['cli', 'workbuddy']]){
+    window.ACCOUNTS = [{uid: 'u1', product: from}, {uid: 'u2', product: from}];
+    POSTS = [];
+    await api.cycleAllProducts(null);
+    const body = POSTS.length === 1 ? JSON.parse(POSTS[0].body) : {};
+    check(from + ' 之后切到 ' + to,
+      POSTS.length === 1 && POSTS[0].url === '/accounts/product'
+      && body.product === to && body.uid === undefined, JSON.stringify(POSTS));
+  }
+
+  // 一个账号都没有时不发请求（服务端全量切换等于空转）
+  window.ACCOUNTS = [];
+  POSTS = [];
+  await api.cycleAllProducts(null);
+  check('没有账号时不发请求', POSTS.length === 0, JSON.stringify(POSTS));
+
 
   console.log = realLog;
   console.log('ok - accounts page & activity history (structure + behaviour)');

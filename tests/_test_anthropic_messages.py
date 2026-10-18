@@ -70,7 +70,7 @@ request = {
     "stop_sequences": ["END"],
     "metadata": {"user_id": "u"},
     "thinking": {"type": "adaptive", "display": "summarized"},
-    "output_config": {"effort": "high"},
+    "output_config": {"effort": "high", "format": {"type": "json_schema"}},
     "context_management": {"edits": []},
     "top_k": 5,
 }
@@ -95,8 +95,7 @@ user = chat["messages"][1]
 img = user["content"][1]["image_url"]["url"]
 check("base64 image becomes a data URL", img == "data:image/png;base64,aaa", img)
 asst = chat["messages"][2]
-check("assistant reasoning remains in its reasoning field",
-      asst.get("reasoning_content") == "secret" and asst.get("content") == "ok", asst)
+check("thinking is not forwarded", "secret" not in json.dumps(asst, ensure_ascii=False), asst)
 call = (asst.get("tool_calls") or [{}])[0]
 check("tool_use maps to an OpenAI tool call",
       call.get("id") == "toolu_1" and call["function"]["name"] == "Bash"
@@ -132,15 +131,19 @@ chat_obj = {
 msg = P.chat_to_messages(chat_obj)
 check("id is a message id", msg["id"].startswith("msg_"), msg["id"])
 check("type/role are native", msg["type"] == "message" and msg["role"] == "assistant", msg)
-check("text block is present", {"type": "text", "text": "hello"} in msg["content"], msg["content"])
+check("reasoning_content becomes a leading thinking block",
+      msg["content"][0] == {"type": "thinking", "thinking": "secret"}, msg["content"])
+check("text block is present", msg["content"][1] == {"type": "text", "text": "hello"}, msg["content"])
 check("tool_use block is present",
-      msg["content"][-1]["type"] == "tool_use" and msg["content"][-1]["input"] == {"cmd": "ls"}, msg["content"])
+      msg["content"][2]["type"] == "tool_use" and msg["content"][2]["input"] == {"cmd": "ls"}, msg["content"])
 check("stop_reason maps tool_calls -> tool_use", msg["stop_reason"] == "tool_use", msg["stop_reason"])
 check("usage maps cache fields",
-      msg["usage"] == {"input_tokens": 6, "output_tokens": 5,
-                       "cache_read_input_tokens": 4, "cache_creation_input_tokens": 0}, msg["usage"])
-check("translated thinking has an empty signature",
-      msg["content"][0] == {"type": "thinking", "thinking": "secret", "signature": ""}, msg)
+      msg["usage"] == {"input_tokens": 10, "output_tokens": 5,
+                       "cache_read_input_tokens": 4, "cache_creation_input_tokens": 2}, msg["usage"])
+check("no thinking block without reasoning_content",
+      all(b["type"] != "thinking" for b in
+          P.chat_to_messages({"choices": [{"message": {"content": "hi"}}]})["content"]),
+      P.chat_to_messages({"choices": [{"message": {"content": "hi"}}]})["content"])
 
 print()
 print("[4] streaming text event order")
@@ -184,29 +187,47 @@ check("tool stop reason is tool_use", tool_final["delta"]["stop_reason"] == "too
 
 print()
 print("[6] streaming error event")
-frames = []
-try:
-    for frame in P.stream_messages_events(iter([
-            b'data: {"error":{"message":"boom"}}\n\n']), "m"):
-        frames.append(frame)
-    check("upstream error is propagated to the HTTP handler", False)
-except RuntimeError as exc:
-    check("upstream error is propagated to the HTTP handler", "boom" in str(exc), exc)
-err_events = parse_events(frames)
-check("an errored stream never reports message_stop",
-      all(event != "message_stop" for event, _ in err_events), err_events)
+err_events = parse_events(list(P.stream_messages_events(iter([
+    b'data: {"error":{"message":"boom"}}\n\n']), "m")))
+check("error event is emitted", err_events and err_events[-1][0] == "error", err_events)
+check("error payload has a native type",
+      err_events[-1][1]["error"]["type"] == "api_error" if err_events else False, err_events)
+
+print()
+print("[6b] streaming thinking events")
+think_chunks = [
+    b'data: {"id":"chatcmpl_4","model":"m","choices":[{"delta":{"reasoning_content":"hmm"}}]}\n\n',
+    b'data: {"id":"chatcmpl_4","model":"m","choices":[{"delta":{"reasoning_content":" ok"}}]}\n\n',
+    b'data: {"id":"chatcmpl_4","model":"m","choices":[{"delta":{"content":"42"}}]}\n\n',
+    b'data: {"id":"chatcmpl_4","model":"m","choices":[{"finish_reason":"stop","delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\n',
+    b'data: [DONE]\n\n',
+]
+t_events = parse_events(list(P.stream_messages_events(iter(think_chunks), "m")))
+t_types = [e[0] for e in t_events]
+starts = [e[1] for e in t_events if e[0] == "content_block_start"]
+check("thinking block opens before the text block",
+      starts and starts[0]["content_block"]["type"] == "thinking"
+      and len(starts) > 1 and starts[1]["content_block"]["type"] == "text", starts)
+thinking = "".join(e[1]["delta"]["thinking"] for e in t_events
+                   if e[0] == "content_block_delta" and e[1]["delta"].get("type") == "thinking_delta")
+check("thinking deltas combine", thinking == "hmm ok", thinking)
+body_text = "".join(e[1]["delta"]["text"] for e in t_events
+                    if e[0] == "content_block_delta" and e[1]["delta"].get("type") == "text_delta")
+check("text deltas combine", body_text == "42", body_text)
+stop_idx = [e[1]["index"] for e in t_events if e[0] == "content_block_stop"]
+check("thinking block stops before the text block", stop_idx == [0, 1], stop_idx)
+check("stream ends with message_stop", t_types and t_types[-1] == "message_stop", t_types)
 
 print()
 print("[7] count_tokens uses the native response shape")
 count = P._anthropic_estimate_chat_tokens(P.messages_to_chat({"model": "m", "messages": [
-    {"role": "user", "content": "你好 hello"}]}, require_max_tokens=False))
+    {"role": "user", "content": "你好 hello"}]}))
 check("count is positive", count > 0, count)
 
 print()
 print("[8] mid-conversation system role is translated, not rejected")
 mid = P.messages_to_chat({
     "model": "m",
-    "max_tokens": 8,
     "system": "top",
     "messages": [
         {"role": "user", "content": "hi"},
@@ -220,8 +241,7 @@ check("system message keeps its place in the conversation",
 check("its text blocks are flattened into the message",
       mid["messages"][2].get("content") == "hook context", mid["messages"][2])
 try:
-    P.messages_to_chat({"model": "m", "max_tokens": 8,
-                        "messages": [{"role": "tool", "content": "x"}]})
+    P.messages_to_chat({"model": "m", "messages": [{"role": "tool", "content": "x"}]})
     check("an unsupported role is still rejected", False, "no ValueError raised")
 except ValueError as exc:
     check("an unsupported role is still rejected and named",

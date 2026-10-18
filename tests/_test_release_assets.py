@@ -251,6 +251,21 @@ class ManifestTests(unittest.TestCase):
                      "start-wb-proxy.command", "start-wb-proxy-lan.sh"):
             self.assertIn(name, listed)
 
+    def test_every_launcher_script_is_listed(self):
+        """启动脚本按前缀全量扫：漏登记一个就在这儿红。
+
+        #285 的教训：portable.txt 里 start-wb-proxy-lan.bat 被 restart-wb-proxy.bat
+        顶掉了，而新脚本恰恰要调用它——便携包少了这个文件，Windows 的 LAN 启动与
+        重启都会失败。上面那份手写清单只点了 .sh 的名，所以没拦住。
+        quick-deploy.sh 是 Docker 路径、刻意不进便携包，不在前缀里。
+        """
+        listed = tools.read_manifest()
+        for prefix in ("start-wb-proxy", "restart-wb-proxy", "allow-firewall"):
+            for path in sorted(glob.glob(os.path.join(ROOT, prefix + "*"))):
+                name = os.path.basename(path)
+                if name.endswith((".bat", ".sh", ".command")):
+                    self.assertIn(name, listed, "便携包清单缺少 %s" % name)
+
     def test_runtime_data_files_are_listed(self):
         # wb_pricing._candidate_file() prefers pricing/pricing.json over the
         # copy inlined in the module, so a package without it silently ships
@@ -822,6 +837,33 @@ class ReleaseWorkflowTests(unittest.TestCase):
             stripped = line.strip()
             if stripped.startswith("wrt/") and (".ipk" in stripped or ".apk" in stripped):
                 self.fail("上传路径不能直接指向 wrt/：%s" % stripped)
+
+
+    def test_portable_scripts_have_lf_and_executable_mode(self):
+        # Issue #329: 检查便携包内脚本换行与执行权限
+        # *.sh 与 *.command 必须为 LF 且带有 0o755 执行权限；*.bat 必须为 CRLF
+        crlf = bytes([13, 10])
+        with tempfile.TemporaryDirectory(prefix="wb-test-eol-") as tmp:
+            rt = os.path.join(tmp, "python")
+            make_runtime(rt)
+            out_zip = os.path.join(tmp, "out.zip")
+            ver = tools.source_version(ROOT)
+            tools.build_portable(ver, "v" + ver, out_zip, source=ROOT, runtime_dir=rt)
+            with zipfile.ZipFile(out_zip, "r") as zf:
+                for info in zf.infolist():
+                    name_lower = info.filename.lower()
+                    mode = (info.external_attr >> 16) & 0o777
+                    if name_lower.endswith((".sh", ".command")):
+                        content = zf.read(info)
+                        self.assertNotIn(crlf, content, f"{info.filename} 包含 CRLF 换行符")
+                        self.assertEqual(mode, 0o755, f"{info.filename} 权限不是 0o755 (got {oct(mode)})")
+                    elif name_lower.endswith(".bat"):
+                        content = zf.read(info)
+                        self.assertIn(crlf, content, f"{info.filename} 必须包含 CRLF 换行符")
+                        self.assertEqual(mode, 0o755, f"{info.filename} 权限不是 0o755")
+                    elif name_lower.endswith(".py"):
+                        content = zf.read(info)
+                        self.assertNotIn(crlf, content, f"{info.filename} 必须为 LF 换行符")
 
 
 if __name__ == "__main__":

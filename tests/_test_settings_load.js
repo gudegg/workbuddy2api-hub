@@ -42,8 +42,12 @@ const SETTINGS = {
   },
   pricing_enabled: false,
   pricing_refresh_minutes: 5,
+  section_max_height: 640,
   auto_switch_product: true,
   daily_chat_web: false,
+  daily_chat_web_timeout: 300,
+  daily_chat_web_timeout_default: 120,
+  daily_chat_web_attempts_default: 3,
   local_web_tools: true,
   remaining_priority_enabled: true,
   version: 'v1.6.14',
@@ -148,13 +152,24 @@ global.__toasts = toasts;
   assert.equal(element('setPricingState').textContent, '(每 5 分钟)');
   assert.equal(element('setAutoSwitch').checked, true);
   assert.equal(element('setDailyChatWeb').checked, false);
+  // 网页通道重试：字段缺失时按默认（开、3 次）显示，次数框写回 3，状态行把
+  // 实际等待序列算出来（300 起、逐轮翻倍）。
+  assert.equal(element('setDailyChatWebRetry').checked, true, '重试开关没按默认写回');
+  assert.equal(element('setDailyChatWebAttempts').value, '3', '最多尝试次数没写回');
+  assert.equal(element('setDailyChatWebAttempts').disabled, false, '重试开着时次数框应可改');
+  assert.equal(element('setDailyChatWebTimeout').value, '300', '首轮等待秒数没写回');
+  assert.equal(element('setDailyChatWebRetryState').textContent,
+    '最多尝试 3 次 · 300 / 600 / 1200 秒', '重试状态行没写回');
   assert.equal(element('setLocalWebTools').checked, true);
   assert.equal(element('setRemainingPriority').checked, true,
     '剩余用量优先调度的复选框没写回');
   assert.equal(element('setRemainingPriorityState').textContent, '(已启用)');
   assert.equal(element('setLimitsPerRealm').checked, true, '有分版本覆盖时应勾上');
+  assert.equal(element('setWinMaxHeight').value, '640', '窗口限高输入框没写回');
+  assert.equal(element('setWinMaxHeightState').textContent, '(当前 640px)',
+    '窗口限高状态文案没写回');
 
-  realLog('loadSettings 完整性断言通过（16 项）');
+  realLog('loadSettings 完整性断言通过（18 项）');
 })().catch(e => {
   console.log = realLog;
   console.error(e && e.stack || e);

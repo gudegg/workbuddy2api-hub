@@ -204,7 +204,6 @@ class CatalogEntryTests(unittest.TestCase):
         class Handler(wb_proxy.Handler):
             def __init__(self):
                 self.captured = None
-                self.headers = {}
 
             def _authorized(self):
                 return True

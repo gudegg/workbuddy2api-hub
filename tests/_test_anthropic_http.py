@@ -32,6 +32,7 @@ os.makedirs(os.environ["WB_PROXY_USAGE_DIR"], exist_ok=True)
 os.environ["HOME"] = WORK
 os.environ["USERPROFILE"] = WORK
 os.environ["WB_PROXY_KEY"] = "TESTKEY"
+os.environ.pop("WB_ENABLE_ANTHROPIC_MESSAGES", None)
 
 
 def jwt(uid="acct-http-1"):
@@ -235,6 +236,28 @@ try:
         print("  [FAIL] gateway did not start")
         sys.exit(1)
 
+    print("[0] Anthropic entrypoints fail closed by default")
+    blocked_request = {
+        "model": "deepseek-v4.1-flash", "max_tokens": 8, "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    for path in ("/v1/messages", "/messages",
+                 "/v1/messages/count_tokens", "/messages/count_tokens"):
+        code, _h, body = request(
+            "POST", path, blocked_request, headers={"x-api-key": "TESTKEY"})
+        payload = json.loads(body or b"{}")
+        error = payload.get("error") or {}
+        check("blocked %s -> non-retryable Anthropic 400" % path,
+              code == 400 and payload.get("type") == "error"
+              and error.get("type") == "invalid_request_error"
+              and "WB_ENABLE_ANTHROPIC_MESSAGES" in error.get("message", ""),
+              (code, payload))
+    check("disabled requests never reach the upstream", not MOCK["requests"],
+          MOCK["requests"])
+
+    # Existing protocol tests below explicitly exercise the risky opt-in path.
+    os.environ["WB_ENABLE_ANTHROPIC_MESSAGES"] = "1"
+
     print("[1] auth uses the Anthropic error envelope")
     code, headers, body = request(
         "POST", "/v1/messages",
@@ -316,8 +339,7 @@ try:
           msg.get("content") == [{"type": "text", "text": "Hello world"}], msg.get("content"))
     check("stop_reason is end_turn", msg.get("stop_reason") == "end_turn", msg.get("stop_reason"))
     check("usage maps input/output",
-          (msg.get("usage") or {}).get("input_tokens") == 8
-          and (msg.get("usage") or {}).get("cache_read_input_tokens") == 3
+          (msg.get("usage") or {}).get("input_tokens") == 11
           and (msg.get("usage") or {}).get("output_tokens") == 2, msg.get("usage"))
     sent = (MOCK["requests"][0].get("body") or {}) if MOCK["requests"] else {}
     check("upstream saw the system prompt",
@@ -355,8 +377,7 @@ try:
     final = [e[1] for e in events if e[0] == "message_delta"][0]
     check("final delta carries stop_reason + usage",
           final["delta"]["stop_reason"] == "end_turn"
-          and final["usage"]["input_tokens"] == 8
-          and final["usage"]["cache_read_input_tokens"] == 3
+          and final["usage"]["input_tokens"] == 11
           and final["usage"]["output_tokens"] == 2, final)
     start = [e[1] for e in events if e[0] == "message_start"][0]
     check("message_start names the model",

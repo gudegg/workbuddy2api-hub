@@ -15,6 +15,7 @@ issue #90：POST /console/as/conversations/ 只是**排队**了一条会话。ag
 这个。这里只实现打卡需要的那点协议：不带工具、不接终端、不回调文件系统。
 """
 
+import base64
 import http.client
 import json
 import queue
@@ -29,6 +30,40 @@ CLIENT_CAPABILITIES = {
     "fs": {"readTextFile": False, "writeTextFile": False},
     "terminal": False,
 }
+
+
+def _proxy_parts(proxy_url):
+    """解析代理 URL → (host, port, CONNECT 头)。
+
+    两种写法都要认：`http://user:pass@host:port`，以及无 scheme 的
+    `user:pass@host:port`（面板两种都有人填，urllib 那条路径也两种都收）。
+    凭据的取值口径与 urllib.request.ProxyHandler.proxy_open 一致（先 unquote
+    再 base64），这样同一个代理 URL 在桌面通道与网页通道上生成同一份凭据。
+    """
+    raw = str(proxy_url or "").strip()
+    parsed = urllib.parse.urlparse(raw)
+    host, port = parsed.hostname, parsed.port
+    user, password = parsed.username, parsed.password
+    if not host:
+        # 无 scheme 的写法 urlparse 认不出来（`user:pass@h:p` 会被当成 scheme），
+        # 手动切 authority。
+        authority = raw.split("://")[-1].split("/")[0]
+        userinfo, _, hostport = authority.rpartition("@")
+        host, _, port_text = hostport.rpartition(":")
+        if not host:                       # 没有端口
+            host, port_text = hostport, ""
+        try:
+            port = int(port_text) if port_text else None
+        except ValueError:
+            port = None
+        if userinfo:
+            user, _, password = userinfo.partition(":")
+    headers = {}
+    if user and password:
+        creds = "%s:%s" % (urllib.parse.unquote(user), urllib.parse.unquote(password))
+        headers["Proxy-Authorization"] = "Basic " + base64.b64encode(
+            creds.encode("utf-8")).decode("ascii")
+    return host, port, headers
 
 
 class AcpError(Exception):
@@ -67,9 +102,12 @@ class AcpChannel(object):
         conn = cls(parsed.hostname, port, timeout=self.timeout)
         if self.proxy:
             # 账号配了代理时走 CONNECT，和 urlopen 那条路径保持一致。
-            proxy = urllib.parse.urlparse(self.proxy)
-            conn = cls(proxy.hostname, proxy.port or 8080, timeout=self.timeout)
-            conn.set_tunnel(parsed.hostname, port)
+            # 凭据必须显式塞进 CONNECT：urllib 的 ProxyHandler 会替我们加
+            # Proxy-Authorization，裸 http.client + set_tunnel 不会，缺了它
+            # 认证代理一律回 407（桌面通道正常、网页通道 407 就是这个原因）。
+            host, proxy_port, tunnel_headers = _proxy_parts(self.proxy)
+            conn = cls(host, proxy_port or 8080, timeout=self.timeout)
+            conn.set_tunnel(parsed.hostname, port, headers=tunnel_headers)
         return conn
 
     def open(self):
@@ -160,14 +198,36 @@ class AcpChannel(object):
                 pass
 
 
+def _set_model(channel, session_id, model, log):
+    """把这一轮用的模型钉到会话上（网页端的做法）。
+
+    建会话请求体里的 model 只写进会话的 manifest，真正决定这一轮用哪个模型的
+    是这条 ACP 扩展请求：网页端在 session/load 之后、session/prompt 之前单独
+    发它（客户端 SDK 里就是 extMethod("session/set_model", {sessionId,
+    modelId})）。少了它，会话跑的是账号的默认模型——网页端默认是 Auto，按付费
+    模型计费，于是每天的活跃都在扣积分。
+
+    失败不当致命错：这一轮还是要跑完，只是模型可能没切成，日志里留一句。
+    """
+    try:
+        channel.request("session/set_model",
+                        {"sessionId": session_id, "modelId": model}, 3)
+        return True
+    except Exception as exc:
+        log("web agent: 设置模型 %s 失败 (%s)，本轮仍按会话默认模型跑" % (model, exc))
+        return False
+
+
 def run_turn(link, token, session_id, cwd, prompt, user_agent, poll_status=None,
              wait_seconds=120, poll_interval=3, log=None, proxy="",
-             channel_factory=AcpChannel):
+             channel_factory=AcpChannel, model=None):
     """接上沙箱、把这一轮跑完。
 
     poll_status 是调用方给的「这条会话现在什么状态」（查 console API）；看到
     completed 就算跑完，failed/error 直接停。返回结果里带事件数与输出段数，
     方便在打卡结果里一眼看出到底跑没跑。
+
+    model 非空时，在 session/load 之后补一条 session/set_model —— 见 _set_model。
     """
     log = log or (lambda *a, **k: None)
     started = time.time()
@@ -183,9 +243,11 @@ def run_turn(link, token, session_id, cwd, prompt, user_agent, poll_status=None,
         channel.request("session/load",
                         {"sessionId": session_id, "cwd": cwd or "/workspace",
                          "mcpServers": []}, 2)
+        if model:
+            _set_model(channel, session_id, model, log)
         channel.request("session/prompt",
                         {"sessionId": session_id,
-                         "prompt": [{"type": "text", "text": prompt}]}, 3)
+                         "prompt": [{"type": "text", "text": prompt}]}, 4)
         deadline = time.time() + max(1, int(wait_seconds))
         while time.time() < deadline:
             if poll_status is not None:

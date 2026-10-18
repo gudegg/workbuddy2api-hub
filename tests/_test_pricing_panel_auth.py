@@ -65,7 +65,6 @@ class Request(object):
     _authorized = proxy.Handler._authorized
     _supplied_key = proxy.Handler._supplied_key
     _request_realm = proxy.Handler._request_realm
-    _is_anthropic_request = proxy.Handler._is_anthropic_request
     _error = proxy.Handler._error
     _get_pricing = proxy.Handler._get_pricing
     _get_v1_models = proxy.Handler._get_v1_models

@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from wb_fingerprint import derive_id, generate_request_id
+from wb_fingerprint import derive_id, generate_request_id, session_id
 import wb_activity
 import wb_atrest
 import wb_identity
@@ -44,7 +44,11 @@ WEB_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 DAILY_CHAT_MODEL = "deepseek-v4.1-flash"
 DAILY_CHAT_WEB_PROMPT = "Hi"
 #: 网页通道一轮最多等多久（秒）。实测一次「Hi」十几秒就跑完，留足余量。
+#: 没配 settings 的账号（如单测里手工构造的）用它兜底。
 WEB_TURN_TIMEOUT = int(os.environ.get("WB_WEB_TURN_TIMEOUT") or "120")
+#: 网页通道一共试几次（含第一轮）。第 N 轮的等待是首轮的 2^(N-1) 倍，所以
+#: 3 次 = 最多等 base×(1+2+4) 秒。设置页可改（见 wb_settings.daily_chat_web_attempts）。
+WEB_TURN_ATTEMPTS = 3
 
 
 def _retryable(exc):
@@ -177,8 +181,10 @@ REALM_CONFIGS = {
         "billing_upstream": "https://www.workbuddy.ai",
         "origin": "https://www.workbuddy.ai",
         "domain": "www.workbuddy.ai",
-        "chat_ua": "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2",
-        "billing_ua": "WorkBuddy/5.5.2",
+        # 5.8.4 实测（2026-10-16 抓包）：桌面端 UA 是三段式，末段是客户端内置
+        # CLI 的版本；取值与 wb_identity.DESKTOP_UA_INTL 保持同一来源。
+        "chat_ua": wb_identity.DESKTOP_UA_INTL,
+        "billing_ua": "WorkBuddy/%s" % wb_identity.DESKTOP_VERSION_INTL,
         "info_filename": "workbuddy-desktop-ai.info",
         "cache_dir_name": ".workbuddy-ai",
         "has_checkin": False,
@@ -189,8 +195,10 @@ REALM_CONFIGS = {
         "billing_upstream": "https://www.codebuddy.cn",
         "origin": "https://www.codebuddy.cn",
         "domain": "copilot.tencent.com",
-        "chat_ua": "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1",
-        "billing_ua": "WorkBuddy/5.5.6",
+        # 国内版没有对应抓包，取值维持原样，但同样从 wb_identity 取，
+        # 免得两处各写一份（国际版 5.8.4 对齐时就漏改过 intl 那一份）。
+        "chat_ua": wb_identity.DESKTOP_UA_CN,
+        "billing_ua": "WorkBuddy/%s" % wb_identity.DESKTOP_VERSION_CN,
         "info_filename": "workbuddy-desktop.info",
         "cache_dir_name": ".workbuddy",
         "has_checkin": True,
@@ -212,7 +220,10 @@ ENTERPRISE_USAGE_PATH = "/billing/meter/get-enterprise-user-usage"
 LOGIN_PENDING = 11217
 LOGIN_TTL_SECONDS = 600
 USER_AGENT = REALM_CONFIGS['intl']['chat_ua']
-DEFAULT_UA_VERSION = '5.5.2'
+#: 国际版桌面端的版本号。以前这里硬编码 5.5.2，和 wb_identity 的
+#: DESKTOP_VERSION_INTL 各写一份，改版本时容易只改一处（5.8.4 对齐时
+#: 就漏了这个常量）。现在统一从 wb_identity 取，保持单一来源。
+DEFAULT_UA_VERSION = wb_identity.DESKTOP_VERSION_INTL
 
 def get_realm_config(realm):
     return REALM_CONFIGS.get(realm) or REALM_CONFIGS["intl"]
@@ -262,6 +273,29 @@ FREE_CAP_MODELS = {
     "intl": frozenset({"hy4-preview-f", "hy3", "deepseek-v4.1-flash"}),
     "cn": frozenset({"hy4-preview-f", "hy3"}),
 }
+
+
+def normalise_disabled_models(raw):
+    """把「人工禁用的模型名单」归一成干净的 list[str]。
+
+    供账号档加载与面板写入两条路共用，保证「内存里的判断」和「落盘的内容」
+    口径一致：保留非空字符串、按小写归一（与 is_model_banned 同口径）、去重、
+    保持输入顺序。非列表输入一律当作「没配」返回空列表——坏数据不至于让账号
+    加载失败。
+    """
+    out = []
+    if not isinstance(raw, (list, tuple)):
+        return out
+    seen = set()
+    for mid in raw:
+        if not isinstance(mid, str):
+            continue
+        m = mid.strip().lower()
+        if not m or m in seen:
+            continue
+        seen.add(m)
+        out.append(m)
+    return out
 
 
 def is_free_cap_model(realm, model):
@@ -424,6 +458,16 @@ SOFT_RATE_UNVERIFIED_MAX = 600.0
 BREAKER_THRESHOLD = 3           # consecutive hard failures before the breaker
 BREAKER_COOLDOWN = 1800.0       # first breaker window: 30 minutes
 BREAKER_COOLDOWN_MAX = 21600.0  # ... doubling up to 6 hours
+# 上面那个「连续」必须有时间含义：老实现只认次数、不认间隔，fails 只有成功才
+# 归零，于是同一条凭据几小时前的一次 502 + 几天前的一次超时 + 刚才一次抖动就凑成
+# 「连续 3 次」，把账号关 30 分钟——而且关得越久下次越容易再凑满（1800 → 3600 →
+# 7200…）。生产上的表现就是「明明测了能用，它还熔断」。现在两次失败间隔超过这个
+# 窗口就重新从 1 数起，连续才真的是连续。可用 WB_FAIL_WINDOW 覆盖，设 0 关闭衰减
+# （回到旧的累计行为）。
+try:
+    FAIL_WINDOW = max(0.0, float(os.environ.get("WB_FAIL_WINDOW") or 600.0))
+except (TypeError, ValueError):
+    FAIL_WINDOW = 600.0
 DEGRADE_THRESHOLD = 5           # consecutive unknown failures before degrading
 DEGRADE_COOLDOWN = 600.0        # first degrade window: 10 minutes
 DEGRADE_COOLDOWN_MAX = 7200.0   # ... doubling up to 2 hours
@@ -506,6 +550,30 @@ class Account(object):
         # Runtime-resolved value; recomputed by AccountPool.apply_proxy_slots().
         self.proxy = self.proxy_legacy
         self.enabled = data.get("enabled", True)
+        # 手动调度权重（面板按账号设置，1 = 不干预）。随凭证档持久化：这是
+        # 用户的明确分派意图，不该在重启后悄悄回到默认。非法值一律回落 1，
+        # 坏数据不至于让账号加载失败。
+        try:
+            self.weight = max(1, min(100, int(data.get("weight") or 1)))
+        except (TypeError, ValueError):
+            self.weight = 1
+        # 账号备注（面板自填，比如「批量」/「自用」）：随凭证档持久化，导出
+        # 与导入照常携带。只做展示，不参与任何调度判断；非字符串一律视为没
+        # 写过，超长截断，别让一条长备注把账号行撑爆。
+        raw_note = data.get("note")
+        self.note = (raw_note if isinstance(raw_note, str) else "").strip()[:200]
+        # 该账号**人工**禁用的模型名单（面板 / 接口配置）。与 weight、note 同款：
+        # 随凭证档持久化 —— 这是使用者的明确意图，不该在重启后悄悄回到默认。
+        #
+        # 与 model_cooldowns / model_caps 那些**自动**节流区分开：那些表达「暂时
+        # 不该用」（限流或额度撞线的恢复窗口），这里表达「这个号就别碰这几个
+        # 模型」。典型用途：某个号在某些模型上有授权/合规限制，但同一个模型还想
+        # 走别的号——那就禁这一对组合，而不是把整个号停掉。
+        #
+        # 模型 id 统一**小写**存储与比较（与 is_model_banned 的口径一致），
+        # 只做精确匹配不做前缀：行为可预期，不会误伤同前缀的其他模型。
+        raw_deny = data.get("disabledModels")
+        self.disabled_models = normalise_disabled_models(raw_deny)
         # Live error state, never restored from the credential file: the label
         # describes the last upstream answer, not the credential. It used to be
         # persisted and read back, so a 429 that had long since recovered came
@@ -525,6 +593,12 @@ class Account(object):
         # otherwise a single throttled model blackholes every request on the pool.
         # Deliberately runtime-only (not persisted): see VOLATILE_FIELDS.
         self.model_cooldowns = {}
+        # 每个模型冷却窗口是**什么时候挂上的**（model -> epoch）。model_cooldowns
+        # 只留恢复时刻，起始时刻以前被丢掉：面板因此无法如实说「限流时刻」，只能
+        # 用「—」占位，把 60s 的短时 parking 和几小时的 6004 撞线画成一样。与
+        # model_cooldowns 同款运行时态：重启即清零（6004 的撞线时刻另有持久化的
+        # model_caps["at"]）。
+        self.model_cooldowns_at = {}
 # 402 (out of credits): a hard park until the next local 04:00,
         # instead of a short cooldown that would retry an empty account all
         # day. Runtime-only, like the other throttle windows; a balance
@@ -541,6 +615,10 @@ class Account(object):
         self.degrade_count = 0
         self.breaker_until = 0.0
         self.degrade_until = 0.0
+        # 最近一次记失败的时刻：FAIL_WINDOW 用它判断「连续」是否还成立。
+        self.last_fail_at = 0.0
+        # 最近一次软限流（429）的时刻：两条软限流阶梯用同一个时间窗。
+        self.last_soft_at = 0.0
         self.credits = data.get("credits") or None
         self.last_checkin = data.get("lastCheckin") or None
         self.last_daily_chat = data.get("lastDailyChat") or None
@@ -647,6 +725,9 @@ class Account(object):
             "proxySlot": self.proxy_slot,
             "proxy": self.proxy_legacy,
             "enabled": self.enabled,
+            "weight": self.weight,
+            "note": self.note,
+            "disabledModels": list(self.disabled_models),
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
@@ -669,6 +750,11 @@ class Account(object):
         models = []
         for model, until in active:
             entry = {"model": model, "expiresAt": int(until)}
+            # 这个窗口是何时挂上的：面板据此把「限流时刻」如实画出来，而不是拿
+            # 「—」占位（临时 429 与 6004 撞线都由此有真实的时间语义）。
+            started = self.model_cooldowns_at.get(model)
+            if started:
+                entry["startedAt"] = int(started)
             # 撞线时间只在 cap 还在恢复期内时带上：它同时说明这次禁用是
             # 「额度用满」（6004）而不是一次临时限流，面板据此显示两段时间。
             if self.cap_until(model, now) > 0:
@@ -693,6 +779,9 @@ class Account(object):
             "product": self.product,
             "enterpriseId": self.enterprise_id,
             "enabled": bool(self.enabled),
+            "weight": int(self.weight),
+            "note": self.note,
+            "disabledModels": list(self.disabled_models),
             "source": self.source,
             "proxySlot": self.proxy_slot,
             "proxy": self.proxy,
@@ -708,6 +797,11 @@ class Account(object):
             "unscopedStreak": int(self.unscoped_streak),
             "breakerFor": round(max(0.0, self.breaker_until - now)) or None,
             "degradeFor": round(max(0.0, self.degrade_until - now)) or None,
+            # 连续失败计数（离熔断还差几次）与最近一次失败的时间：面板用它解释
+            # 「为什么这个账号被关了」，也是「一键测试」判定成功/失败的依据。
+            "fails": int(self.fails),
+            "failWindow": int(FAIL_WINDOW),
+            "lastFailFor": (round(max(0.0, now - self.last_fail_at)) if self.last_fail_at else None),
             "addedAt": self.added_at,
             "file": os.path.basename(self.path) if self.path else None,
             "credits": self.credits,
@@ -735,7 +829,7 @@ class Account(object):
             "canDailyChat": self.realm == "intl",
             "canReportActivity": self.realm == "cn" and not self.is_enterprise(),
             "machineId": derive_id(self.uid, "machine"),
-            "sessionId": derive_id(self.uid, "session"),
+            "sessionId": session_id(self.uid),
         }
 
     def save(self, directory):
@@ -1036,6 +1130,10 @@ class Account(object):
             return "已停用"
         if not self.access_token:
             return "无凭证"
+        # 与 ready() 同序：人工黑名单排在所有「暂时不可用」之前，所以
+        # 「所有账号都禁用了这个模型」时，池子抽干的报错里会逐个号写明原因。
+        if self.model_disabled(model):
+            return "该模型已被人工禁用"
         now = time.time()
         # 四种惩罚的到期时间各走各的，谁把时间推得最远就报谁：只报「冷却」
         # 会让人往 429 的方向查，而实际可能是上游连续断连触发的熔断（30 分钟
@@ -1046,7 +1144,15 @@ class Account(object):
             penalties.append(("模型 %s 冷却" % model, self.model_cooldowns.get(model, 0.0)))
         label, until = max(penalties, key=lambda item: item[1])
         if until > now:
-            return "%s 剩余 %s" % (label, _human_delta(until - now) or "?")
+            # 剩余时间要精确到秒：还剩 42 秒时写「0 min」，读起来就是「已经该能用
+            # 了却还被挡着」——生产日志里那串「软限流冷却 剩余 0 min」就是这么
+            # 来的。连续次数一并带上，才看得出是在升级还是刚开始。
+            streak = ""
+            if label == "软限流冷却" and self.soft_streak > 1:
+                streak = "（连续第 %d 次）" % self.soft_streak
+            elif label.startswith("模型") and self.unscoped_streak > 1:
+                streak = "（连续第 %d 次）" % self.unscoped_streak
+            return "%s 剩余 %s%s" % (label, _human_left(until - now), streak)
         if self.reserve_blocked():
             return "余额低于保留线"
         if self.daily_limit_blocked():
@@ -1060,8 +1166,23 @@ class Account(object):
             return "凭证已过期"
         return ""
 
+    def model_disabled(self, model):
+        """这个账号被人工禁用了该模型？空名单恒为 False。
+
+        与自动节流区分：`model_cooldowns` / `model_caps` 表达「暂时不该用」，
+        这里是使用者明确指定的「这个号就别碰这几个模型」。精确匹配（名单在
+        加载时已按小写归一），不做前缀匹配。
+        """
+        if not model or not self.disabled_models:
+            return False
+        return str(model).strip().lower() in self.disabled_models
+
     def ready(self, model=None):
         if not self.enabled or not self.access_token:
+            return False
+        # 人工黑名单排在最前：它是静态配置（最便宜），而且在语义上优先于所有
+        # 「暂时不可用」的判断 —— 被禁用的模型不该因为账号恰好恢复了就漏进来。
+        if self.model_disabled(model):
             return False
         if self.throttle_wait(model=model) > 0:
             return False
@@ -1100,6 +1221,15 @@ class Account(object):
 
         chat 用途走 wb_identity（CLI 头 / WorkBuddy 头，可切换）；
         billing 用途维持原本的轻量标头，计费端点不吃那套身分。
+
+        chat 标头按 5.8.4 抓包对齐：官方对话请求不带 X-Machine-ID /
+        X-Session-ID（那两个只用于反馈上报），所以这里也不再发——之前发的
+        是每个账号恒定的派生值，反而是一处「网关特征」。
+
+        billing 标头仍带 X-Machine-ID / X-Session-ID，但两个都必须按账号派生：
+        网关是一个进程冒充几十台设备，一旦取进程级的值，全部账号就会共用同一个
+        session id，那是一条把它们串起来的关联键（与每账号一台设备的隔离口径
+        相悖）。见 wb_fingerprint.session_id。
         """
         cfg = get_realm_config(self.realm)
 
@@ -1118,7 +1248,7 @@ class Account(object):
                 "Accept-Language": "en-US" if self.realm == "intl" else "zh-CN",
                 "X-Request-ID": generate_request_id(self.uid),
                 "X-Machine-ID": derive_id(self.uid, "machine"),
-                "X-Session-ID": derive_id(self.uid, "session"),
+                "X-Session-ID": session_id(self.uid),
             }
             if self.enterprise_id:
                 headers["X-Enterprise-Id"] = self.enterprise_id
@@ -1137,7 +1267,6 @@ class Account(object):
             realm=self.realm,
             uid=self.uid,
             token=self.access_token,
-            conversation_id=getattr(self, "conversation_id", None),
             enterprise_id=self.enterprise_id,
             tenant_id=self.enterprise_id,
         )
@@ -1149,8 +1278,6 @@ class Account(object):
             "Referer": cfg["origin"] + "/",
             "X-CodeBuddy-Request": "1",
             "Accept-Language": "en-US" if self.realm == "intl" else "zh-CN",
-            "X-Machine-ID": derive_id(self.uid, "machine"),
-            "X-Session-ID": derive_id(self.uid, "session"),
         }
         headers.update(identity)
         device_token = self._device_token()
@@ -1294,6 +1421,34 @@ class Account(object):
             "User-Agent": WEB_USER_AGENT,
         }
 
+    def daily_chat_model(self):
+        """Which model this account's daily activity runs on.
+
+        The panel's setting wins when set; otherwise the built-in free id. Both
+        legs (the desktop-identity completion and the web conversation) read
+        this, so one setting moves the whole activity.
+        """
+        candidates = []
+        if self.path:
+            picked = wb_settings.daily_chat_model(os.path.dirname(self.path))
+            if picked:
+                candidates.append(picked)
+        candidates.append(DAILY_CHAT_MODEL)
+        # Add fallback free models for the account's realm if preferred model is cooling down
+        if self.realm == "intl":
+            candidates.extend(["hy3", "hy4-preview-f", "hy4-preview", "glm-5.3-flash"])
+        else:
+            candidates.extend(["hy3", "hy4-preview-f", "hy4-preview"])
+
+        now = time.time()
+        with self._throttle_lock:
+            for cand in candidates:
+                # Check model-level cooldown or cap directly
+                cooldown_until = self.model_cooldowns.get(cand, 0.0)
+                if cooldown_until <= now and self.cap_until(cand, now) <= 0.0:
+                    return cand
+        return candidates[0]
+
     def daily_chat_web(self, prompt=None, trigger="unknown"):
         """网页通道的每日活跃会话（issue #75 / #59 / #90）。
 
@@ -1315,10 +1470,55 @@ class Account(object):
         return res
 
     def _daily_chat_web_upstream(self, prompt=None):
-        """网页通道的实际流程；返回形状见 daily_chat_web。"""
+        """网页通道的实际流程；返回形状见 daily_chat_web。
+
+        失败会再试（见 daily_chat_web_policy）：一共最多 attempts 次（含第一轮），
+        第 N 轮的等待是首轮的 2^(N-1) 倍 —— 默认 3 次、首轮 120 秒，也就是
+        120 / 240 / 480。最典型的失败是「会话还没跑完」（状态=working），它往往
+        只是慢，多等一轮就好，所以这里把等待时间当成重试的代价，不再额外 sleep。
+        业务拒绝（建会话返回非 0 code）不再试：同一个被拒的请求再发一次也一样被拒。
+
+        返回里带 attempts（实际跑了几轮），其余字段与 _daily_chat_web_once 一致。
+        """
+        base, total = self.daily_chat_web_policy()
+        attempt = 0
+        while True:
+            res = self._daily_chat_web_once(prompt, wait_seconds=base * (2 ** attempt))
+            res["attempts"] = attempt + 1
+            if res.get("ok") or attempt + 1 >= total or not res.get("retryable"):
+                return res
+            attempt += 1
+
+    def daily_chat_web_policy(self):
+        """(首轮等待秒数, 总尝试次数)。设置页改过就按设置页的来。
+
+        重试开关默认开（见 wb_settings.daily_chat_web_retry），关掉就是只试一次。
+        等待时间没设过时用 WEB_TURN_TIMEOUT —— 它吃 WB_WEB_TURN_TIMEOUT 环境变量，
+        别让这个新设置项把它悄悄顶掉。没配 settings 的账号（单测里手工构造的）
+        同样按内置默认走。
+        """
+        if not self.path:
+            return WEB_TURN_TIMEOUT, WEB_TURN_ATTEMPTS
+        directory = os.path.dirname(self.path)
+        total = 1
+        if wb_settings.daily_chat_web_retry(directory):
+            total = wb_settings.daily_chat_web_attempts(directory,
+                                                        default=WEB_TURN_ATTEMPTS)
+        return (wb_settings.daily_chat_web_timeout(directory, default=WEB_TURN_TIMEOUT),
+                total)
+
+    def _daily_chat_web_once(self, prompt=None, wait_seconds=None):
+        """网页通道的一轮尝试；返回形状见 daily_chat_web。
+
+        结果里的 retryable 说明这一轮的失败值不值得再试一次（重试策略见
+        _daily_chat_web_upstream）。
+        """
+        if wait_seconds is None:
+            wait_seconds = WEB_TURN_TIMEOUT
+        model = self.daily_chat_model()
         body = {
             "prompt": prompt or DAILY_CHAT_WEB_PROMPT,
-            "model": DAILY_CHAT_MODEL,
+            "model": model,
             # 网页端建会话时固定带上这两项（抓包所得），保持请求形态一致。
             "conversationOrigin": "workbuddy-app",
             "plugins": [{"name": "weixinpay", "marketplace": "codebuddy-builtin"}],
@@ -1335,39 +1535,44 @@ class Account(object):
                 detail = exc.read().decode("utf-8", "replace")
             except Exception:
                 detail = str(exc)
-            return {"ok": False, "error": "HTTP %d: %s" % (exc.code, detail[:120])}
+            return {"ok": False, "error": "HTTP %d: %s" % (exc.code, detail[:120]),
+                    "retryable": exc.code >= 500 or exc.code in (408, 429)}
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": str(exc), "retryable": True}
         if not isinstance(payload, dict):
-            return {"ok": False, "error": "unexpected response"}
+            return {"ok": False, "error": "unexpected response", "retryable": True}
         conversation = (payload.get("data") or {}).get("id")
         if payload.get("code") not in (0, None) or not conversation:
             return {"ok": False, "error": "code=%s msg=%s"
-                    % (payload.get("code"), payload.get("msg"))}
+                    % (payload.get("code"), payload.get("msg")),
+                    "retryable": False}
 
         # 建完只是排队：接上沙箱、请求这一轮，它才会真的跑起来（issue #90）。
         try:
             session = (self._web_conversation_get(conversation, "/session") or {}).get("data") or {}
         except Exception as exc:
             return {"ok": False, "conversation": conversation,
-                    "error": "session 查询失败: %s" % exc}
+                    "error": "session 查询失败: %s" % exc, "retryable": True}
         link = session.get("link") or session.get("endpoint") or ""
         token = session.get("token") or ""
         session_id = session.get("sessionId") or session.get("session_id") or conversation
         cwd = session.get("cwd") or "/workspace"
         if not link or not token:
             return {"ok": False, "conversation": conversation,
-                    "error": "沙箱未就绪（没有 link/token）"}
+                    "error": "沙箱未就绪（没有 link/token）", "retryable": True}
 
         result = wb_webagent.run_turn(
             link, token, session_id, cwd, prompt or DAILY_CHAT_WEB_PROMPT,
             WEB_USER_AGENT,
             poll_status=lambda: self._web_conversation_status(conversation),
-            wait_seconds=WEB_TURN_TIMEOUT, proxy=self.proxy)
+            wait_seconds=wait_seconds, proxy=self.proxy,
+            model=model)
         result["conversation"] = conversation
         if result.get("ok"):
             result["msg"] = "网页通道会话跑完：%d 段输出，%d ms" % (
                 result.get("chunks") or 0, result.get("elapsed_ms") or 0)
+        else:
+            result["retryable"] = True
         return result
 
     def _web_conversation_get(self, conversation, suffix=""):
@@ -1394,7 +1599,8 @@ class Account(object):
         settings.json 里的 daily_chat_web 决定，True/False 可显式指定。
 
         trigger 只用于活动历史的来源标注；整次尝试记一行，网页通道那一步的结果
-        并进同一行的说明里，不再多记一行。
+        并进同一行的说明里，不再多记一行。ok 以真正计入积分的网页腿为准：网页腿
+        开着且失败时整次算失败（桌面腿跑过也不算数）。
         """
         if self.realm != "intl":
             return {"ok": False, "error": "daily chat is only for international accounts"}
@@ -1408,7 +1614,7 @@ class Account(object):
         url = self.chat_base_url() + wb_proxy.CHAT_PATH
         headers = self.headers("chat")
         body = {
-            "model": DAILY_CHAT_MODEL,
+            "model": self.daily_chat_model(),
             "messages": [{"role": "user", "content": "Hi"}],
             "stream": True,
             "max_tokens": 10,
@@ -1420,26 +1626,43 @@ class Account(object):
         try:
             with urlopen(req, timeout=20, proxy=self.proxy) as resp:
                 _ = resp.read()
-            self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
-            if self.path and os.path.exists(os.path.dirname(self.path)):
-                self.save(os.path.dirname(self.path))
             try:
                 self.fetch_credits()
             except Exception:
                 pass
             result = {"ok": True, "msg": "每日活跃对话成功完成"}
+            web_ok = True
             if web is None:
                 web = bool(self.path) and wb_settings.daily_chat_web(os.path.dirname(self.path))
             if web:
                 res = self.daily_chat_web(trigger=None)
                 result["web"] = res
-                if res.get("ok"):
-                    result["msg"] = ("每日活跃对话成功完成（网页通道 %s：%d 段输出，%d ms）"
-                                     % (res.get("status") or "completed",
+                web_ok = bool(res.get("ok"))
+                if web_ok:
+                    # 重试过就把轮数带上：光看「成功」分不清是首轮就跑完，还是
+                    # 前几轮超时、多等了一轮才跑完（后者是慢，不是没跑）。
+                    tries = res.get("attempts") or 1
+                    retried = "（重试 %d 次后）" % (tries - 1) if tries > 1 else ""
+                    result["msg"] = ("每日活跃对话成功完成（网页通道%s %s：%d 段输出，%d ms）"
+                                     % (retried, res.get("status") or "completed",
                                         res.get("chunks") or 0, res.get("elapsed_ms") or 0))
                 else:
-                    result["msg"] = ("每日活跃对话成功完成（网页通道失败：%s）"
-                                     % res.get("error"))
+                    # 桌面腿成功不等于当天打卡完成：计入官方「每日活跃」的只有网页腿
+                    # （#75/#59/#90）。面板与活动历史按 ok 画成功/失败，网页腿失败却
+                    # 报成功的话，「今天这 30/50 积分没到账」在界面上一直看不见。
+                    tries = res.get("attempts") or 1
+                    suffix = "（已重试 %d 次）" % (tries - 1) if tries > 1 else ""
+                    result["ok"] = False
+                    result["error"] = "网页通道失败：%s%s" % (res.get("error"), suffix)
+                    result["msg"] = "每日活跃对话未完成（网页通道失败：%s%s）" % (
+                        res.get("error"), suffix)
+            # 只有真正计入官方「每日活跃」的网页通道成功了才算今天做过：网页腿失败时
+            # 若照写 lastDailyChat，当天后续巡检会直接跳过该账号，那天的 30/50 积分静默
+            # 丢掉且不再重试。web=False（没开网页通道）时维持原语义：桌面腿成功即算完成。
+            if web_ok:
+                self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    self.save(os.path.dirname(self.path))
             return result
         except urllib.error.HTTPError as exc:
             try:
@@ -1480,8 +1703,18 @@ class Account(object):
             return {"ok": (code == 0 or code == 10001), "code": code, "msg": msg, "data": payload.get("data")}
         except urllib.error.HTTPError as exc:
             try:
-                body = json.loads(exc.read().decode("utf-8") or "{}")
-                return {"ok": False, "error": body.get("msg") or ("HTTP %d" % exc.code)}
+                raw_b = exc.read().decode("utf-8") or "{}"
+                body = json.loads(raw_b)
+                code = body.get("code")
+                msg = body.get("msg") or ("HTTP %d" % exc.code)
+                # 上游如果在今日已签到时返回 HTTP 400 且 code 为 10001 / "今天已签到"
+                # 这说明今日事实上已经处于签到完成状态，按成功处理，并记录最后签到时间
+                if code == 10001 or "今天已签到" in msg or "已签到" in msg:
+                    self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+                    if self.path and os.path.exists(os.path.dirname(self.path)):
+                        self.save(os.path.dirname(self.path))
+                    return {"ok": True, "code": code, "msg": msg, "data": body.get("data")}
+                return {"ok": False, "error": msg}
             except Exception:
                 return {"ok": False, "error": "HTTP %d" % exc.code}
         except Exception as exc:
@@ -1951,7 +2184,11 @@ class Account(object):
                 # Model-scoped throttle: keep the account usable for every other model.
                 wait = max(1.0, float(until) - time.time()) if until else (
                     3.0 if single_account else float(cooldown))
-                self.model_cooldowns[model] = time.time() + wait
+                now = time.time()
+                self.model_cooldowns[model] = now + wait
+                # 起始时刻：面板要如实说「限流时刻 + 恢复时间」，而恢复时刻减不出
+                # 起始时刻（wait 来自 60s→10m 的阶梯，不落库）。记这一次就够了。
+                self.model_cooldowns_at[model] = now
                 return
             actual_cooldown = 3 if single_account else cooldown
             self.cooldown_until = time.time() + actual_cooldown
@@ -1995,11 +2232,26 @@ class Account(object):
     def note_soft_rate(self, message):
         """Account-level rate limit: soft cooldown with exponential backoff."""
         with self._throttle_lock:
+            self._decay_soft_streak()
             self.soft_streak += 1
             wait = soft_backoff(self.soft_streak)
             self.last_error = str(message)[:200]
             self.cooldown_until = max(self.cooldown_until, time.time() + wait)
         return wait
+
+    def _decay_soft_streak(self):
+        """软限流阶梯也要有时间窗（调用方已持有 _throttle_lock）。
+
+        这两条阶梯原先只加不减、只有成功才归零：昨天被限过 3 次，今天第一个
+        429 就直接从 2400s 起步，后天起步更高，直到 7200s 封顶——账号明明已经
+        恢复正常（面板测试通过），却动不动被按几十分钟到两小时，这正是「不断
+        软限流」的另一半。窗口内才算连续，隔得久就回到第一档（600s / 60s）。
+        """
+        now = time.time()
+        if FAIL_WINDOW and self.last_soft_at and now - self.last_soft_at > FAIL_WINDOW:
+            self.soft_streak = 0
+            self.unscoped_streak = 0
+        self.last_soft_at = now
 
     def note_unscoped_rate(self, model):
         """An unscoped soft 429: grow its own streak, return this model's window.
@@ -2012,6 +2264,7 @@ class Account(object):
         request clears both through note_success().
         """
         with self._throttle_lock:
+            self._decay_soft_streak()
             self.unscoped_streak += 1
             return unverified_soft_backoff(self.unscoped_streak)
 
@@ -2019,16 +2272,29 @@ class Account(object):
         """5xx / transport failure: feed the breaker counter."""
         with self._throttle_lock:
             self.last_error = str(message)[:200]
+            self._decay_strikes()
             self.fails += 1
             if self.fails >= BREAKER_THRESHOLD:
                 wait = breaker_backoff(self.fails)
                 self.breaker_until = max(self.breaker_until, time.time() + wait)
         return self.breaker_until
 
+    def _decay_strikes(self):
+        """两次失败隔得太久就不再算「连续」，从头计数。
+
+        调用方必须已持有 _throttle_lock。窗口设 0 时保持旧的累计语义。
+        """
+        now = time.time()
+        if FAIL_WINDOW and self.last_fail_at and now - self.last_fail_at > FAIL_WINDOW:
+            self.fails = 0
+            self.degrade_count = 0
+        self.last_fail_at = now
+
     def note_unknown_failure(self, message):
         """Unknown error: degrade counter plus the shared breaker counter."""
         with self._throttle_lock:
             self.last_error = str(message)[:200]
+            self._decay_strikes()
             self.degrade_count += 1
             self.fails += 1
             now = time.time()
@@ -2045,10 +2311,13 @@ class Account(object):
         with self._throttle_lock:
             if model:
                 self.model_cooldowns.pop(model, None)
+                self.model_cooldowns_at.pop(model, None)
             self.soft_streak = 0
             self.unscoped_streak = 0
             self.fails = 0
             self.degrade_count = 0
+            self.last_fail_at = 0.0
+            self.last_soft_at = 0.0
             self.breaker_until = 0.0
             self.degrade_until = 0.0
             self.last_error = ""
@@ -2079,13 +2348,16 @@ self.balance_until - now, self.breaker_until - now, self.degrade_until - now)
             if model:
                 if not (keep_caps and self.cap_until(model) > 0):
                     self.model_cooldowns.pop(model, None)
+                    self.model_cooldowns_at.pop(model, None)
             elif keep_caps:
                 now = time.time()
                 for mid in [m for m in self.model_cooldowns
                             if self.cap_until(m, now) <= 0]:
                     self.model_cooldowns.pop(mid, None)
+                    self.model_cooldowns_at.pop(mid, None)
             else:
                 self.model_cooldowns.clear()
+                self.model_cooldowns_at.clear()
             if (self.last_error or self.cooldown_until
                     or self.last_error_detail or self.balance_until):
                 self.last_error = ""
@@ -2101,6 +2373,25 @@ def _human_delta(seconds):
     hours = seconds / 3600.0
     if hours >= 1: return "%.1f hours" % hours
     return "%d min" % int(seconds / 60)
+
+def _human_left(seconds):
+    """还剩多久，精确到秒（对外解释「为什么现在不能用」时用）。
+
+    `_human_delta` 是给凭据有效期那种以天计的场景用的，小于一分钟一律写
+    「0 min」；而冷却/熔断的剩余时间经常就是几十秒，写成 0 分钟会让人以为
+    账号已经可用、网关还在挡它。
+    """
+    secs = max(0, int(round(seconds)))
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        m, s = divmod(secs, 60)
+        return "%dm%02ds" % (m, s) if s else "%dm" % m
+    if secs < 86400:
+        h, rem = divmod(secs, 3600)
+        m = rem // 60
+        return "%dh%02dm" % (h, m) if m else "%dh" % h
+    return "%.1f days" % (secs / 86400.0)
 
 class SessionAffinity(object):
     """Which upstream account served a conversation, so the next turn can go
@@ -2365,6 +2656,9 @@ class AccountPool(object):
         # 这条偏好自己的平滑加权轮询累计值，键是 (uid, model)：与临期的
         # _expiry_weights 分开，两个偏好各自记各自的轮次。
         self._remaining_pick_state = {}
+        # 手动权重优先（面板按账号设置，weight > 1 才生效）的平滑加权轮询
+        # 累计值，键是 uid：与前两条偏好各自的轮次分开。派生值，不落盘。
+        self._manual_weights = {}
         # 页内轮转（超限对话）的每页游标，键是 (页号, 页大小)；整池轮转仍用
         # _cursor，两条轮转互不挪动对方的位置。派生值，不落盘。
         self._page_cursors = {}
@@ -2536,6 +2830,47 @@ class AccountPool(object):
             account.clear_error()
         account.save(self.dir)
         self.apply_proxy_slots()
+        return account.public()
+
+    def set_weight(self, uid, weight):
+        """设置账号的手动调度权重（1-100，1 = 不干预），落盘并回公共视图。"""
+        account = self.get(uid)
+        if account is None:
+            return None
+        try:
+            account.weight = max(1, min(100, int(weight)))
+        except (TypeError, ValueError):
+            return None
+        account.save(self.dir)
+        return account.public()
+
+    def set_note(self, uid, note):
+        """设置账号备注（面板标记「批量」/「自用」等），落盘并回公共视图。
+
+        空串 = 清除备注；与调度无关，纯展示。
+        """
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.note = str(note or "").strip()[:200]
+        account.save(self.dir)
+        return account.public()
+
+    def set_disabled_models(self, uid, models):
+        """设置该账号**人工**禁用的模型名单，落盘并回公共视图。
+
+        语义：这些模型不再派给这个账号。不影响该账号的其他模型，也不影响其他
+        账号对同一模型的可用性 —— 请求会自动落到池子里别的号上。传空列表 =
+        清空禁用、恢复原行为。
+
+        名单按 normalise_disabled_models 归一；坏输入退化成空列表（= 不禁用）
+        而不是抛错：面板传进来什么形状都不该让一个账号加载失败。
+        """
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.disabled_models = normalise_disabled_models(models)
+        account.save(self.dir)
         return account.public()
 
     def set_proxy(self, uid, proxy):
@@ -2820,6 +3155,14 @@ class AccountPool(object):
         # covers is unavailable right now - the pool falls back to the plain
         # round-robin it always had, so a single lapsed account can never wedge
         # the realm.
+        # 手动权重优先：面板给账号设了 >1 的权重时，这些账号先于一切自动
+        # 偏好接单，彼此之间按权重平滑加权轮询——权重高的先被选中、分到的
+        # 流量也多，但同层之内仍有轮转，谁也不独占。它们此刻都不可用（冷却、
+        # 限额、被排除）时照旧落回下面的自动偏好与轮询，一条偏好卡不住池子。
+        # 全部权重都是 1（默认）时这一层直接返回 None，分派与从前完全一致。
+        account = self._pick_weighted_first(snapshot, exclude, model)
+        if account is not None:
+            return account
         account = self._pick_expiring_first(snapshot, exclude, model)
         if account is not None:
             return account
@@ -2830,6 +3173,29 @@ class AccountPool(object):
         if account is not None:
             return account
         return self._rotate_pick(snapshot, exclude, model, cursor_key=page)
+
+    def _pick_weighted_first(self, snapshot, exclude, model):
+        """手动权重 > 1 的账号优先接单，或 None（没有可交的）。
+
+        与临期积分那条同款的两层结构，只是这层的权重来自用户在面板上的明确
+        设置，优先级也最高：权重是「我就想让这个号多用」的直接表达，不该被
+        自动偏好覆盖。同层之间按权重平滑加权轮询——两个高权重账号按权重比
+        分流量，它们与权重 1 的账号之间则是「先用完我再轮别人」。权重 1 的
+        账号完全不进这一层：临期积分、剩余用量这些自动子权重照旧在它们身上
+        生效，一行都不变。
+        """
+        ready = []
+        for account in snapshot:
+            if account.uid in exclude:
+                continue
+            if int(getattr(account, "weight", 1) or 1) <= 1:
+                continue
+            if not account.ready(model=model):
+                continue
+            ready.append((account, account.uid, int(account.weight)))
+        if not ready:
+            return None
+        return self._smooth_weighted_pick(ready, "_manual_weights")
 
     def _pick_expiring_first(self, snapshot, exclude, model):
         """Serve the in-window accounts first, or None when none can.
@@ -3289,7 +3655,9 @@ def scan_desktop_credentials():
                         key = None
                 if key is None:
                     item["needsKey"] = True
-                    item["error"] = "凭据已加密：先点「回收密钥」，再回来导入"
+                    item["error"] = ("凭据已加密：先点「回收密钥」，再回来导入"
+                                     if wb_atrest.hunt_supported()
+                                     else "凭据已加密：" + wb_atrest.hunt_hint())
                     found.append(item)
                     continue
                 token = wb_atrest.decrypt_field(key, raw) or ""
