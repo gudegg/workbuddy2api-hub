@@ -4,6 +4,7 @@ Reuses the credentials the WorkBuddy desktop app already stored on this machine
 (%%LOCALAPPDATA%%\\CodeBuddyExtension\\Data\\Public\\auth\\*.info), so no separate
 login is needed. Exposes:
     GET  /v1/models
+    GET  /v1/balance-summary
     POST /v1/chat/completions     (stream=true and stream=false)
     GET  /health
 Only the Python standard library is required.
@@ -57,7 +58,6 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-import subprocess
 import wb_accounts
 import wb_activity
 import wb_atrest
@@ -260,78 +260,12 @@ def install_console_close_handler():
         return None
 
 # ---------------------------------------------------------------------------
-# 日志终端查看器（双进程模型）
+# 日志窗口
 #
-# 服务进程以 pythonw 静默后台运行（无窗口、关闭任何窗口都不停）。用户看到的
-# "终端"是一个独立的 console_tail.py 进程——它只连本地 /logs 接口实时打印日志，
-# 关掉它不影响服务。启动脚本会弹一个；面板眼睛按钮可以再开/关一个。
+# 面板的眼睛按钮改为在新窗口打开运行日志页（?tab=logs）。服务端不再 spawn
+# 任何进程：容器 / Linux 上没有窗口可开，Windows 上也不需要第二个 python 进程
+# （#427）。启动脚本仍可单独拉起 console_tail.py，那是命令行通道，与本按钮无关。
 # ---------------------------------------------------------------------------
-CONSOLE_VIEWER_PROC = None
-_LISTEN_PORT = 8788
-
-def _console_python():
-    """Find a console (windowed) python next to the running interpreter.
-
-    The service is launched with pythonw (GUI subsystem, no console), so
-    sys.executable is pythonw.exe. To open a visible viewer window we need the
-    console sibling (python.exe) in the same directory.
-    """
-    exe = sys.executable or "python"
-    d = os.path.dirname(exe)
-    cand = os.path.join(d, "python.exe")
-    if os.path.exists(cand):
-        return cand
-    if exe.lower().endswith("pythonw.exe"):
-        cand2 = exe[: -len("pythonw.exe")] + "python.exe"
-        if os.path.exists(cand2):
-            return cand2
-    return exe
-
-def _console_viewer_running():
-    return bool(CONSOLE_VIEWER_PROC and CONSOLE_VIEWER_PROC.poll() is None)
-
-def _launch_console_viewer():
-    """Launch console_tail.py in its own NEW console window.
-
-    Returns True on launch, False if already running, None if the script is
-    missing. A server-generated panel token is passed so the viewer works even
-    if the panel password was changed from the default.
-    """
-    global CONSOLE_VIEWER_PROC
-    if _console_viewer_running():
-        return False
-    here = os.path.dirname(os.path.abspath(__file__))
-    script = os.path.join(here, "console_tail.py")
-    if not os.path.exists(script):
-        return None
-    py = _console_python()
-    try:
-        token = PANEL.create()
-    except Exception:
-        token = ""
-    try:
-        proc = subprocess.Popen(
-            [py, "-u", script, "--port", str(_LISTEN_PORT), "--token", token],
-            creationflags=0x00000010,  # CREATE_NEW_CONSOLE
-            stdin=subprocess.DEVNULL,
-        )
-        CONSOLE_VIEWER_PROC = proc
-        return True
-    except Exception:
-        return None
-
-def _kill_console_viewer():
-    global CONSOLE_VIEWER_PROC
-    if _console_viewer_running():
-        try:
-            CONSOLE_VIEWER_PROC.terminate()
-        except Exception:
-            pass
-        CONSOLE_VIEWER_PROC = None
-        return True
-    CONSOLE_VIEWER_PROC = None
-    return False
-
 UPSTREAM = "https://www.workbuddy.ai"
 CHAT_PATH = "/v2/chat/completions"
 MODELS_PATH = "/v2/enterprises/personal/models"
@@ -902,6 +836,11 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         row["account"] = account
     acc = POOL.get(account) if (account and POOL) else None
     row["realm"] = acc.realm if acc else CURRENT_REALM
+    # The refresher visits one account per tick, so on a large pool the cached
+    # balance can be hours old; subtract this request's real cost at once so
+    # reserve_credits keeps working between refreshes (#442).
+    if acc and fields.get("credit"):
+        acc.consume_credit(fields["credit"])
     # Always written, even when the caller presented no key. The empty value is
     # what separates "ran without a key" from rows written before the field
     # existed; the dashboard reports those as two different buckets, and a
@@ -5922,6 +5861,59 @@ def account_views(realm=None):
         return []
     return POOL.list_public(realm=realm)
 
+
+def _finite_number(value):
+    """True for a float that is neither NaN nor +/-inf.
+
+    Deliberately avoids `math`: the portable runtime ships the compiled
+    `math` module, and the release-asset test maps every imported stdlib
+    name to a `Lib/*.py` file, which `math` does not have.
+    """
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
+def credit_balance_summary(realm=None):
+    """Aggregate cached credit snapshots without account-identifying fields.
+
+    This intentionally never calls fetch_credits(): a balance widget may poll
+    this route frequently, and each upstream refresh would spend time and risk
+    needless upstream traffic. Unknown snapshots stay unknown instead of being
+    reported as a zero balance.
+    """
+    accounts = [
+        account for account in (POOL.accounts if POOL else [])
+        if account.enabled and (
+            not realm or realm == "all" or account.realm == realm
+        )
+    ]
+    total = 0.0
+    known = 0
+    updated = []
+    for account in accounts:
+        credits = account.credits if isinstance(account.credits, dict) else {}
+        try:
+            remain = float(credits.get("remain"))
+        except (TypeError, ValueError):
+            continue
+        if not _finite_number(remain) or remain < 0:
+            continue
+        total += remain
+        known += 1
+        try:
+            stamp = float(credits.get("updated_at"))
+        except (TypeError, ValueError):
+            continue
+        if _finite_number(stamp):
+            updated.append(stamp)
+    return {
+        "balance": round(total, 2) if known else None,
+        "unit": "credit",
+        "realm": realm or CURRENT_REALM,
+        "accounts_enabled": len(accounts),
+        "accounts_with_credit_data": known,
+        "updated_at": max(updated) if updated else None,
+    }
+
 # --------------------------------------------------------- 积分获取历史（发放记录）
 # 上游对每个账号返回一份积分包清单（免费套餐、每日活跃奖励的 Bonus Pack、活动包…），
 # 每个包带面额、发放时间与到期时间。看板的「积分获取历史」就是这份清单的合并视图：
@@ -9995,7 +9987,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.12",
+        "version": "1.7.13",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -11310,7 +11302,18 @@ def sanitize_content(content):
                 out.append(part)
         return out
     return content
+
+
+def preserve_request_contract_enabled():
+    """Opt-in field/data preservation; does not enforce upstream constraints."""
+    return os.environ.get("WB_PRESERVE_REQUEST_CONTRACT", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def sanitize_tool_calls(tool_calls):
+    # Arguments are serialized application data, not a client fingerprint.
+    if preserve_request_contract_enabled():
+        return tool_calls
     if not isinstance(tool_calls, list):
         return tool_calls
     out = []
@@ -11331,7 +11334,9 @@ def sanitize_messages(messages):
     for m in messages or []:
         if isinstance(m, dict):
             item = dict(m)
-            if "content" in item:
+            preserve_tool_result = (preserve_request_contract_enabled()
+                                    and item.get("role") in ("tool", "function"))
+            if "content" in item and not preserve_tool_result:
                 item["content"] = sanitize_content(item["content"])
             if isinstance(item.get("reasoning_content"), str):
                 item["reasoning_content"] = sanitize_text(item["reasoning_content"])
@@ -14093,6 +14098,8 @@ def expand_namespace_tools(tools, _depth=0):
                     "parameters": entry.get("parameters") or entry.get("input_schema")
                                   or {"type": "object", "properties": {}},
                 }
+                if preserve_request_contract_enabled() and "strict" in entry:
+                    fn["strict"] = entry["strict"]
             name = str(fn.get("name") or "").strip()
             if not name or name in seen:
                 return
@@ -14645,6 +14652,20 @@ def responses_to_chat(payload):
     """Translate a Responses API request body into a Chat Completions body."""
     messages = _responses_input_to_messages(payload)
     chat = {"model": payload.get("model"), "messages": messages}
+    if preserve_request_contract_enabled():
+        text = payload.get("text")
+        fmt = text.get("format") if isinstance(text, dict) else None
+        if isinstance(fmt, dict):
+            kind = fmt.get("type")
+            if kind in ("text", "json_object"):
+                chat["response_format"] = {"type": kind}
+            elif kind == "json_schema":
+                chat["response_format"] = {
+                    "type": kind,
+                    "json_schema": {key: fmt[key] for key in
+                                    ("name", "description", "schema", "strict")
+                                    if key in fmt},
+                }
     for key in ("temperature", "top_p", "seed"):
         if payload.get(key) is not None:
             chat[key] = payload[key]
@@ -16159,7 +16180,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.12"
+    server_version = "wb-proxy/1.7.13"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -16677,6 +16698,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_health()
         if path == "/realm":
             return self._get_realm()
+        if path == "/v1/balance-summary":
+            return self._get_v1_balance_summary()
         if path in ("/v1/models", "/models"):
             return self._get_v1_models()
         if path in ("/usage", "/v1/usage"):
@@ -16753,10 +16776,9 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, info)
 
     def _get_console_state(self):
-        return self._json(200, {
-            "supported": True,
-            "visible": _console_viewer_running(),
-        })
+        # 按钮不再 spawn 进程，而是在新窗口打开运行日志页。这样 Windows /
+        # macOS / 容器走同一条路，不存在「当前环境开不了窗口」的伪状态（#427）。
+        return self._json(200, {"supported": True, "mode": "web", "visible": False})
 
     def _route_console_toggle(self):
         # 按钮请求均携带 `{}` body 但不解析：必须把残留字节读掉，否则同一条
@@ -16765,27 +16787,17 @@ class Handler(BaseHTTPRequestHandler):
         # Expect: 100-continue，否则排空会等待一个永远不会发出的 body。
         self._handle_expect_continue()
         self._discard_body()
-        if _console_viewer_running():
-            _kill_console_viewer()
-            visible = False
-        else:
-            launched = _launch_console_viewer()
-            visible = bool(launched)
-        return self._json(200, {"ok": True, "visible": visible})
+        # 兼容旧面板：新面板直接 window.open，不再请求这里。
+        return self._json(200, {"ok": True, "mode": "web",
+                                "url": "/dashboard?tab=logs", "visible": False})
 
     def _route_shutdown(self):
         # 同 toggle：按钮的 `{}` body 不解析也必须排空，否则它会污染同一条
         # keep-alive 连接上的下一个请求（连点触发 501）。
         self._handle_expect_continue()
         self._discard_body()
-        # 先关掉日志终端窗口：服务一旦退出，查看器轮询 /logs 会持续报
-        # 「上游拒绝连接」。先把窗口结束掉，用户就看不到任何报错。
-        # 然后回响应、延迟退出：0.4s 让 _json 的 body 先 flush 到
-        # socket；端口随进程释放，下次启动走原来的启动脚本。
-        try:
-            _kill_console_viewer()
-        except Exception:
-            pass
+        # 回响应、延迟退出：0.4s 让 _json 的 body 先 flush 到 socket；端口
+        # 随进程释放，下次启动走原来的启动脚本。
         def _bye():
             time.sleep(0.4)
             try:
@@ -16847,6 +16859,12 @@ class Handler(BaseHTTPRequestHandler):
         if meta:
             payload["catalog"] = meta
         return self._json(200, payload)
+
+    def _get_v1_balance_summary(self):
+        if not self._authorized():
+            return
+        realm = self._request_realm() or CURRENT_REALM
+        return self._json(200, credit_balance_summary(realm))
 
     def _get_v1_usage(self, query):
         if not self._authorized():
@@ -19829,9 +19847,7 @@ def running_version():
     return Handler.server_version.split("/", 1)[-1]
 
 def main():
-    global _LISTEN_PORT
     args = _parse_cli_args()
-    _LISTEN_PORT = args.port
     _apply_cli_overrides(args)
     if _probe_running_instance(args):
         return

@@ -698,6 +698,11 @@ class Account(object):
         # result. Separate from _refresh_lock (token refresh) and _save_lock
         # (file write) so the three never nest into each other.
         self._credits_lock = threading.Lock()
+        # Guards the local estimate written by consume_credit(). Kept apart
+        # from _credits_lock because that one is held across a network call:
+        # a request finishing while a refresh is in flight must not wait for
+        # the upstream round-trip just to subtract its own spend.
+        self._balance_lock = threading.Lock()
         # The dashboard snapshots this state while request threads update it.
         # Keep it separate from _refresh_lock, which spans network requests.
         self._throttle_lock = threading.Lock()
@@ -888,6 +893,51 @@ class Account(object):
         except (TypeError, ValueError):
             return False
         return remain <= reserve
+
+    def consume_credit(self, amount):
+        """Subtract what this request actually cost from the cached balance.
+
+        The background refresher is the source of truth, but it visits one
+        account per tick (30 minutes by default). On a large pool a balance
+        can therefore be hours old, and reserve_blocked() would keep handing
+        the account out until it reached zero (#442). Every finished request
+        carries the upstream's own ``credit``, so the guard can stay honest
+        between refreshes; the next fetch overwrites this estimate with the
+        real number.
+
+        Never raises: a missing/unknown balance simply stays unknown, and the
+        result is clamped at zero so a single expensive request cannot make
+        the panel show a negative remainder.
+        """
+        try:
+            amount = float(amount or 0)
+        except (TypeError, ValueError):
+            return
+        if amount <= 0:
+            return
+        with self._balance_lock:
+            credits = self.credits
+            if not isinstance(credits, dict):
+                return
+            try:
+                remain = float(credits.get("remain"))
+            except (TypeError, ValueError):
+                return
+            try:
+                used = float(credits.get("used") or 0)
+            except (TypeError, ValueError):
+                used = 0.0
+            try:
+                size = float(credits.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0.0
+            remain = max(0.0, remain - amount)
+            used += amount
+            credits["remain"] = round(remain, 2)
+            credits["used"] = round(used, 2)
+            if size > 0:
+                credits["remain_percent"] = "%.1f%%" % (remain / size * 100.0)
+                credits["used_percent"] = "%.1f%%" % (min(used, size) / size * 100.0)
 
     def soonest_expiring_days(self):
         """Days until the earliest credit package that still has credits left.
