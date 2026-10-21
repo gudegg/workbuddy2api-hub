@@ -141,6 +141,12 @@ class RequestContractTests(unittest.TestCase):
         self.assertEqual(assistant["tool_calls"][0]["function"]["arguments"], DATA)
         self.assertEqual(tool["content"], DATA)
 
+    def test_object_arguments_are_still_serialized_when_preserving(self):
+        """#446 and this flag must not cancel each other out."""
+        calls = [{"function": {"name": "fixture", "arguments": {"code": 11 - 128}}}]
+        out = P.sanitize_tool_calls(calls)
+        self.assertEqual(out[0]["function"]["arguments"], '{"code": -117}')
+
     def test_legacy_function_result_preserved(self):
         out = P.sanitize_messages([{"role": "function", "name": "fixture", "content": DATA}])
         self.assertEqual(out[0]["content"], DATA)
