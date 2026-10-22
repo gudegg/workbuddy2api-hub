@@ -40,7 +40,8 @@ import release_tools as tools  # noqa: E402
 # reads them from tests.yml rather than from this tuple - this is the
 # expectation the reader checks that derivation against.
 EXPECTED_LEGS = (
-    "ubuntu-latest / python 3.9",
+    # Pinned because ubuntu-latest moved to 26.04, which has no 3.9 build.
+    "ubuntu-24.04 / python 3.9",
     "ubuntu-latest / python 3.12",
     "windows-latest / python 3.12",
 )
@@ -454,6 +455,14 @@ class PortableZipTests(unittest.TestCase):
             self.assertEqual(manifest["runtime"]["prefix"], "python/")
             self.assertEqual(manifest["runtime"]["python"], portable_runtime.RUNTIME_VERSION)
             self.assertGreater(manifest["runtime"]["files"], 0)
+            # #573: an image / rootfs deployment only owns the app layer; the
+            # launchers and the bundled pricing snapshot are portable-only.
+            app = manifest["profiles"]["app"]
+            self.assertIn("wb_proxy.py", app)
+            self.assertIn("dashboard.html", app)
+            self.assertNotIn("pricing/pricing.json", app)
+            self.assertNotIn("start-wb-proxy.bat", app)
+            self.assertTrue(set(app) <= set(files))
 
     def test_the_launchers_look_where_the_runtime_is(self):
         # The packaged path and the path the launcher probes have to agree, or

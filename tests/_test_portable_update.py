@@ -8,6 +8,7 @@ replace, and rollback.
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -28,7 +29,7 @@ def read(path):
         return fh.read()
 
 
-def make_zip(path, version, files):
+def make_zip(path, version, files, profiles=None):
     manifest = {
         "schema": 1,
         "version": version,
@@ -36,6 +37,8 @@ def make_zip(path, version, files):
         "files": list(files),
         "protected": ["accounts/", "usage/"],
     }
+    if profiles is not None:
+        manifest["profiles"] = profiles
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("release-manifest.json",
                     json.dumps(manifest, ensure_ascii=False))
@@ -86,6 +89,40 @@ class ExtractTests(unittest.TestCase):
                 zf.writestr("../evil.txt", "x")
             with self.assertRaises(U.UpdateError):
                 U.safe_extract(path, os.path.join(d, "out"), "wb-proxy")
+
+    def test_safe_extract_preserves_unix_modes(self):
+        # 启动脚本在包里是 755，解包后必须保持可执行：否则一键更新在
+        # macOS/Linux 的重启一步 Popen() 报 EACCES，整次更新被迫回滚。
+        # 没有 unix 属性的条目维持默认权限，不应被凭空赋予执行位。
+        # The launchers ship 755 and the restart Popen()s them, so a 644 copy
+        # rolls the whole update back (Errno 13). Entries without unix attrs
+        # must not gain an executable bit out of nowhere.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "modes.zip")
+            with zipfile.ZipFile(path, "w") as zf:
+                info = zipfile.ZipInfo("wb-proxy/start-wb-proxy.sh")
+                info.external_attr = 0o755 << 16
+                zf.writestr(info, "#!/bin/sh\n")
+                info = zipfile.ZipInfo("wb-proxy/wb_proxy.py")
+                info.external_attr = 0o644 << 16
+                zf.writestr(info, "x = 1\n")
+                info = zipfile.ZipInfo("wb-proxy/plain.txt")
+                info.external_attr = 0
+                zf.writestr(info, "plain\n")
+            out = os.path.join(d, "out")
+            U.safe_extract(path, out, "wb-proxy")
+            if os.name == "nt":
+                # Windows stores no exec bit (chmod only maps the read-only
+                # bit); extraction succeeding without an error is the contract.
+                self.assertTrue(os.path.isfile(
+                    os.path.join(out, "wb-proxy", "start-wb-proxy.sh")))
+                return
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(
+                out, "wb-proxy", "start-wb-proxy.sh")).st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(
+                out, "wb-proxy", "wb_proxy.py")).st_mode), 0o644)
+            self.assertFalse(stat.S_IMODE(os.lstat(os.path.join(
+                out, "wb-proxy", "plain.txt")).st_mode) & 0o111)
 
 
 class StageTests(unittest.TestCase):
@@ -175,7 +212,7 @@ class ApplyTests(unittest.TestCase):
                     mock.patch.object(U, "stop_gateway", lambda pid: None), \
                     mock.patch.object(U, "wait_port_free", lambda port: True), \
                     mock.patch.object(U, "start_service", lambda *a: None), \
-                    mock.patch.object(U, "wait_health", lambda port: True):
+                    mock.patch.object(U, "wait_health", lambda port, **kw: True):
                 code = U.run_update(root, package, "v2.0.0", "2.0.0",
                                     8788, False, 1234, "o/r")
             self.assertEqual(code, 0)
@@ -192,13 +229,141 @@ class ApplyTests(unittest.TestCase):
                     mock.patch.object(U, "stop_gateway", lambda pid: None), \
                     mock.patch.object(U, "wait_port_free", lambda port: True), \
                     mock.patch.object(U, "start_service", lambda *a: None), \
-                    mock.patch.object(U, "wait_health", lambda port: False):
+                    mock.patch.object(U, "wait_health", lambda port, **kw: False):
                 code = U.run_update(root, package, "v2.0.0", "2.0.0",
                                     8788, False, 1234, "o/r")
             self.assertEqual(code, 1)
             with open(status_file, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["state"], "rolled_back")
             self.assertIn("1.0.0", read(os.path.join(root, "wb_proxy.py")))
+
+
+class ProfileTests(unittest.TestCase):
+    """#573：镜像 / rootfs 部署只拥有应用层。
+
+    便携包按整份清单更新；镜像部署没有 start-wb-proxy*、ops/ 和随包价格快照，
+    把它们写进去只会多出镜像本来没有的文件，其中 pricing/pricing.json 还会盖掉
+    wb_pricing.py 的内联快照且两份永不同步。
+    """
+
+    ALL = {
+        "wb_proxy.py": proxy_source("2.0.0"),
+        "wb_update_apply.py": "# helper 2.0.0\n",
+        "dashboard.html": "<html>2.0.0</html>",
+        "start-wb-proxy.bat": "@echo off\r\n",
+        "pricing/pricing.json": '{"generated_at": "2.0.0"}',
+    }
+    APP = ["wb_proxy.py", "wb_update_apply.py", "dashboard.html"]
+
+    def _manifest(self):
+        return {"version": "2.0.0", "root": "wb-proxy",
+                "files": list(self.ALL), "profiles": {"app": self.APP}}
+
+    def _stage(self, directory):
+        stage = os.path.join(directory, "stage")
+        os.makedirs(os.path.join(stage, "wb-proxy", "pricing"))
+        for rel, data in self.ALL.items():
+            with open(os.path.join(stage, "wb-proxy", rel), "w",
+                      encoding="utf-8") as fh:
+                fh.write(data)
+        manifest = self._manifest()
+        with open(os.path.join(stage, "release-manifest.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+        return stage, manifest
+
+    def test_profile_selects_the_app_layer_in_manifest_order(self):
+        self.assertEqual(U.profile_files(self._manifest(), "app"), self.APP)
+        # No profile keeps the historical full list, so an executor that
+        # predates this feature behaves exactly as before.
+        self.assertEqual(U.profile_files(self._manifest()), list(self.ALL))
+
+    def test_unknown_or_incomplete_profile_is_refused(self):
+        with self.assertRaises(U.UpdateError):
+            U.profile_files(self._manifest(), "image")
+        with self.assertRaises(U.UpdateError):
+            U.profile_files({"version": "2.0.0", "root": "wb-proxy",
+                             "files": ["wb_proxy.py"]}, "app")
+        with self.assertRaises(U.UpdateError):
+            U.profile_files({"version": "2.0.0", "root": "wb-proxy",
+                             "files": list(self.ALL),
+                             "profiles": {"app": ["dashboard.html"]}}, "app")
+
+    def test_apply_with_profile_does_not_write_portable_only_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "app")
+            os.makedirs(root)
+            stage, manifest = self._stage(d)
+            U.apply_stage(stage, root, d, manifest,
+                          U.profile_files(manifest, "app"))
+            self.assertIn("2.0.0", read(os.path.join(root, "wb_proxy.py")))
+            self.assertFalse(os.path.exists(
+                os.path.join(root, "start-wb-proxy.bat")))
+            self.assertFalse(os.path.exists(
+                os.path.join(root, "pricing", "pricing.json")))
+
+    def test_a_profile_backup_is_still_restorable(self):
+        # The backup manages fewer files than the manifest lists; the count
+        # check has to use backup.json's own `files`, not the manifest.
+        with tempfile.TemporaryDirectory() as d:
+            package = os.path.join(d, "package")
+            root = os.path.join(package, "app")
+            os.makedirs(root)
+            with open(os.path.join(root, "wb_proxy.py"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(proxy_source("1.0.0"))
+            with open(os.path.join(package, "release-manifest.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"version": "1.0.0", "root": "wb-proxy",
+                           "files": list(self.ALL)}, fh)
+            backup, saved, absent = U.backup_current(
+                root, package, self.APP, "2.0.0")
+            self.assertEqual(len(saved) + len(absent), len(self.APP))
+            ok, reason = U.backup_complete(backup, "2.0.0")
+            self.assertTrue(ok, reason)
+
+    def test_run_update_with_app_profile_skips_portable_only_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            package = os.path.join(d, "package")
+            root = os.path.join(package, "app")
+            os.makedirs(root)
+            with open(os.path.join(root, "wb_proxy.py"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(proxy_source("1.0.0"))
+            with open(os.path.join(package, "release-manifest.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"version": "1.0.0", "root": "wb-proxy",
+                           "files": list(self.ALL)}, fh)
+            zip_path = os.path.join(d, "new.zip")
+            make_zip(zip_path, "2.0.0", self.ALL,
+                     profiles={"app": self.APP})
+            with open(zip_path, "rb") as fh:
+                sha = hashlib.sha256(fh.read()).hexdigest()
+            sha_path = os.path.join(d, "SHA256SUMS")
+            with open(sha_path, "w", encoding="utf-8") as fh:
+                fh.write("%s  new.zip\n" % sha)
+            status_file = os.path.join(root, "updates", "status.json")
+
+            def fake_urls(repo, tag, version):
+                return ("file:///" + zip_path.replace(os.sep, "/"),
+                        "file:///" + sha_path.replace(os.sep, "/"),
+                        "new.zip")
+
+            with mock.patch.object(U, "asset_urls", fake_urls), \
+                    mock.patch.object(U, "status_path", lambda: status_file), \
+                    mock.patch.object(U, "is_visible_process", lambda pid: False), \
+                    mock.patch.object(U, "stop_gateway", lambda pid: None), \
+                    mock.patch.object(U, "wait_port_free", lambda port: True), \
+                    mock.patch.object(U, "start_service", lambda *a: None), \
+                    mock.patch.object(U, "wait_health", lambda port, **kw: True):
+                code = U.run_update(root, package, "v2.0.0", "2.0.0",
+                                    8788, False, 1234, "o/r", profile="app")
+            self.assertEqual(code, 0)
+            self.assertIn("2.0.0", read(os.path.join(root, "wb_proxy.py")))
+            self.assertFalse(os.path.exists(
+                os.path.join(root, "start-wb-proxy.bat")))
+            self.assertFalse(os.path.exists(
+                os.path.join(root, "pricing", "pricing.json")))
 
 
 class RequestTests(unittest.TestCase):
@@ -295,7 +460,18 @@ class ExternalBridgeTests(unittest.TestCase):
                 self.assertEqual(payload["port"], 8899)
                 self.assertEqual(payload["pid"], os.getpid())
                 self.assertTrue(os.path.isdir(payload["root"]))
+                # 非便携包部署（镜像 / 自建 rootfs）只拥有应用层（#573）。
+                self.assertEqual(payload.get("profile"), "app")
                 self.assertEqual(R.status()["installation"]["state"], "queued")
+
+    def test_portable_request_carries_no_profile(self):
+        # 便携包照旧按整份清单更新；多带一个档位会让它少写 start-wb-proxy*。
+        import wb_update_request as R
+        with mock.patch.object(R.wb_update_portable, "app_root",
+                               return_value="/pkg/wb-proxy"), \
+                mock.patch.object(R.wb_update_portable, "package_root",
+                                  return_value="/pkg"):
+            self.assertNotIn("profile", R._request_fields("2.0.0", 8788))
 
     def test_external_executor_reads_and_unlinks_the_request(self):
         import wb_update_external as E
@@ -324,9 +500,24 @@ class ExternalBridgeTests(unittest.TestCase):
             self.assertEqual(code, 0)
             kwargs = run.call_args.kwargs
             self.assertIsNone(kwargs["start_service_fn"])
+            self.assertIsNone(kwargs["profile"])
             self.assertEqual(kwargs["status_file"],
                              os.path.join(d, "status.json"))
             self.assertEqual(run.call_args.args[:2], (d, d))
+
+    def test_external_executor_passes_the_requested_profile(self):
+        import wb_update_external as E
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "wb_proxy.py"), "w") as fh:
+                fh.write("# app\n")
+            request_file = os.path.join(d, "request.json")
+            with open(request_file, "w", encoding="utf-8") as fh:
+                json.dump({"tag": "v2.0.0", "version": "2.0.0", "pid": 1234,
+                           "port": 8788, "root": d, "profile": "app"}, fh)
+            os.chmod(request_file, 0o600)
+            with mock.patch.object(E, "run_update", return_value=0) as run:
+                self.assertEqual(E.main(["--request-dir", d]), 0)
+            self.assertEqual(run.call_args.kwargs["profile"], "app")
 
 
     def test_external_executor_recovers_a_half_applied_update(self):
