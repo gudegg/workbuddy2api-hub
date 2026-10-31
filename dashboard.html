@@ -4,6 +4,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>WorkBuddy 用量看板</title>
+<!-- 首帧判定：必须留在 <head>、在任何页面内容之前同步执行。
+     没有面板会话令牌（无痕 / 首次访问 / 已登出）→ 不动 markup 上的 display:flex，
+     登录闸门随首帧一起出现，看板骨架不会被先画出来再盖住。
+     有令牌 → 先隐藏闸门，交给 bootPanel() 用 /panel/status 复核；令牌过期或网关
+     重启导致复核失败时，panelNeedsLogin() 会摘掉这个类把闸门放回屏幕上。
+     这里必须 !important：闸门的可见性写在它自己的内联 style 上，普通规则压不住。 -->
+<style>html.wb-panel-session #panelGate{display:none!important}</style>
+<script>
+/* 面板会话令牌的存储键。全页只在这里定义一次：首帧判定要用它，所以必须先于
+   任何页面内容；后面的脚本直接复用这个绑定，不要再写一遍字面量。 */
+const PANEL_STORE = 'wb-proxy-panel-token';
+(function(){
+  try{
+    if(sessionStorage.getItem(PANEL_STORE)){
+      document.documentElement.classList.add('wb-panel-session');
+    }
+  }catch(e){}
+})();
+</script>
 <style>
 :root{
   /* 对比度增强 v2（2026-10-15）：信号元素进一步推强。
@@ -138,7 +157,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}
    单元格 nowrap 防止长模型 ID / 思考档位换行，超长用省略号兜底。 */
 #modelsTable{table-layout:fixed}
 #modelsTable th,#modelsTable td{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-/* 消费倍率列可能同时放「倍率」和「免费账号不可用」两枚胶囊；固定列宽下
+/* 消费倍率列可能同时放「倍率」和「Pro Only」两枚胶囊；固定列宽下
    nowrap 会把第二枚裁掉，允许换行只让这一类行变高（#527）。 */
 #modelsTable td.rate-cell{white-space:normal;line-height:1.8}
 #modelsTable td[data-label="思考档位"]{white-space:nowrap}
@@ -187,6 +206,32 @@ th.sortable:focus-visible .sort-arrow.idle{opacity:1}
 .bar-fill.think{background:var(--think)}
 .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%;border-radius:8px}
 .table-wrap table{min-width:720px}
+/* 单元格里「长文本省略号」的统一 span：截断样式收在这里，宽度上限由行内
+   style 按列给（不同列不同），媒体查询只调上限与折行行为。 */
+.note-clip{display:inline-block;vertical-align:bottom;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+/* 中屏（641–960px）：桌面表格布局还在，但横向空间有限。固定 px 的说明上限
+   在这个区间最挤——一条 429 原文能把「账号」压到贴着「时间」。这里把说明列
+   收到 300px（行内 max-width 优先级更高，须 !important 才盖得住）；表格下限
+   720px 不动，摆不下仍横向滚动，列宽不会被压扁。账号列的 160px 上限不动。 */
+@media (min-width:641px) and (max-width:960px){
+  td[data-label="说明"] .note-clip{max-width:300px!important}
+}
+/* 手机卡片模式（≤640px）：每格独占一行，折行显示全文，不再省略号截断
+   （完整内容本来也在 title 里，但触屏没有 hover，截断了就看不全）。 */
+@media (max-width:640px){
+  table.data-cards .note-clip{white-space:normal;overflow:visible;text-overflow:clip;
+    overflow-wrap:anywhere;word-break:break-word}
+}
+/* 活动表的短标签列（时间/区域/任务/来源/结果）不许逐字折行：表格自动布局
+   里说明列一挤，这些列会被压到一字宽——「国际版每日活跃」变成一字一行的
+   竖条，行高撑到七八行。nowrap 给布局一个真实下限（列至少要放得下标签），
+   宽度不够时整表横向滚动，而不是把标签竖起来；说明列仍是弹性吸收方。 */
+table.activity-table td[data-label="时间"],
+table.activity-table td[data-label="区域"],
+table.activity-table td[data-label="任务"],
+table.activity-table td[data-label="来源"],
+table.activity-table td[data-label="结果"]{white-space:nowrap}
 #recent table th, #recent table td{text-align:center}
 #recent table th:first-child, #recent table td:first-child{text-align:center}
 #recent table td.mono{font-variant-numeric:tabular-nums}
@@ -398,6 +443,21 @@ table.account-cards tr.cool-row .cool-pill{display:inline-block;width:auto;max-w
   color:var(--accent);text-decoration:none;font-size:12px}
 .login-link:hover{border-color:var(--accent);background:var(--panel)}
 .hint{color:var(--dim);font-size:12px;margin:8px 0}
+/* 标题旁的「!」帮助标记：默认只是一个低调的圆圈，悬停/聚焦/展开时变亮。
+   说明文本放在旁边的 .help-detail 里，点它才展开（默认 hidden），所以不占
+   版面高度。只做点击展开，不再挂悬停气泡——点了就能看到说明，两个入口
+   同时出现反而挡视线。 */
+.help-mark{display:inline-flex;align-items:center;justify-content:center;
+  width:15px;height:15px;border-radius:50%;border:1px solid var(--line2);
+  color:var(--dim);font-size:10px;font-weight:700;line-height:1;cursor:pointer;
+  vertical-align:1px;margin-left:4px;user-select:none;transition:all .15s ease}
+.help-mark:hover,.help-mark:focus-visible{color:var(--accent);border-color:var(--accent);
+  background:var(--accent-soft);outline:none}
+.help-mark.open{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
+.help-detail{font-size:12px;line-height:1.6;color:var(--dim);margin-top:6px;
+  padding:8px 10px;border-left:2px solid var(--accent);background:var(--panel2);
+  border-radius:0 8px 8px 0;max-width:760px}
+.help-detail[hidden]{display:none}
 .step{display:flex;gap:10px;align-items:flex-start;margin:10px 0}
 .step .n{flex:0 0 20px;height:20px;border-radius:50%;background:var(--panel2);
   border:1px solid var(--line);color:var(--dim);font-size:11px;display:flex;
@@ -1183,6 +1243,58 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 #pageAnalytics .skel{color:var(--dim2);font-size:12px;padding:22px 0;text-align:center}
 #pageAnalytics .foot-note{color:var(--dim2);font-size:11px;text-align:center;margin-top:20px}
 
+/* ── 自定义下拉（Custom Select）────────────────────────────────────
+   原生 <select> 的展开列表由浏览器绘制，CSS 无法美化：深色模式下
+   会出现突兀的直角白框/系统蓝高亮，与暖色主题割裂。
+   这里用渐进增强：原生 select 仍在（表单值、change 事件、无障碍不变），
+   仅视觉上被隐藏，由同尺寸的触发器 + 自绘面板接管。
+   无 JS 时原生 select 照常可用，不会退化。 */
+.cs-wrap{position:relative;display:inline-block;vertical-align:middle;max-width:100%}
+.cs-wrap.cs-block{display:block;width:100%}
+/* 原生控件保留在无障碍树里，只做视觉隐藏（不能用 display:none） */
+.cs-native{position:absolute!important;inset:0;width:100%;height:100%;
+  opacity:0;pointer-events:none;margin:0}
+.cs-trigger{display:flex;align-items:center;gap:8px;width:100%;
+  background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius-control);
+  padding:5px 9px;color:var(--fg);font:inherit;font-size:12px;line-height:1.35;
+  text-align:left;cursor:pointer;transition:border-color .14s ease,background .14s ease,box-shadow .14s ease}
+.cs-trigger:hover{border-color:var(--line-hover);background:var(--panel3)}
+.cs-trigger:focus-visible{outline:none;border-color:var(--accent);
+  box-shadow:0 0 0 3px var(--accent-soft)}
+.cs-wrap.cs-open .cs-trigger{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.cs-value{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cs-value.cs-placeholder{color:var(--dim-light)}
+.cs-arrow{flex:0 0 auto;width:9px;height:9px;margin-left:2px;opacity:.55;
+  border-right:1.6px solid currentColor;border-bottom:1.6px solid currentColor;
+  transform:translateY(-2px) rotate(45deg);transition:transform .18s ease,opacity .14s ease}
+.cs-trigger:hover .cs-arrow{opacity:.8}
+.cs-wrap.cs-open .cs-arrow{transform:translateY(1px) rotate(-135deg)}
+.cs-panel{position:absolute;z-index:80;top:calc(100% + 4px);left:0;min-width:100%;
+  max-width:min(320px,calc(100vw - 24px));max-height:min(320px,52vh);overflow:auto;
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  box-shadow:var(--shadow-md);padding:4px;
+  opacity:0;transform:translateY(-4px) scale(.985);pointer-events:none;
+  transition:opacity .13s ease,transform .13s ease;
+  scrollbar-width:thin}
+.cs-wrap.cs-open .cs-panel{opacity:1;transform:none;pointer-events:auto}
+.cs-wrap.cs-drop-up .cs-panel{top:auto;bottom:calc(100% + 4px);transform:translateY(4px) scale(.985)}
+.cs-wrap.cs-drop-up.cs-open .cs-panel{transform:none}
+.cs-opt{display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:7px;
+  font-size:12px;color:var(--fg);cursor:pointer;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;transition:background .1s ease}
+.cs-opt.cs-hover{background:var(--panel2)}
+.cs-opt.cs-selected{background:var(--accent-selected-bg);color:var(--accent);font-weight:600}
+.cs-opt.cs-selected.cs-hover{background:var(--accent-selected-bg)}
+.cs-opt.cs-disabled{color:var(--dim-light);cursor:not-allowed;opacity:.65}
+.cs-opt.cs-disabled.cs-hover{background:transparent}
+.cs-opt .cs-tick{flex:0 0 auto;width:11px;font-size:11px;opacity:0;color:var(--accent)}
+.cs-opt.cs-selected .cs-tick{opacity:1}
+.cs-empty{padding:10px 9px;font-size:11.5px;color:var(--dim-light);text-align:center}
+/* 深色主题下原生控件仍是系统配色，这里补一层兜底，避免未增强时闪白 */
+[data-theme="dark"] select{color-scheme:dark}
+@media (prefers-reduced-motion:reduce){
+  .cs-panel,.cs-arrow,.cs-trigger{transition:none}
+}
 </style>
 <script>
 /* Runs before <body> is parsed, so the page the user last had is the
@@ -1196,6 +1308,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     material: {label:'Material', light:{"--bg":"#fefbff","--panel":"#ffffff","--panel2":"#f5eff7","--panel3":"#ece6f0","--line":"#cac4d0","--line-hover":"#b4aab8","--fg":"#1d1b20","--dim":"#5b5b66","--dim-light":"#767680","--accent":"#6750a4","--accent-hover":"#4f378b","--accent-soft":"#eaddff","--accent-selected-bg":"#e8def8","--accent2":"#006a60","--accent2-soft":"#ccfbee","--warn":"#7e5260","--bad":"#b3261e","--bad-soft":"#f9dedc","--think":"#5e5891","--think-soft":"#e5dffa","--shadow-sm":"0 1px 2px 0 rgba(29,27,32,.15)","--shadow":"0 1px 2px 0 rgba(29,27,32,.18),0 1px 3px 1px rgba(29,27,32,.10)","--shadow-md":"0 2px 4px -1px rgba(29,27,32,.12),0 4px 6px 1px rgba(29,27,32,.10)","--header-bg":"rgba(254,251,255,.94)","--hm0":"#e8def8","--hm1":"#d3c2f1","--hm2":"#b8a1ec","--hm3":"#9a82e3","--hm4":"#6750a4"}, dark:{"--bg":"#141218","--panel":"#211f26","--panel2":"#2b2930","--panel3":"#36343b","--line":"#49454f","--line-hover":"#5b5963","--fg":"#e6e1e5","--dim":"#c4c5d0","--dim-light":"#928f9a","--accent":"#d0bcff","--accent-hover":"#b9a4fa","--accent-soft":"rgba(208,188,255,.24)","--accent-selected-bg":"rgba(208,188,255,.30)","--accent2":"#4ecdb4","--accent2-soft":"rgba(78,205,180,.24)","--warn":"#f2b8b4","--bad":"#f2b8b4","--bad-soft":"rgba(242,184,180,.24)","--think":"#cfc4f7","--think-soft":"rgba(207,196,247,.18)","--shadow-sm":"0 1px 2px 0 rgba(0,0,0,.30)","--shadow":"0 1px 2px 0 rgba(0,0,0,.40),0 1px 3px 1px rgba(0,0,0,.30)","--shadow-md":"0 2px 4px -1px rgba(0,0,0,.45),0 4px 6px 1px rgba(0,0,0,.32)","--header-bg":"rgba(20,18,24,.88)","--hm0":"#2b2930","--hm1":"#332e44","--hm2":"#3d3460","--hm3":"#4d4080","--hm4":"#d0bcff"}},
     miuix: {label:'MiuiX', light:{"--bg":"#f6f7fa","--panel":"#ffffff","--panel2":"#eef0f4","--panel3":"#e2e6ee","--line":"#dde1e8","--line-hover":"#c9d0db","--fg":"#1f2024","--dim":"#5f6671","--dim-light":"#8c93a0","--accent":"#ff5c00","--accent-hover":"#ff7a33","--accent-soft":"rgba(255,92,0,.10)","--accent-selected-bg":"rgba(255,92,0,.18)","--accent2":"#07c160","--accent2-soft":"rgba(7,193,96,.12)","--warn":"#d48200","--bad":"#e53935","--bad-soft":"rgba(229,57,53,.10)","--think":"#7c4dff","--think-soft":"rgba(124,77,255,.10)","--shadow-sm":"0 1px 2px 0 rgba(31,32,36,.05)","--shadow":"0 2px 6px 0 rgba(31,32,36,.08)","--shadow-md":"0 6px 16px 0 rgba(31,32,36,.10)","--header-bg":"rgba(255,255,255,.85)","--hm0":"#ffece0","--hm1":"#ffd0b8","--hm2":"#ffb085","--hm3":"#ff8c4a","--hm4":"#ff5c00"}, dark:{"--bg":"#0e0f12","--panel":"#191b1f","--panel2":"#22252b","--panel3":"#2a2d34","--line":"#2e3239","--line-hover":"#3a3f48","--fg":"#f0f1f4","--dim":"#9aa0aa","--dim-light":"#7a8090","--accent":"#ff7a33","--accent-hover":"#ff9056","--accent-soft":"rgba(255,122,51,.18)","--accent-selected-bg":"rgba(255,122,51,.26)","--accent2":"#3ed984","--accent2-soft":"rgba(62,217,132,.20)","--warn":"#ffb852","--bad":"#ff6f6f","--bad-soft":"rgba(255,111,111,.16)","--think":"#a78bff","--think-soft":"rgba(167,139,255,.18)","--shadow-sm":"0 1px 2px 0 rgba(0,0,0,.40)","--shadow":"0 2px 6px 0 rgba(0,0,0,.55)","--shadow-md":"0 6px 18px 0 rgba(0,0,0,.60)","--header-bg":"rgba(14,15,18,.78)","--hm0":"#22252b","--hm1":"#332820","--hm2":"#4a2c20","--hm3":"#5c3220","--hm4":"#ff7a33"}}
   };
+  window.__WB_THEME_STYLES__ = THEME_STYLES;
   var STYLE_GEOMETRY = {claude:12, material:14, miuix:20};
   Object.keys(THEME_STYLES).forEach(function(id){
     ['light','dark'].forEach(function(mode){
@@ -1389,6 +1502,19 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   var ATTRS = ['title', 'placeholder', 'aria-label', 'data-label', 'alt'];
   var SKIP = {SCRIPT: 1, STYLE: 1, TEXTAREA: 1, NOSCRIPT: 1};
   var DICT = {
+    '添加 API Key 账号': 'Add an API Key account',
+    '粘贴 CodeBuddy API 管理页签发的静态 Key': 'Paste the static key issued by the CodeBuddy API console',
+    '前缀。': 'prefix.',
+    '它会先拿企业额度端点验一次，通过了才落盘——验不过就什么都不写。': 'It is first probed against the enterprise quota endpoint and only saved when that check passes; a failed probe writes nothing.',
+    '备注名（可选）': 'Label (optional)',
+    '例如：企微企业号': 'e.g. the enterprise WeCom account',
+    '验证并添加': 'Verify and add',
+    '验证中…': 'Verifying…',
+    '正在用企业额度端点验一次…': 'Probing the enterprise quota endpoint…',
+    '请先填入 API Key': 'Enter the API key first',
+    '前缀不对：应当以 ck_ 或 pt_ 开头': 'Wrong prefix: it must start with ck_ or pt_',
+    ' · 额度 ': ' · quota ',
+    '，本期已用 ': ', used this cycle ',
     '(不限)': '(unlimited)',
     '(仅桌面端对话)': '(desktop chats only)',
     '(低于': '(below',
@@ -1523,6 +1649,10 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '任务福利': 'Task rewards',
     '任务说明': 'Task description',
     '会员类型:': 'Membership:',
+    '仅标记不可用，未标记不代表可用': 'only blocked models are labelled; an unlabelled model is not a promise',
+    '上游目录声明：该模型仅限 PRO 账号': 'Upstream catalogue: this model is PRO accounts only',
+    '目录刷新于': 'catalogue refreshed at',
+    '免费账号的请求会被本地拦下，不发往上游': 'free-account requests are refused locally and never sent upstream',
     '会话已失效，请重新输入密码': 'Session expired, please enter the password again',
     '住宅': 'Residential',
     '保存': 'Save',
@@ -1681,6 +1811,29 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '国际版 (Global) · www.workbuddy.ai': 'Global · www.workbuddy.ai',
     '国际版每日活跃': 'Global daily activity',
     '国际版每日活跃打卡': 'Global daily activity check-in',
+    '① 时段': '1. Slots',
+    '② 候选模型': '2. Model candidates',
+    '③ 预算': '3. Budget',
+    '恢复随机': 'Back to random',
+    '恢复自动': 'Back to automatic',
+    '选择模型': 'Pick models',
+    '今日生效': 'Active today',
+    '单账号': 'Per account',
+    '单轮最长': 'Max per round',
+    '个账号': 'account(s)',
+    '启动补跑': 'Catch up on start',
+    '保存本模块': 'Save this module',
+    '恢复推荐值': 'Restore defaults',
+    '每日活跃设置已保存': 'Daily activity settings saved',
+    '已恢复推荐值：随机两个时段、自动候选、预算 600 秒': 'Defaults restored: two random slots, automatic candidates, 600s budget',
+    '恢复失败:': 'Restore failed: ',
+    '今日时段': 'Slots today',
+    '运行中': 'Running',
+    '今天全部完成': 'All done for today',
+    '未完成': 'Not done',
+    '未到时段': 'Slot not reached yet',
+    '失败：': 'Failed: ',
+    '未读取到排程（调度器未运行？）': 'No schedule read (is the scheduler running?)',
     '国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话。默认开启。': 'When a Global account checks in, besides the light desktop-identity chat it also runs one web-channel session. On by default.',
     '在家待命中': 'At home, idle',
     '在浏览器里打开下方链接并完成登录授权': 'Open the link below in a browser and finish the sign-in authorization',
@@ -1776,6 +1929,14 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '网页通道一轮没跑完（会话还在 working）就再来一轮：最多尝试几次（含第一轮，可改），每轮等待时间在上一轮基础上增加一个首轮时长——默认 3 次、首轮 120 秒，也就是 120 / 240 / 360 秒。默认开启；会话只是慢的时候多等一轮通常就过了。': 'When a web-channel attempt does not finish (the session is still working), try again: up to N tries in total (the first one included, configurable), with each wait one more first-wait step than the previous one - 3 tries and a 120-second first wait by default, i.e. 120 / 240 / 360. On by default; a session that is merely slow usually finishes on the next attempt.',
     '注意：等待时间逐轮递增，「次数」与「首轮等待」调大都是线性累加的代价——一个始终跑不完的账号最坏能占住巡检 base×(1+2+…+次数) 秒（默认 120×(1+2+3) = 720 秒 = 12 分钟）。建议不超过客户端愿意空等的时长。': 'Note: the wait grows by one first-wait step each round, so raising either the try count or the first wait costs you on a linear scale - an account that never finishes can hold the sweep for base×(1+2+…+tries) seconds (120×(1+2+3) = 720 seconds, 12 minutes, by default). Keep it within how long a client is willing to wait.',
     '已启用：网页通道失败后会再试（等待时间递增）': 'On: the web channel tries again after a failure (wait doubles each time)',
+    '建会话失败退避': 'Backoff after a create failure',
+    '建会话（或取沙箱）就失败的那一轮只花几百毫秒，重试不消耗「首轮等待」的预算，所以这里单独退避：第 N 轮等 base×2^(N-1) 秒，单次上限取 30 秒与基数的较大者，默认 5 秒；填 0 = 不退避（旧行为：一秒内把所有候选打光）。跑过一轮会话的失败不受影响，它们已经用等待时间付过账。': 'A round that fails while creating the conversation (or fetching the sandbox) costs a few hundred milliseconds and never touches the first-wait budget, so it backs off on its own: round N waits base×2^(N-1) seconds, capped per wait at the larger of 30 seconds and the base, 5 seconds by default. 0 disables it, which is the old timing (every candidate burned inside one second). Rounds that did reach the turn are unaffected - they already paid with the wait time.',
+    '建会话失败后等 ': 'Waits ',
+    '不退避：建会话失败后立即重试': 'No backoff: a failed create is retried immediately',
+    '请输入不小于 0 的整数秒（0 = 不退避）': 'Enter a whole number of seconds, 0 or more (0 = no backoff)',
+    '已保存：建会话失败后先等 ': 'Saved: wait ',
+    ' 秒再重试': ' seconds before retrying a failed create',
+    '已关闭退避：建会话失败后立即重试': 'Backoff off: a failed create is retried immediately',
     '已关闭：网页通道只跑一轮': 'Off: the web channel runs a single attempt',
     '已保存：最多尝试 ': 'Saved: up to ',
     ' 次，首轮等待 ': ' tries, first wait ',
@@ -1972,6 +2133,21 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '传输类失败与 502/503/504 改记在「出口」而不是账号上：同一个出口的账号共用一个计数器，退避是秒级（1 秒起、翻倍、封顶 15 秒、带抖动），任一次成功即清零；账号级熔断（30 分钟起、翻倍到 6 小时）不再被一次链路抖动触发。500 与 401/403/429 仍走原路径。默认关闭。': 'Transport failures and 502/503/504 are charged to the egress instead of the account: accounts sharing one egress share one counter, the backoff is seconds-scale (1s, doubling, capped at 15s, jittered) and any success clears it; the account breaker (30 minutes, doubling to 6h) is no longer tripped by a link hiccup. 500 and 401/403/429 keep their old paths. Off by default.',
     '已启用：出口级瞬时失败退避': 'On: egress-level transient backoff',
     '已关闭出口级瞬时失败退避': 'Egress-level transient backoff off',
+'账号级并发上限': 'Per-account concurrency cap',
+'一个上游账号同时最多接几个请求。0 = 不限（默认，跟没这个功能一样）；1 = 一个账号同时只接一个；N = 一个账号最多同时接 N 个。': 'How many requests one upstream account may serve at once. 0 = unlimited (the default, same as having no such feature); 1 = one request per account at a time; N = up to N at once per account.',
+'整个池子能同时接多少 = 账号数 × N（本机 24 个账号：1 → 24 个，3 → 72 个，10 → 240 个）。超出这个数的请求不排队，直接回「每个账号都在忙」，客户端自己重试。': 'Total capacity = accounts x N (24 accounts here: 1 -> 24, 3 -> 72, 10 -> 240 simultaneous requests). Requests beyond that are not queued: they are answered straight away with "every account is busy" and the client retries.',
+'它只防「同一瞬间两个请求压到同一个账号上」（上游按账号+分钟计 token，压一起会回 429、账号被停放）。它治不了「两个开场白相同的会话每轮互换账号」——那种情况每轮都丢缓存，要靠下面的「更稳的会话粘滞键」。': 'It only prevents two requests landing on the same account at the same instant (the upstream meters tokens per account per minute, and piling up there earns a 429 plus a parked account). It does not fix two conversations with the same opening line swapping accounts every turn - those lose their cache each turn and need the stable conversation key below.',
+'1 和 2–10 的实际区别：只有 1 能保证两个同开场白的会话不会同时撞进同一个号；2 以上只是把总容量放大，两个会话又能同时进同一个号（该撞还是撞）；10 在 24 个账号下基本等于「不限」，除非真的同时有 240 个以上请求。日常两三个会话用不到它，保持 0 即可。': 'What 1 versus 2-10 actually changes: only 1 guarantees two conversations with the same opening never share an account at the same time; 2 and above merely raise the total capacity and let those two conversations land on one account again (they still collide); 10 is effectively "unlimited" with 24 accounts unless you really have 240+ simultaneous requests. For two or three everyday conversations you do not need it - leave it at 0.',
+'为什么需要：上游按「账号 + 分钟」计 token，而一个大上下文会话单请求就带十几万 token。两个会话同时压在一个账号上，一分钟内很容易过百万 token，上游回 429；网关随即停放该账号并换号，新账号没有这段对话的前缀缓存，缓存命中率从 99% 掉到 0、首字从 1.5 秒涨到 5-6 秒。设成 1 时两个会话各走各的账号，各自保留缓存。': 'Why this exists: the upstream meters tokens per account per minute, and one large-context turn already carries over a hundred thousand tokens. Two conversations on one account easily pass a million tokens a minute, so the upstream answers 429; the gateway then parks that account and switches, and the new account holds none of the conversation prefix, so the cache hit rate drops from 99% to 0 and time-to-first-byte goes from 1.5s to 5-6s. At 1 each conversation keeps its own account and its own cache.',
+'个 / 账号': 'per account',
+'已保存：账号并发不限': 'Saved: per-account concurrency unlimited',
+'请输入 0 到 10 的整数（0 = 不限）': 'Enter a whole number from 0 to 10 (0 = unlimited)',
+'更稳的会话粘滞键': 'Stable conversation key',
+'会话粘滞（同一段对话每轮回到同一个账号）默认只用「system 提示 + 首条提问」算会话键。两个开场白相同的会话会算出同一个键、共享同一个绑定槽，于是每轮互相覆盖、轮流换账号，缓存每轮归零。开启后把「首条 assistant 回复」也算进键里，两个会话从第 2 轮起各走各的账号。默认关闭，关着时与上游逻辑一字不差。': 'Sticky sessions (every turn of a conversation returning to the same account) key off the system prompt plus the first user message by default. Two conversations that open the same way hash to the same key, share one binding slot, overwrite each other every turn and swap accounts each turn, so the prefix cache is dropped every time. Turning this on also hashes the first assistant reply, so from the second turn on the two conversations keep separate accounts. Off by default: with it off the behaviour is byte-identical to upstream.',
+'代价：前缀真的完全相同的会话仍会共用一个账号（那本来就是最优的缓存共享）；开启后前两条消息的哈希变成前三条，正在进行的对话会一次性重新绑定账号（那一轮缓存掉一次）。': 'The cost: conversations whose prefixes really are identical still share an account (that is the best possible cache sharing anyway); turning it on changes the hash from two messages to three, so conversations already in flight are re-bound once (one turn loses its cache).',
+'启用更稳的会话键': 'Enable stable key',
+'已启用：会话键包含首条回复': 'On: the key includes the first reply',
+'已关闭：会话键只用前两条消息': 'Off: the key uses the first two messages',
     '上游响应头超时': 'Upstream response-header timeout',
     '单次尝试等上游返回响应头的上限（秒）。拿到响应头之前网关不会向客户端发出任何字节，所以这个值就是客户端要空等的时长：设得比客户端的首字节预算还大时，客户端会先断开（表现为 499 / 首字节迟迟不返回），而网关仍会按这个上限继续换账号重试。默认 120。': 'How long one attempt may wait for the upstream to send response headers (seconds). Nothing is sent to the client before those headers arrive, so this is exactly how long the client can end up waiting: set it above the client\'s first-byte budget and the client disconnects first (seen as a 499, or a first byte that never comes) while the gateway keeps retrying on the next account under the same limit. Default 120.',
     '调小的代价：上游偶尔确实算得慢的正常请求会被提前判失败、换账号重试，多消耗一次额度。建议不高于客户端的首字节预算。': 'The cost of lowering it: a normal request the upstream genuinely takes a long time to compute is failed early and retried on another account, spending one more unit of quota. Prefer a value no higher than the client\'s first-byte budget.',
@@ -2101,6 +2277,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '检查失败': 'Check failed',
     '尚未检查': 'Not checked yet',
     '读取失败': 'Could not read',
+    '读取于': 'read at',
     '本月': 'This month',
     '本月 (This Month)': 'This month',
     '本月消耗 Token': 'Tokens used this month',
@@ -2481,6 +2658,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '账号当日消费的积分达到该值后，只允许请求免费模型（目录中标记为 x0.00 的模型），需要花费积分的模型自动切到其他账号；本地时间 0 点后自动恢复。填 0 表示关闭（默认）。': 'Once the credit spend of an account for the day reaches this, only free models are allowed (those marked x0.00 in the catalog) and models that cost credits switch to other accounts; it recovers after local midnight. 0 turns it off (default).',
     '账号，之后相关请求都会走该账号': 'account; requests will then go through it',
     '走网页通道': 'use the web channel',
+    '证书失败改走活跃上报': 'report activity when the certificate fails',
     '活跃使用的模型': 'Model for the daily activity',
     '(已指定)': '(set)',
     '（免费 0.00x）': ' (free 0.00x)',
@@ -2880,6 +3058,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "已启用：429 时自动切换出站身份": "已啟用：429 時自動切換出站身份",
     "已启用：余额低于": "已啟用：餘額低於",
     "已启用：国际版打卡走网页通道": "已啟用：國際版打卡走網頁通道",
+    "证书失败改走活跃上报": "憑證失敗改走活躍上報",
     "失败重试": "失敗重試",
     "最多尝试次数": "最多嘗試次數",
     "首轮等待": "首輪等待",
@@ -2890,6 +3069,14 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "网页通道一轮没跑完（会话还在 working）就再来一轮：最多尝试几次（含第一轮，可改），每轮等待时间在上一轮基础上增加一个首轮时长——默认 3 次、首轮 120 秒，也就是 120 / 240 / 360 秒。默认开启；会话只是慢的时候多等一轮通常就过了。": "網頁通道一輪沒跑完（會話還在 working）就再來一輪：最多嘗試幾次（含第一輪，可改），每輪等待時間在上一輪基礎上增加一個首輪時長——預設 3 次、首輪 120 秒，也就是 120 / 240 / 360 秒。預設開啟；會話只是慢的時候多等一輪通常就過了。",
     "注意：等待时间逐轮递增，「次数」与「首轮等待」调大都是线性累加的代价——一个始终跑不完的账号最坏能占住巡检 base×(1+2+…+次数) 秒（默认 120×(1+2+3) = 720 秒 = 12 分钟）。建议不超过客户端愿意空等的时长。": "注意：等待時間逐輪遞增，「次數」與「首輪等待」調大都是線性累加的代價——一個始終跑不完的帳號最壞能佔住巡檢 base×(1+2+…+次數) 秒（預設 120×(1+2+3) = 720 秒 = 12 分鐘）。建議不超過客戶端願意空等的時長。",
     "已启用：网页通道失败后会再试（等待时间递增）": "已啟用：網頁通道失敗後會再試（等待時間遞增）",
+    "建会话失败退避": "建會話失敗退避",
+    "建会话（或取沙箱）就失败的那一轮只花几百毫秒，重试不消耗「首轮等待」的预算，所以这里单独退避：第 N 轮等 base×2^(N-1) 秒，单次上限取 30 秒与基数的较大者，默认 5 秒；填 0 = 不退避（旧行为：一秒内把所有候选打光）。跑过一轮会话的失败不受影响，它们已经用等待时间付过账。": "建會話（或取沙箱）就失敗的那一輪只花幾百毫秒，重試不消耗「首輪等待」的預算，所以這裡單獨退避：第 N 輪等 base×2^(N-1) 秒，單次上限取 30 秒與基數的較大者，預設 5 秒；填 0 = 不退避（舊行為：一秒內把所有候選打光）。跑過一輪會話的失敗不受影響，它們已經用等待時間付過帳。",
+    "建会话失败后等 ": "建會話失敗後等 ",
+    "不退避：建会话失败后立即重试": "不退避：建會話失敗後立即重試",
+    "请输入不小于 0 的整数秒（0 = 不退避）": "請輸入不小於 0 的整數秒（0 = 不退避）",
+    "已保存：建会话失败后先等 ": "已儲存：建會話失敗後先等 ",
+    " 秒再重试": " 秒再重試",
+    "已关闭退避：建会话失败后立即重试": "已關閉退避：建會話失敗後立即重試",
     "已关闭：网页通道只跑一轮": "已關閉：網頁通道只跑一輪",
     "已保存：最多尝试 ": "已保存：最多嘗試 ",
     " 次，首轮等待 ": " 次，首輪等待 ",
@@ -3838,7 +4025,11 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </div>
   </div>
 </header>
-<div id="panelGate" style="position:fixed;inset:0;z-index:600;display:none;
+<!-- 面板闸门默认可见（fail-closed）。看板骨架是静态标记，闸门若初始 display:none，
+     首帧会先把整块看板画出来、等 /panel/status 回来才盖住：无痕窗口 / 首次访问每次
+     都能看到「登录后的界面」闪一下。有会话令牌时由 <head> 里那段首帧判定先隐藏
+     （html.wb-panel-session），复核失败再由 panelNeedsLogin() 显示。 -->
+<div id="panelGate" style="position:fixed;inset:0;z-index:600;display:flex;
      align-items:center;justify-content:center;padding:20px;background:var(--bg)">
   <div style="width:min(380px,100%);background:var(--panel);border:1px solid var(--line);
               border-radius:14px;padding:26px 24px;box-shadow:0 10px 30px rgba(15,23,42,.12)">
@@ -3848,10 +4039,13 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
            onkeydown="if(event.key==='Enter') submitPanelLogin()"
            style="width:100%;background:var(--panel2);border:1px solid var(--line);
                   border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
-    <div id="panelLoginMsg" style="font-size:12px;color:var(--bad);min-height:17px;margin:8px 0 12px"></div>
+    <div id="panelLoginMsg" style="font-size:12px;color:var(--bad);min-height:17px;margin:8px 0 12px;word-break:break-word;line-height:1.4"></div>
     <button onclick="submitPanelLogin()" style="width:100%;padding:9px 12px;font-size:13px">进入面板</button>
     <div id="panelDefaultHint" style="display:none;font-size:11px;color:var(--warn);margin-top:12px">
       当前仍在使用默认密码 <b>admin</b>，登录后请在「设置」中修改。
+    </div>
+    <div id="panelCryptoWarning" style="display:none;font-size:11px;color:var(--bad);margin-top:12px;line-height:1.4;word-break:break-word">
+      警告：当前 Python 解释器缺少 <code>hashlib.pbkdf2_hmac</code> 支持。若使用 Windows 便携版 Python，可能因系统安全策略（如 Smart App Control）拦截了 <code>DLLs/_hashlib.pyd</code>。自定义密码将无法登录，请更换为完整 Python 或放行该 DLL。
     </div>
   </div>
 </div>
@@ -4039,6 +4233,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div class="collapse-inner">
     <div class="toolbar">
     <button onclick="openLoginModal()">添加</button>
+    <!-- 静态 API Key 是另一条并行入口：CodeBuddy 的登录页不支持企业微信扫码，
+         企业号只能在 API 管理页手工建 Key 再粘进来。 -->
+    <button class="sec" onclick="openApiKeyModal()">+ API Key</button>
     <!-- 打卡按钮与「添加」同排：手机端靠右显示，不再单独占一行。 -->
     <div class="tb-group tb-checkin">
     <button class="sec" id="btnCheckin" onclick="doCheckin(this)" style="display:none">Buddy 加油站签到</button>
@@ -4155,6 +4352,13 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <div class="k">累计活跃奖励积分</div>
         <div class="v" id="intlTotalGranted" style="color:var(--warn)">-</div>
       </div>
+    </div>
+    <!-- 今日活跃的现场：时段、未完成名单与原因、正在跑的账号。设置项在「设置」页，
+         这里只读，回答的是「今天到底跑没跑、卡在谁身上」。 -->
+    <div id="intlDailyChatPanel" style="border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:16px;font-size:12px;line-height:1.8">
+      <div id="intlDailyChatSlots" style="color:var(--dim)">今日时段：-</div>
+      <div id="intlDailyChatLive" style="color:var(--dim)"></div>
+      <div id="intlDailyChatPending" style="margin-top:6px"></div>
     </div>
   </section>
 
@@ -4973,7 +5177,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
           <div>
             <h2 style="margin:0">国际版每日活跃打卡 <em id="setDailyChatWebState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
-              国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话。默认开启。
+              一次打卡 = 一个预算 + 一个候选模型序列：按顺序换模型重试，预算用完必给结论。
             </div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
@@ -4981,98 +5185,108 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
               <input id="setDailyChatWeb" type="checkbox" style="width:16px;height:16px">
               走网页通道
             </label>
-            <button onclick="saveDailyChatWeb(this)">保存</button>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setDailyChatActivityFallback" type="checkbox" style="width:16px;height:16px">
+              证书失败改走活跃上报
+              <em id="setDailyChatActivityFallbackState" style="font-style:normal;font-size:12px;color:var(--dim)"></em>
+            </label>
           </div>
         </div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <label style="font-size:13px;color:var(--dim)">活跃使用的模型</label>
-          <select id="setDailyChatModel" style="min-width:240px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit"></select>
-          <button onclick="saveDailyChatModel(this)">保存</button>
-          <span id="setDailyChatModelState" style="font-size:12px;color:var(--dim)"></span>
-        </div>
-        <div style="font-size:12px;color:var(--dim);margin-top:6px">
-          清单是国际版目录里的全部模型，标价 0.00x 的标成免费并排在前面。每日活跃只是一次「Hi」的会话，默认用内置的免费模型；换一个是为了把活跃挪出真实流量正在用的那个模型的窗口额度。选到付费模型的话，活跃就会按那个模型花积分。
-        </div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px">
-          <label style="font-size:13px;color:var(--dim)">每日活跃定时</label>
-          <span id="setDailyChatTimesState" style="font-size:12px;color:var(--dim)"></span>
-          <input id="setDailyChatTimeInput" type="time" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">
-          <button class="sec mini" onclick="addDailyChatTime()">添加时间</button>
-          <button onclick="saveDailyChatTimes(this)">保存</button>
-        </div>
-        <div id="setDailyChatTimesList" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"></div>
-        <div style="font-size:12px;color:var(--dim);margin-top:6px">
-          可填多个 HH:MM（逗号分隔，最多 24 个）。留空时跟随「签到」整点（默认 09:00/21:00）；填写后每日活跃只在这些时刻触发，不再跟签到走。改完无需重启，调度器每 30 秒重读一次。
-        </div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px">
-          <label class="switch">
-            <input id="setDailyChatWebRetry" type="checkbox" onchange="saveDailyChatWebRetry()">
-            <span class="switch-track"></span>
-            <span>失败重试</span>
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
-            最多尝试次数
-            <input id="setDailyChatWebAttempts" type="number" min="1" step="1" style="width:70px">
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
-            首轮等待
-            <input id="setDailyChatWebTimeout" type="number" min="1" step="1" style="width:90px">
-            秒
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
-            并发数
-            <input id="setDailyChatWebConcurrency" type="number" min="1" step="1" style="width:70px">
-            个账号
-          </label>
-          <button onclick="saveDailyChatWebTuning(this)">保存</button>
-          <span id="setDailyChatWebRetryState" style="font-size:12px;color:var(--dim)"></span>
-        </div>
-        <div style="font-size:12px;color:var(--dim);margin-top:6px">
-          网页通道一轮没跑完（会话还在 working）就再来一轮：最多尝试几次（含第一轮，可改），每轮等待时间在上一轮基础上增加一个首轮时长——默认 3 次、首轮 120 秒，也就是 120 / 240 / 360 秒。默认开启；会话只是慢的时候多等一轮通常就过了。
-        </div>
-        <div style="font-size:12px;color:var(--warn);margin-top:4px">
-          注意：等待时间逐轮递增，「次数」与「首轮等待」调大都是线性累加的代价——一个始终跑不完的账号最坏能占住巡检 base×(1+2+…+次数) 秒（默认 120×(1+2+3) = 720 秒 = 12 分钟）。建议不超过客户端愿意空等的时长。
-        </div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px">
-          <label class="switch">
-            <input id="setDailyChatWebFallback" type="checkbox" onchange="saveDailyChatWebFallback()">
-            <span class="switch-track"></span>
-            <span>失败后按模型组合回退</span>
-          </label>
-          <span id="setDailyChatWebFallbackState" style="font-size:12px;color:var(--dim)"></span>
-        </div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px">
-          <label style="font-size:13px;color:var(--dim)">回退模型组合</label>
-          <span id="setDailyChatWebFallbackModelsState" style="font-size:12px;color:var(--dim)"></span>
-          <button class="sec mini" onclick="toggleDailyChatFallbackPicker()">选择模型</button>
-          <button onclick="saveDailyChatWebFallbackModels(this)">保存</button>
-        </div>
-        <div id="setDailyChatWebFallbackPicker" style="display:none;border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:6px">
-          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
-            <input id="setDailyChatWebFallbackSearch" placeholder="搜索模型" oninput="filterDailyChatFallbackPicker()" style="flex:1;min-width:160px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 9px;font:inherit;color:var(--fg)">
-            <button class="sec mini" onclick="setDailyChatFallbackAll(true)">全选</button>
-            <button class="sec mini" onclick="setDailyChatFallbackAll(false)">全不选</button>
+
+        <div style="border-top:1px solid var(--line);padding-top:12px">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <strong style="font-size:13px">① 时段</strong>
+            <span id="setDailyChatTimesState" style="font-size:12px;color:var(--dim)"></span>
+            <input id="setDailyChatTimeInput" type="time" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">
+            <button class="sec mini" onclick="addDailyChatTime()">添加时间</button>
+            <button class="sec mini" onclick="resetDailyChatTimes()">恢复随机</button>
           </div>
-          <div id="setDailyChatWebFallbackList" style="max-height:220px;overflow:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:2px 8px"></div>
+          <div id="setDailyChatTimesList" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"></div>
+          <div style="font-size:12px;color:var(--dim);margin-top:6px">
+            留空 = 每天随机两个时间、间隔 12 小时（分钟避开整点，绕开上游 14220 的批处理窗口）。今日生效：
+            <span id="setDailyChatEffective" style="color:var(--accent2)">-</span>
+          </div>
         </div>
-        <div style="font-size:12px;color:var(--dim);margin-top:6px">
-          回退开启后，网页通道每失败一次就换下一个模型；组合按目录倍率自动排序（免费 → 低积分 → 高积分），先试免费的，再试便宜的，最后才是贵的。候选至少各试一次，配置的「最多尝试次数」更大时再从头跑第二轮。默认关闭。
+
+        <div style="border-top:1px solid var(--line);padding-top:12px;margin-top:12px">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <strong style="font-size:13px">② 候选模型</strong>
+            <span id="setDailyChatModelsState" style="font-size:12px;color:var(--dim)"></span>
+            <button class="sec mini" onclick="toggleDailyChatModelPicker()">选择模型</button>
+            <button class="sec mini" onclick="resetDailyChatModels()">恢复自动</button>
+          </div>
+          <div id="setDailyChatModelList" style="display:flex;flex-direction:column;gap:4px;margin-top:8px"></div>
+          <div id="setDailyChatModelPicker" style="display:none;border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:6px">
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+              <input id="setDailyChatModelSearch" placeholder="搜索模型" oninput="filterDailyChatModelPicker()" style="flex:1;min-width:160px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 9px;font:inherit;color:var(--fg)">
+              <button class="sec mini" onclick="setDailyChatModelAll(true)">全选</button>
+              <button class="sec mini" onclick="setDailyChatModelAll(false)">全不选</button>
+            </div>
+            <div id="setDailyChatModelPickList" style="max-height:220px;overflow:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:2px 8px"></div>
+          </div>
+          <div style="font-size:12px;color:var(--dim);margin-top:6px">
+            按顺序试：第一个是首选，失败换下一个；留空 = 自动（首选模型 + 该区域免费模型，按倍率排序）。
+            建会话失败（14220）与模型无关，多加候选只是多打几次。
+          </div>
         </div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px">
-          <label class="switch">
-            <input id="setDailyChatRandomPrompt" type="checkbox" onchange="saveDailyChatRandomPrompt()">
-            <span class="switch-track"></span>
-            <span>随机提示词</span>
-          </label>
-          <span id="setDailyChatRandomPromptState" style="font-size:12px;color:var(--dim)"></span>
+
+        <div style="border-top:1px solid var(--line);padding-top:12px;margin-top:12px">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <strong style="font-size:13px">③ 预算</strong>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              单账号
+              <input id="setDailyChatBudget" type="number" min="0" step="30" style="width:90px">
+              秒
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              单轮最长
+              <input id="setDailyChatTurnTimeout" type="number" min="30" step="10" style="width:90px">
+              秒
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              并发
+              <input id="setDailyChatWebConcurrency" type="number" min="1" step="1" style="width:70px">
+              个账号
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              建会话退避
+              <input id="setDailyChatWebRetryBackoff" type="number" min="0" step="1" style="width:70px">
+              秒
+            </label>
+          </div>
+          <div style="font-size:12px;color:var(--dim);margin-top:6px">
+            每轮最多等「单轮最长」与「剩余预算」里较小的那个，建会话退避也从预算里扣：预算用完这一轮必出结论（成功 / 失败 / 超时）。
+            单账号填 0 = 不限制。
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px">
+            <label class="switch">
+              <input id="setDailyChatStartupCatchup" type="checkbox">
+              <span class="switch-track"></span>
+              <span>启动补跑</span>
+            </label>
+            <span id="setDailyChatStartupCatchupState" style="font-size:12px;color:var(--dim)"></span>
+          </div>
+          <div style="font-size:12px;color:var(--dim);margin-top:6px">
+            进程重启后如果当天还有账号没活跃，立刻补跑一次；旧行为是等到下一个时段，最多再等 12 小时。
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px">
+            <label class="switch">
+              <input id="setDailyChatRandomPrompt" type="checkbox" onchange="saveDailyChatRandomPrompt()">
+              <span class="switch-track"></span>
+              <span>随机提示词</span>
+            </label>
+            <span id="setDailyChatRandomPromptState" style="font-size:12px;color:var(--dim)"></span>
+            <button class="sec mini" onclick="openPromptPicker()">选择提示词</button>
+          </div>
+          <div style="font-size:12px;color:var(--dim);margin-top:6px">
+            开启后每次网页活跃从勾选的提示词里随机抽一条；一条都不勾时使用全部内置 300 条。关闭时仍旧只发 Hi。
+          </div>
         </div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px">
-          <label style="font-size:13px;color:var(--dim)">随机池</label>
-          <span id="setDailyChatPromptsState" style="font-size:12px;color:var(--dim)"></span>
-          <button class="sec mini" onclick="openPromptPicker()">选择提示词</button>
-        </div>
-        <div style="font-size:12px;color:var(--dim);margin-top:6px">
-          开启后每次网页活跃从勾选的提示词里随机抽一条；一条都不勾时使用全部内置 300 条。关闭时仍旧只发 Hi。
+
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:14px">
+          <button class="primary" onclick="saveDailyChatModule(this)">保存本模块</button>
+          <button class="sec" onclick="resetDailyChatModule(this)">恢复推荐值</button>
+          <span id="setDailyChatSaveState" style="font-size:12px;color:var(--dim)"></span>
         </div>
         <div id="promptPickerMask" class="modal-mask" style="display:none">
           <div class="modal" role="dialog" aria-modal="true" style="width:min(760px,100%)">
@@ -5302,6 +5516,74 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <section>
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
           <div>
+            <h2 style="margin:0">账号级并发上限 <em id="setAccountConcurrentState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              一个上游账号同时最多接几个请求。0 = 不限（默认，跟没这个功能一样）；1 = 一个账号同时只接一个；N = 一个账号最多同时接 N 个。
+            </div>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              整个池子能同时接多少 = 账号数 × N（本机 24 个账号：1 → 24 个，3 → 72 个，10 → 240 个）。超出这个数的请求不排队，直接回「每个账号都在忙」，客户端自己重试。
+            </div>
+            <div style="font-size:12px;color:var(--warn);margin-top:4px">
+              它只防「同一瞬间两个请求压到同一个账号上」（上游按账号+分钟计 token，压一起会回 429、账号被停放）。它治不了「两个开场白相同的会话每轮互换账号」——那种情况每轮都丢缓存，要靠下面的「更稳的会话粘滞键」。
+            </div>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              1 和 2–10 的实际区别：只有 1 能保证两个同开场白的会话不会同时撞进同一个号；2 以上只是把总容量放大，两个会话又能同时进同一个号（该撞还是撞）；10 在 24 个账号下基本等于「不限」，除非真的同时有 240 个以上请求。日常两三个会话用不到它，保持 0 即可。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setAccountConcurrent" type="number" min="0" max="10" step="1" style="width:90px">
+              个 / 账号
+            </label>
+            <button onclick="saveAccountConcurrent(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">更稳的会话粘滞键 <span class="help-mark" role="button" tabindex="0" aria-label="功能说明" onclick="toggleHelpDetail('affinityStableKeyHelp', event)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleHelpDetail('affinityStableKeyHelp', event);}">!</span> <em id="setAffinityStableKeyState"></em></h2>
+            <div class="help-detail" id="affinityStableKeyHelp" hidden>
+              会话粘滞（同一段对话每轮回到同一个账号）默认只用「system 提示 + 首条提问」算会话键。两个开场白相同的会话会算出同一个键、共享同一个绑定槽，于是每轮互相覆盖、轮流换账号，缓存每轮归零。开启后把「首条 assistant 回复」也算进键里，两个会话从第 2 轮起各走各的账号。默认关闭，关着时与上游逻辑一字不差。
+              <br><br>
+              代价：前缀真的完全相同的会话仍会共用一个账号（那本来就是最优的缓存共享）；开启后前两条消息的哈希变成前三条，正在进行的对话会一次性重新绑定账号（那一轮缓存掉一次）。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setAffinityStableKey" type="checkbox" style="width:16px;height:16px">
+              启用更稳的会话键
+            </label>
+            <button onclick="saveAffinityStableKey(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">上游响应头超时 <em id="setHeaderTimeoutState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              单次尝试等上游返回响应头的上限（秒）。拿到响应头之前网关不会向客户端发出任何字节，所以这个值就是客户端要空等的时长：设得比客户端的首字节预算还大时，客户端会先断开（表现为 499 / 首字节迟迟不返回），而网关仍会按这个上限继续换账号重试。默认 120。
+            </div>
+            <div style="font-size:12px;color:var(--warn);margin-top:4px">
+              调小的代价：上游偶尔确实算得慢的正常请求会被提前判失败、换账号重试，多消耗一次额度。建议不高于客户端的首字节预算。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setHeaderTimeout" type="number" min="1" step="1" style="width:90px">
+              秒
+            </label>
+            <button onclick="saveHeaderTimeout(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
             <h2 style="margin:0">日志落库 <em id="setLogDbState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
               默认关闭：日志只留在内存（最新 2000 条，重启即失），与上游一致。开启后每条日志追加写入
@@ -5358,6 +5640,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
           </tbody>
         </table>
         <div id="setUpdateError" style="font-size:12px;color:var(--warn);margin-top:8px"></div>
+        <div id="setUpdateInstallHint" style="font-size:12px;color:var(--dim);margin-top:8px" aria-live="polite"></div>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-top:14px">
           <input id="setUpdateCheckEnabled" type="checkbox" style="width:16px;height:16px">
           每天自动检查更新
@@ -5652,6 +5935,37 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   </div>
 </div>
 
+<div class="modal-mask" id="apiKeyModal">
+  <div class="modal" role="dialog" aria-modal="true" style="width:min(560px,100%)">
+    <div class="modal-hd">
+      <h2>添加 API Key 账号</h2>
+      <button class="modal-x" onclick="closeApiKeyModal()" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <p class="hint" style="margin-top:0">
+        粘贴 CodeBuddy API 管理页签发的静态 Key（<code>ck_</code> / <code>pt_</code> 前缀）。
+        它会先拿企业额度端点验一次，通过了才落盘——验不过就什么都不写。
+      </p>
+      <div class="field" style="margin-top:12px">
+        <label for="apiKeyInput">API Key</label>
+        <input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false"
+               placeholder="ck_xxxxxxxx.yyyyyyyy" style="width:100%">
+      </div>
+      <div class="field" style="margin-top:12px">
+        <label for="apiKeyNickname">备注名（可选）</label>
+        <input id="apiKeyNickname" type="text" autocomplete="off" maxlength="64"
+               placeholder="例如：企微企业号" style="width:100%">
+      </div>
+      <p class="hint" id="apiKeyModalMsg" style="margin-bottom:0"></p>
+    </div>
+    <div class="modal-ft">
+      <span style="flex:1"></span>
+      <button class="sec" onclick="closeApiKeyModal()">取消</button>
+      <button class="primary" id="btnApiKeyCommit" onclick="commitApiKey(this)">验证并添加</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-mask" id="activityHistoryModal" onclick="if(event.target===this) closeActivityHistory()">
   <div class="modal" role="dialog" aria-modal="true" style="width:min(920px,96vw);max-height:92vh;display:flex;flex-direction:column">
     <div class="modal-hd">
@@ -5669,7 +5983,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
           <option value="7d" selected>近 7 天</option>
           <option value="30d">近 30 天</option>
         </select>
-        <select id="actUid" onchange="setActivityFilter('uid', this.value)" title="账号"></select>
+        <select id="actUid" onchange="setActivityFilter('uid', this.value)" title="账号" style="max-width:180px"></select>
         <select id="actTask" onchange="setActivityFilter('task', this.value)" title="任务">
           <option value="">全部任务</option>
           <option value="checkin">国内签到</option>
@@ -5683,7 +5997,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <button class="sec" onclick="loadActivityHistory()">刷新</button>
       </div>
       <div class="table-wrap">
-        <table class="data-cards"><thead><tr>
+        <table class="data-cards activity-table"><thead><tr>
           <th>时间</th><th>账号</th><th>任务</th><th>结果</th><th>说明</th>
         </tr></thead><tbody id="activityHistoryRows"></tbody></table>
       </div>
@@ -6399,15 +6713,21 @@ function renderAvailableModels(){
         ? ' <span style="font-size:10px;color:var(--accent)">(夜间0.5x)</span>' : '';
       credBadge = '<span class="badge s">' + esc(raw) + night + '</span>';
     }
-    // #505: 只标「免费账号不可用」，不标「可用」。没有 entitlement 就什么都不显示。
+    // #505: 只标「Pro Only」（与上游徽章同名），不标「可用」。没有 entitlement 就什么都不显示。
+    // 标注由 /v1/models 给出：source=catalog 是上游目录 modelTiers 的声明（与
+    // 调度器拦人用的是同一份数据），source=runtime 是历史上真撞到过 11158。
     const ent = m.entitlement;
-    if(ent && Number(ent.code) === 11158){
-      const who = ent.userType ? ('user type ' + ent.userType) : '免费账号';
-      const when = ent.checked_at ? new Date(Number(ent.checked_at) * 1000).toLocaleString() : '';
-      const tip = '上游 ' + ent.code + ' · ' + who + (when ? (' · ' + when) : '')
-        + ' · 仅标记不可用，未标记不代表可用';
+    if(ent){
+      const stamp = ent.checked_at || ent.at;
+      const when = stamp ? new Date(Number(stamp) * 1000).toLocaleString() : '';
+      const tip = (ent.source === 'catalog')
+        ? ('上游目录声明：该模型仅限 PRO 账号（requiredUserType=standard）'
+           + (when ? (' · 目录刷新于 ' + when) : '')
+           + ' · 免费账号的请求会被本地拦下，不发往上游 · 仅标记不可用，未标记不代表可用')
+        : ('上游 ' + ent.code + ' · ' + (ent.userType ? ('user type ' + ent.userType) : '免费账号')
+           + (when ? (' · ' + when) : '') + ' · 仅标记不可用，未标记不代表可用');
       credBadge += ' <span class="badge warn" style="font-size:11px;background:var(--warn-soft);color:var(--warn);border-color:rgba(183,121,31,.35)" title="'
-        + esc(tip) + '">免费账号不可用</span>';
+        + esc(tip) + '">Pro Only</span>';
     }
 
     // 2. 模型能力 (Vision, Tool calls)
@@ -7551,7 +7871,7 @@ function card(k, v, sub, cls){
 
 /* ---- api key handling ---- */
 const KEY_STORE = 'wb-proxy-api-key';
-const PANEL_STORE = 'wb-proxy-panel-token';
+// PANEL_STORE 在 <head> 里定义（首帧判定要用它），这里不再重复声明。
 let API_KEY = '';
 let PANEL_TOKEN = '';
 try { PANEL_TOKEN = sessionStorage.getItem(PANEL_STORE) || ''; } catch(e) { PANEL_TOKEN = ''; }
@@ -7936,6 +8256,83 @@ async function loadActivityToday(){
   }
 }
 
+// 国际版每日活跃的现场面板：时段、下次到点、正在跑的账号与未完成名单。
+// 名单与「未活跃打卡一键打卡」同源（pending 由 updateTaskPageCheckinCards 传进来），
+// 原因取今天最近一条活跃流水的说明，所以「没跑」和「失败」在界面上分得开。
+let DAILY_CHAT_PANEL_CACHE = {at: 0, data: null};
+async function fetchDailyChatScheduler(){
+  const now = Date.now();
+  if(DAILY_CHAT_PANEL_CACHE.data && now - DAILY_CHAT_PANEL_CACHE.at < 10000){
+    return DAILY_CHAT_PANEL_CACHE.data;
+  }
+  try{
+    const s = await getJSON('/scheduler');
+    const info = (s && s.daily_chat) ? s.daily_chat : null;
+    DAILY_CHAT_PANEL_CACHE = {at: now, data: info};
+    return info;
+  }catch(e){
+    return DAILY_CHAT_PANEL_CACHE.data;
+  }
+}
+function fmtDuration(sec){
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  if(s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  return m + 'm' + String(s % 60).padStart(2, '0') + 's';
+}
+async function renderDailyChatPanel(pending, intlAccts){
+  const slotsEl = document.getElementById('intlDailyChatSlots');
+  const liveEl = document.getElementById('intlDailyChatLive');
+  const pendingEl = document.getElementById('intlDailyChatPending');
+  if(!slotsEl && !liveEl && !pendingEl) return;
+  const info = await fetchDailyChatScheduler();
+  const total = (intlAccts || []).length;
+  const done = total - ((pending || []).length);
+  if(slotsEl){
+    if(!info || !Array.isArray(info.times) || !info.times.length){
+      slotsEl.textContent = '今日时段：未读取到排程（调度器未运行？）';
+    }else{
+      const label = info.random ? '（每天随机，间隔 12 小时）' : '';
+      const next = info.next_slot ? (' · 下次 ' + info.next_slot) : ' · 今日时段已全部触发';
+      slotsEl.textContent = '今日时段 ' + info.times.join(' / ') + label + next
+        + ' · 完成 ' + done + '/' + total
+        + (info.budget_s ? (' · 单账号预算 ' + fmtDuration(info.budget_s)) : ' · 预算不限制');
+    }
+  }
+  if(liveEl){
+    const live = (info && Array.isArray(info.live)) ? info.live : [];
+    if(!live.length){
+      liveEl.textContent = '';
+    }else{
+      liveEl.innerHTML = live.map(function(item){
+        const left = item.remaining_s == null ? '' : (' / 剩余 ' + fmtDuration(item.remaining_s));
+        return '<span style="color:var(--accent)">运行中 ' + esc(item.uid8 || '') + ' · 已用 '
+          + fmtDuration(item.elapsed_s) + left + '</span>';
+      }).join('<br>');
+    }
+  }
+  if(pendingEl){
+    const list = pending || [];
+    if(!list.length){
+      pendingEl.innerHTML = '<span style="color:var(--accent2)">今天全部完成</span>';
+      return;
+    }
+    const rows = list.map(function(a){
+      const uid8 = String(a.uid || '').slice(0, 8);
+      const nick = a.nickname || '';
+      const row = (ACTIVITY_TODAY && ACTIVITY_TODAY.byUid) ? ACTIVITY_TODAY.byUid[a.uid] : null;
+      let reason = '未到时段';
+      if(row && row.message){
+        reason = (row.ok === false ? '失败：' : '') + String(row.message);
+      }
+      return '<div><span style="color:var(--dim)">·</span> ' + esc(uid8)
+        + ' <span style="color:var(--fg)">' + esc(nick) + '</span> '
+        + '<span style="color:var(--warn)">' + esc(reason.slice(0, 120)) + '</span></div>';
+    }).join('');
+    pendingEl.innerHTML = '<div style="color:var(--dim)">未完成 ' + list.length + '</div>' + rows;
+  }
+}
+
 // 任务与福利页面的今日打卡/签到卡片状态：与网关与账号页面的今日活跃/今日签到完全同一口径
 // 统一通过 activityStatusOf(a) 判定（以今天真实流水为准，回落到本日本地时间前缀）。
 function updateTaskPageCheckinCards(){
@@ -7968,6 +8365,7 @@ function updateTaskPageCheckinCards(){
       }
       // 悬停看未打卡名单：与「未活跃打卡一键打卡」按钮要打的那批同源，看到什么就打什么。
       setCardTip(pending.length ? pendingDailyChatTip(pending) : '国际版账号今天都已打卡');
+      renderDailyChatPanel(pending, intlAccts);
     }
   }
 
@@ -8044,9 +8442,10 @@ function activityHistoryRow(row){
     +   (row && row.ok ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>')
     + '</td>'
     // 上游原文可能很长：在 span 上做行内截断（td 自身不吃 max-width），完整
-    // 内容留在 title 里，模态框不会被撑宽。
+    // 内容留在 title 里，模态框不会被撑宽。.note-clip 与账号页活动表共用分档
+    // 上限（中屏 300px），手机上由 640px 断点改折行。
     + '<td data-label="说明" style="text-align:left">'
-    +   '<span style="display:inline-block;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom"'
+    +   '<span class="note-clip" style="max-width:420px"'
     +   ' title="' + esc(message) + '">' + esc(message || '—') + '</span></td>'
     + '</tr>';
 }
@@ -8175,6 +8574,25 @@ function accountRow(a){
       expBadge = '<span class="badge mini warn" style="font-size:10px;padding:1px 4px" title="最近套餐包将于 ' + esc(expEnd.slice(5,10)) + ' 到期 (剩' + Math.ceil(d) + '天)">7天内到期</span>';
     }
   }
+  // 账号档位（#505）读自上游计费摘要，包名原样显示（国际版 Free、国内版体验版），
+  // 与 workbuddy 官方叫法一致，不自造「免费 / 付费」标签。tier 为空 = 还没读过，
+  // 那是「未知」而不是免费，所以不画任何胶囊（企业号与被风控限制的号也是空）。
+  //
+  // 位置放在「版本」格里、区域徽章的正下方：这一格只有一枚区域徽章（实测 76px
+  // 宽、内容约 52px），是全表唯一还有余量又不会被别的元素挤到的地方。积分格
+  // 实测只有 120px，加了「临期 / 明细」就顶满；账号格里的次要信息行是 10px 的
+  // 可点击链接，胶囊挤在旁边既会被长名单推走、又容易被当成链接的一部分。
+  // 行高不受影响：账号格本来就比这一格高。
+  const tier = a.tier && typeof a.tier === 'object' ? a.tier : null;
+  const tierPkg = tier && tier.package ? String(tier.package) : '';
+  let tierBadge = '';
+  if(tierPkg){
+    const at = tier.checked_at ? new Date(tier.checked_at * 1000).toLocaleString() : '';
+    tierBadge = '<span class="badge mini' + (tier.paid === true ? ' ok' : '') + '"'
+      + ' title="会员类型: ' + esc(tierPkg) + (at ? ' · 读取于 ' + esc(at) : '') + '">'
+      + esc(tierPkg) + '</span>';
+  }
+  const tierBadgeBlock = tierBadge ? '<div style="margin-top:2px">' + tierBadge + '</div>' : '';
   const credText = cred
     ? ('<div class="credit-stack">'
        + '<div class="credit-main"><b>' + fmt(cred.remain) + '</b>'
@@ -8202,17 +8620,27 @@ function accountRow(a){
   // 有续行时给账号行打 has-alert：两行是同一块内容，中间不该有分割线（见 CSS）。
   const alertRows = coolRow(a) + limitRow(a);
   return '<tr' + (alertRows ? ' class="has-alert"' : '') + '>'
-    + '<td style="text-align:center;white-space:nowrap" data-label="版本">' + realmBadge + '</td>'
+    + '<td style="text-align:center;white-space:nowrap" data-label="版本">' + realmBadge + tierBadgeBlock + '</td>'
     + '<td style="text-align:left" data-label="账号">'
     // 账号名（大一号）+ 备注 chip 同一行；备注从独立一行收进账号后面。
     +   '<div class="acct-name-row">'
     +     '<span class="acct-name" title="' + esc(a.nickname) + '">' + esc(a.nickname) + '</span>'
+    // 静态 API Key 账号：没有登录身份，也没有签到/成长体系，标出来省得当成
+    // 普通 OAuth 号去点「重新登录」。悬停给出脱敏后的凭证，方便对上是哪一把。
+    +     (a.apiKey
+          ? '<span class="badge mini" style="background:var(--panel2);color:var(--dim)"'
+            + ' title="静态 API Key 账号（' + esc(a.credentialMask || 'ck_***') + '）：不参与刷新 / 签到 / 成长任务，额度走企业口径"'
+            + '>API Key</span>'
+          : '')
     +     (a.note
           ? '<span class="note-chip has" title="点击编辑备注" onclick="editAccountNote(&quot;' + uidAttr + '&quot;)">' + esc(a.note) + '</span>'
           : '<span class="note-chip" title="点击添加备注，比如「批量」/「自用」" onclick="editAccountNote(&quot;' + uidAttr + '&quot;)">+ 备注</span>')
-    +     '<span class="badge mini ' + (a.tasksEnabled ? 'ok' : 'off') + '" style="cursor:pointer;margin-left:6px" title="参与签到 / 成长任务 / 连登管家 / 猫猫旅行 / 国际版活跃；与 API 取号无关，点一下切换" onclick="toggleAccountTasks(&quot;' + uidAttr + '&quot;,' + (!a.tasksEnabled) + ')">任务' + (a.tasksEnabled ? '开' : '关') + '</span>'
+    // API Key 账号没有个人成长体系，签到/任务开关对它没有意义：上游一律拒绝，
+    // 画出来只会让人以为点了能开。
+    +     (a.apiKey ? ''
+          : '<span class="badge mini ' + (a.tasksEnabled ? 'ok' : 'off') + '" style="cursor:pointer;margin-left:6px" title="参与签到 / 成长任务 / 连登管家 / 猫猫旅行 / 国际版活跃；与 API 取号无关，点一下切换" onclick="toggleAccountTasks(&quot;' + uidAttr + '&quot;,' + (!a.tasksEnabled) + ')">任务' + (a.tasksEnabled ? '开' : '关') + '</span>')
     // 移动端专用：版本 + 状态徽章靠右同行（桌面隐藏，用表格自己的两列）。
-    +     '<span class="acct-mobile-badges">' + realmBadgeMobile + state + '</span>'
+    +     '<span class="acct-mobile-badges">' + realmBadgeMobile + state + tierBadge + '</span>'
     +   '</div>'
     // 次要信息收成一行：值截断到几个字符，完整值走悬浮气泡（data-tip）。
     +   '<div class="acct-meta mono">'
@@ -8258,6 +8686,18 @@ function accountRow(a){
     + '</div>'
     + '</td></tr>'
     + alertRows;
+}
+
+// 「!」帮助标记的展开/收起：说明文本只写一份（在 .help-detail 里），
+// 点击标记才显示，再点一次收起。
+function toggleHelpDetail(id, evt){
+  if(evt && evt.stopPropagation) evt.stopPropagation();
+  const box = document.getElementById(id);
+  if(!box) return;
+  const willOpen = box.hasAttribute('hidden');
+  if(willOpen) box.removeAttribute('hidden'); else box.setAttribute('hidden', '');
+  const mark = document.querySelector('.help-mark[onclick*="' + id + '"]');
+  if(mark) mark.classList.toggle('open', willOpen);
 }
 
 // 悬停气泡（全局单例）。用自定义 DOM 而不是原生 title：原生 tooltip 由浏览器
@@ -8514,9 +8954,9 @@ function renderActivityBoard(data){
   }
   const resultBadge = ok => ok ? '<span class="badge ok">成功</span>'
                                : '<span class="badge bad">失败</span>';
-  box.innerHTML = '<table class="data-cards"><thead><tr>'
+  box.innerHTML = '<table class="data-cards activity-table"><thead><tr>'
     + '<th style="text-align:left;width:132px">时间</th>'
-    + '<th style="text-align:left">账号</th>'
+    + '<th style="text-align:left;width:11%">账号</th>'
     + '<th style="text-align:center;width:76px">区域</th>'
     + '<th style="text-align:left;width:132px">任务</th>'
     + '<th style="text-align:center;width:76px">来源</th>'
@@ -8526,7 +8966,8 @@ function renderActivityBoard(data){
     + rows.map(r => '<tr>'
         + '<td class="mono" data-label="时间">' + esc(activityTime(r.ts)) + '</td>'
         + '<td data-label="账号" title="' + esc(r.uid || '') + '">'
-          + '<span data-no-i18n>' + esc(activityWho(r)) + '</span></td>'
+          + '<span class="note-clip" style="max-width:160px" title="'
+          + esc(activityWho(r)) + '" data-no-i18n>' + esc(activityWho(r)) + '</span></td>'
         + '<td style="text-align:center" data-label="区域">'
           + esc(ACTIVITY_REALM_LABEL[r.realm] || '—') + '</td>'
         + '<td data-label="任务">' + esc(ACTIVITY_TASK_LABEL[r.task] || r.task || '—') + '</td>'
@@ -8535,9 +8976,11 @@ function renderActivityBoard(data){
         + '<td style="text-align:center" data-label="结果">' + resultBadge(r.ok) + '</td>'
         // 上游原文可能很长：在 span 上做行内截断（td 自身不吃 max-width，撑宽的是
         // 整张表），完整内容留在 title 里，表格不会被一条 429 原文拉出横向滚动。
+        // 上限分档给（.note-clip）：大屏 520px，中屏 641–960px 桌面布局还在但
+        // 宽度有限，收到 300px，免得账号贴着时间；手机卡片模式下改折行显示全文。
         + '<td data-label="说明" style="text-align:left">'
         +   (r.message
-              ? '<span style="display:inline-block;max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom" title="' + esc(r.message) + '">' + esc(r.message) + '</span>'
+              ? '<span class="note-clip" style="max-width:520px" title="' + esc(r.message) + '">' + esc(r.message) + '</span>'
               : '<span style="color:var(--dim)">—</span>')
         + '</td>'
         + '</tr>').join('')
@@ -9113,6 +9556,64 @@ function openImport(){
     readImportFile(f);
   };
   picker.click();
+}
+
+function openApiKeyModal(){
+  const m = document.getElementById('apiKeyModal');
+  const input = document.getElementById('apiKeyInput');
+  const name = document.getElementById('apiKeyNickname');
+  const msg = document.getElementById('apiKeyModalMsg');
+  const btn = document.getElementById('btnApiKeyCommit');
+  if(input) input.value = '';
+  if(name) name.value = '';
+  if(msg) msg.textContent = '';
+  if(btn){ btn.disabled = false; btn.textContent = '验证并添加'; }
+  if(m) m.classList.add('show');
+  if(input) setTimeout(() => input.focus(), 50);
+}
+
+function closeApiKeyModal(){
+  const m = document.getElementById('apiKeyModal');
+  if(m) m.classList.remove('show');
+  const input = document.getElementById('apiKeyInput');
+  // 关掉就抹掉：这串东西等同于账号本身，留在 DOM 里没有任何好处。
+  if(input) input.value = '';
+}
+
+async function commitApiKey(btn){
+  const input = document.getElementById('apiKeyInput');
+  const name = document.getElementById('apiKeyNickname');
+  const msg = document.getElementById('apiKeyModalMsg');
+  const key = (input && input.value || '').trim();
+  if(!key){
+    if(msg){ msg.style.color = 'var(--warn)'; msg.textContent = '请先填入 API Key'; }
+    return;
+  }
+  if(!/^(ck_|pt_)/.test(key)){
+    if(msg){ msg.style.color = 'var(--warn)'; msg.textContent = '前缀不对：应当以 ck_ 或 pt_ 开头'; }
+    return;
+  }
+  if(btn){ btn.disabled = true; btn.textContent = '验证中…'; }
+  if(msg){ msg.style.color = 'var(--dim)'; msg.textContent = '正在用企业额度端点验一次…'; }
+  try{
+    const r = await postJSON('/accounts/add-api-key', {
+      key: key,
+      nickname: (name && name.value || '').trim(),
+    });
+    const probe = r.probe || {};
+    let msg = (r.updated ? '已更新 ' : '已添加 ') + (r.nickname || r.uid || 'API Key 账号');
+    if(probe.limit !== undefined && probe.limit !== null){
+      msg += ' · 额度 ' + probe.limit
+           + (probe.used !== undefined && probe.used !== null ? '，本期已用 ' + probe.used : '');
+    }
+    toast(msg);
+    closeApiKeyModal();
+    // 与导入一致：只重拉账号列表，不整页刷新（会打断正在看的其他面板）。
+    await loadAccounts();
+  }catch(e){
+    if(msg){ msg.style.color = 'var(--warn)'; msg.textContent = '添加失败: ' + e.message; }
+    if(btn){ btn.disabled = false; btn.textContent = '验证并添加'; }
+  }
 }
 
 function closeImport(){
@@ -10237,6 +10738,10 @@ function isAuthError(err){
 }
 
 function panelNeedsLogin(){
+  // 闸门的可见性有两处来源：markup 上的 display:flex，和 <head> 首帧判定加的
+  // html.wb-panel-session（!important）。必须先摘掉那个类，否则闸门永远出不来
+  // ——会话过期、登录失败都靠这个函数把登录框放回屏幕。
+  document.documentElement.classList.remove('wb-panel-session');
   const gate = document.getElementById('panelGate');
   if(gate) gate.style.display = 'flex';
   const input = document.getElementById('panelPwdInput');
@@ -10265,6 +10770,9 @@ function panelSessionLost(){
 }
 
 function panelHideGate(){
+  // 首帧判定的类只在「复核还没回来」时有用；一旦确认已登录就清掉，
+  // 让「有类 ⇔ 闸门被首帧判定隐藏」这条不变式只作用于启动阶段。
+  document.documentElement.classList.remove('wb-panel-session');
   const gate = document.getElementById('panelGate');
   if(gate) gate.style.display = 'none';
 }
@@ -10275,6 +10783,11 @@ async function submitPanelLogin(){
   const password = (input && input.value) || '';
   if(!password){ if(msg) msg.textContent = '请输入面板密码'; return; }
   if(msg) msg.textContent = '';
+  if(location.protocol === 'file:'){
+    if(msg) msg.textContent = '请通过 http://127.0.0.1:8788/ 打开面板，不要直接双击 dashboard.html';
+    panelNeedsLogin();
+    return;
+  }
   try {
     const r = await fetch('/panel/login', {
       method: 'POST',
@@ -10284,6 +10797,10 @@ async function submitPanelLogin(){
     const data = await r.json().catch(() => ({}));
     if(!r.ok){
       if(msg) msg.textContent = (data.error && data.error.message) || '密码错误';
+      // 登录失败必须保证闸门在屏幕上：带 ?pwd= 自动登录时页面不会走 bootPanel 的
+      // 未认证分支，闸门若停在首帧判定的隐藏态，用户看到的是「看着已登录、其实
+      // 进不去」的空看板，连重输的框都没有。
+      panelNeedsLogin();
       return;
     }
     PANEL_TOKEN = data.token || '';
@@ -10297,6 +10814,8 @@ async function submitPanelLogin(){
     await startDashboard();
   } catch(e) {
     if(msg) msg.textContent = '登录失败: ' + e.message;
+    // 网络层失败（网关没起来、反代 502）同样要把闸门留在屏幕上。
+    panelNeedsLogin();
   }
 }
 
@@ -10317,6 +10836,8 @@ async function bootPanel(){
   } catch(e) { PANEL_STATUS = {}; }
   const hint = document.getElementById('panelDefaultHint');
   if(hint && PANEL_STATUS.panel_password_is_default) hint.style.display = 'block';
+  const cryptoWarn = document.getElementById('panelCryptoWarning');
+  if(cryptoWarn && PANEL_STATUS.crypto_ok === false) cryptoWarn.style.display = 'block';
   if(PANEL_STATUS.authenticated){
     panelHideGate();
     await startDashboard();
@@ -11223,54 +11744,66 @@ async function loadSettings(showToast){
         dailyWebState.textContent = dailyWeb ? '(已启用)' : '(仅桌面端对话)';
         dailyWebState.style.color = dailyWeb ? 'var(--accent2)' : 'var(--dim)';
       }
-      renderDailyChatModel(data.daily_chat_model || '', data.daily_chat_model_default || '');
+      // ① 时段：显式时段优先；留空时后端每天随机抽两个（间隔 12 小时）。
       const scheduleCfg = (data.schedule && typeof data.schedule === 'object') ? data.schedule : {};
       const dailyChatTimes = Array.isArray(scheduleCfg.daily_chat) ? scheduleCfg.daily_chat : [];
       renderDailyChatTimes(dailyChatTimes);
-      // 网页通道重试：没配过时后端给的是「开」，只有显式 false 才当关闭。
-      const dailyWebRetry = data.daily_chat_web_retry !== false;
-      const dailyWebRetryInput = document.getElementById('setDailyChatWebRetry');
-      if(dailyWebRetryInput) dailyWebRetryInput.checked = dailyWebRetry;
-      const dailyWebTimeoutDefault = Number(data.daily_chat_web_timeout_default || 120);
-      const dailyWebTimeout = Number(data.daily_chat_web_timeout || dailyWebTimeoutDefault);
-      const dailyWebAttemptsDefault = Number(data.daily_chat_web_attempts_default || 3);
-      const dailyWebAttempts = Number(data.daily_chat_web_attempts || dailyWebAttemptsDefault);
-      const dailyWebConcurrency = Number(data.daily_chat_web_concurrency || 1);
-      const dailyWebConcurrencyInput = document.getElementById('setDailyChatWebConcurrency');
-      if(dailyWebConcurrencyInput) dailyWebConcurrencyInput.value = String(dailyWebConcurrency);
-      const dailyWebAttemptsInput = document.getElementById('setDailyChatWebAttempts');
-      if(dailyWebAttemptsInput){
-        dailyWebAttemptsInput.value = String(dailyWebAttempts);
-        // 关掉重试就只跑一轮，次数没有意义；等待时间仍对那唯一一轮有效，保持可改。
-        dailyWebAttemptsInput.disabled = !dailyWebRetry;
+      const dailyChatEffective = Array.isArray(scheduleCfg.daily_chat_effective)
+        ? scheduleCfg.daily_chat_effective : [];
+      const dailyChatEffectiveEl = document.getElementById('setDailyChatEffective');
+      if(dailyChatEffectiveEl){
+        dailyChatEffectiveEl.textContent = dailyChatEffective.length
+          ? (dailyChatEffective.join(' / ') + (scheduleCfg.daily_chat_random ? '（随机）' : ''))
+          : '-';
       }
-      const dailyWebTimeoutInput = document.getElementById('setDailyChatWebTimeout');
-      if(dailyWebTimeoutInput) dailyWebTimeoutInput.value = String(dailyWebTimeout);
-      const dailyWebRetryState = document.getElementById('setDailyChatWebRetryState');
-      if(dailyWebRetryState){
-        // 状态行把实际的等待序列算出来，省得对着两个数字自己乘。
-        const waits = [];
-        const rounds = dailyWebRetry ? dailyWebAttempts : 1;
-        for(let i = 0; i < rounds; i++) waits.push(dailyWebTimeout * Math.pow(2, i));
-        dailyWebRetryState.textContent = dailyWebRetry
-          ? ('最多尝试 ' + dailyWebAttempts + ' 次 · ' + waits.join(' / ') + ' 秒')
-          : ('只跑一轮 · ' + dailyWebTimeout + ' 秒');
-        dailyWebRetryState.style.color = dailyWebRetry ? 'var(--accent2)' : 'var(--dim)';
+      // ② 候选模型：有序，第一个是首选。
+      renderDailyChatModelList(Array.isArray(data.daily_chat_models) ? data.daily_chat_models : []);
+      // ③ 预算：单账号总预算、单轮上限、并发、建会话退避。
+      const dailyChatBudgetDefault = Number(data.daily_chat_budget_default || 600);
+      const dailyChatBudget = Number(data.daily_chat_budget != null
+        ? data.daily_chat_budget : dailyChatBudgetDefault);
+      const dailyChatBudgetInput = document.getElementById('setDailyChatBudget');
+      if(dailyChatBudgetInput){
+        dailyChatBudgetInput.value = String(dailyChatBudget);
+        dailyChatBudgetInput.max = String(Number(data.daily_chat_budget_max || 7200));
       }
-      const dailyWebFallback = data.daily_chat_web_fallback === true;
-      const dailyWebFallbackInput = document.getElementById('setDailyChatWebFallback');
-      if(dailyWebFallbackInput) dailyWebFallbackInput.checked = dailyWebFallback;
-      const dailyWebFallbackModels = Array.isArray(data.daily_chat_web_fallback_models)
-        ? data.daily_chat_web_fallback_models : [];
-      renderDailyChatFallbackPicker(dailyWebFallbackModels);
-      const dailyWebFallbackState = document.getElementById('setDailyChatWebFallbackState');
-      if(dailyWebFallbackState){
-        dailyWebFallbackState.textContent = dailyWebFallback
-          ? ('已启用 · ' + (dailyWebFallbackModels.length
-              ? dailyWebFallbackModels.length + ' 个候选'
-              : '默认免费组合'))
-          : '(未启用)';
-        dailyWebFallbackState.style.color = dailyWebFallback ? 'var(--accent2)' : 'var(--dim)';
+      const dailyChatTurnDefault = Number(data.daily_chat_web_timeout_default || 120);
+      const dailyChatTurn = Number(data.daily_chat_web_timeout || dailyChatTurnDefault);
+      const dailyChatTurnInput = document.getElementById('setDailyChatTurnTimeout');
+      if(dailyChatTurnInput){
+        dailyChatTurnInput.value = String(dailyChatTurn);
+        dailyChatTurnInput.max = String(Number(data.daily_chat_web_timeout_max || 3600));
+      }
+      const dailyChatConcurrency = Number(data.daily_chat_web_concurrency || 1);
+      const dailyChatConcurrencyInput = document.getElementById('setDailyChatWebConcurrency');
+      if(dailyChatConcurrencyInput) dailyChatConcurrencyInput.value = String(dailyChatConcurrency);
+      // 建会话阶段失败的退避：0 表示不退避，所以不能用 || 兜底。
+      const dailyChatBackoffDefault = Number(
+        data.daily_chat_web_retry_backoff_default != null
+          ? data.daily_chat_web_retry_backoff_default : 5);
+      const dailyChatBackoff = Number(
+        data.daily_chat_web_retry_backoff != null
+          ? data.daily_chat_web_retry_backoff : dailyChatBackoffDefault);
+      const dailyChatBackoffInput = document.getElementById('setDailyChatWebRetryBackoff');
+      if(dailyChatBackoffInput){
+        dailyChatBackoffInput.value = String(dailyChatBackoff);
+        dailyChatBackoffInput.max = String(Number(data.daily_chat_web_retry_backoff_max || 60));
+      }
+      const dailyChatCatchup = data.daily_chat_startup_catchup !== false;
+      const dailyChatCatchupInput = document.getElementById('setDailyChatStartupCatchup');
+      if(dailyChatCatchupInput) dailyChatCatchupInput.checked = dailyChatCatchup;
+      const dailyChatCatchupState = document.getElementById('setDailyChatStartupCatchupState');
+      if(dailyChatCatchupState){
+        dailyChatCatchupState.textContent = dailyChatCatchup ? '(已启用)' : '(关闭)';
+        dailyChatCatchupState.style.color = dailyChatCatchup ? 'var(--accent2)' : 'var(--dim)';
+      }
+      const dailyChatActivityFallback = data.daily_chat_web_fallback_activity === true;
+      const dailyChatActivityFallbackInput = document.getElementById('setDailyChatActivityFallback');
+      if(dailyChatActivityFallbackInput) dailyChatActivityFallbackInput.checked = dailyChatActivityFallback;
+      const dailyChatActivityFallbackState = document.getElementById('setDailyChatActivityFallbackState');
+      if(dailyChatActivityFallbackState){
+        dailyChatActivityFallbackState.textContent = dailyChatActivityFallback ? '(已启用)' : '(关闭)';
+        dailyChatActivityFallbackState.style.color = dailyChatActivityFallback ? 'var(--accent2)' : 'var(--dim)';
       }
       const dailyWebRandomPrompt = data.daily_chat_web_random_prompt === true;
       const dailyWebRandomPromptInput = document.getElementById('setDailyChatRandomPrompt');
@@ -11343,6 +11876,22 @@ async function loadSettings(showToast){
       if(egressBackoffState){
         egressBackoffState.textContent = egressBackoff ? '(已启用)' : '(未启用)';
         egressBackoffState.style.color = egressBackoff ? 'var(--accent2)' : 'var(--dim)';
+      }
+      const accountConcurrent = (typeof data.account_max_concurrent === 'number') ? data.account_max_concurrent : 0;
+      const accountConcurrentInput = document.getElementById('setAccountConcurrent');
+      if(accountConcurrentInput) accountConcurrentInput.value = accountConcurrent;
+      const accountConcurrentState = document.getElementById('setAccountConcurrentState');
+      if(accountConcurrentState){
+        accountConcurrentState.textContent = accountConcurrent > 0 ? '(' + accountConcurrent + ' 个 / 账号)' : '(不限)';
+        accountConcurrentState.style.color = accountConcurrent > 0 ? 'var(--accent2)' : 'var(--dim)';
+      }
+      const affinityStableKey = data.affinity_stable_key_enabled === true;
+      const affinityStableKeyInput = document.getElementById('setAffinityStableKey');
+      if(affinityStableKeyInput) affinityStableKeyInput.checked = affinityStableKey;
+      const affinityStableKeyState = document.getElementById('setAffinityStableKeyState');
+      if(affinityStableKeyState){
+        affinityStableKeyState.textContent = affinityStableKey ? '(已启用)' : '(未启用)';
+        affinityStableKeyState.style.color = affinityStableKey ? 'var(--accent2)' : 'var(--dim)';
       }
       SAVED_QUOTA_SCAN_MODELS = Array.isArray(data.quota_scan_models) ? data.quota_scan_models.slice() : [];
       QUOTA_SCAN_SELECTED = SAVED_QUOTA_SCAN_MODELS.slice();
@@ -12055,23 +12604,8 @@ async function savePrivateData(btn){
   }
 }
 
-async function saveDailyChatWeb(btn){
-  const el = document.getElementById('setDailyChatWeb');
-  const value = !!(el && el.checked);
-  if(btn) btn.disabled = true;
-  try {
-    await postJSON('/settings/save', {daily_chat_web: value});
-    toast(value ? '已启用：国际版打卡走网页通道' : '已关闭：国际版打卡只发桌面端对话', 'ok');
-    loadSettings();
-  } catch(e) {
-    toast('保存失败: ' + e.message, 'bad');
-  } finally {
-    if(btn) btn.disabled = false;
-  }
-}
-
-/* 网页通道失败重试。后端只接受严格布尔，所以这里直接发勾选状态；存失败时
-   把开关拨回去，免得界面显示一个其实没落盘的状态。 */
+/* 随机提示词开关。后端只接受严格布尔，所以这里直接发勾选状态；存失败时把开关
+   拨回去，免得界面显示一个其实没落盘的状态。 */
 async function saveDailyChatRandomPrompt(){
   const el = document.getElementById('setDailyChatRandomPrompt');
   const value = !!(el && el.checked);
@@ -12186,139 +12720,13 @@ async function savePromptPicker(btn){
   }
 }
 
-async function saveDailyChatWebRetry(){
-  const el = document.getElementById('setDailyChatWebRetry');
-  const value = !!(el && el.checked);
-  try {
-    await postJSON('/settings/save', {daily_chat_web_retry: value});
-    toast(value ? '已启用：网页通道失败后最多重试 3 次（等待翻倍）'
-                : '已关闭：网页通道只跑一轮', 'ok');
-    loadSettings();
-  } catch(e) {
-    toast('保存失败: ' + e.message, 'bad');
-    if(el) el.checked = !value;
-  }
-}
+// ---- 国际版每日活跃：候选模型序列 + 预算 -------------------------------------
+// 旧的六个旋钮（最多尝试次数 / 失败重试 / 回退开关 / 回退组合 / 首轮等待 /
+// 建会话退避）在代码里互相覆盖，面板上又看不出来，所以整块换成一个有序候选序列
+// 加一个总预算：顺序即优先级，预算用完必给结论。
+let DAILY_CHAT_MODEL_SELECTED = [];   // 面板上正在编辑的有序候选
+let DAILY_CHAT_MODELS = null;         // /v1/models 的元数据缓存
 
-async function saveDailyChatWebFallback(){
-  const el = document.getElementById('setDailyChatWebFallback');
-  const value = !!(el && el.checked);
-  try {
-    await postJSON('/settings/save', {daily_chat_web_fallback: value});
-    toast(value ? '已启用：网页通道失败后按模型组合回退'
-                : '已关闭：网页通道只用当前模型', 'ok');
-    loadSettings();
-  } catch(e) {
-    toast('保存失败: ' + e.message, 'bad');
-    if(el) el.checked = !value;
-  }
-}
-
-let DAILY_CHAT_FALLBACK_SELECTED = [];
-function updateDailyChatFallbackState(){
-  const el = document.getElementById('setDailyChatWebFallbackModelsState');
-  if(el){
-    el.textContent = DAILY_CHAT_FALLBACK_SELECTED.length
-      ? ('已选 ' + DAILY_CHAT_FALLBACK_SELECTED.length + ' 个候选')
-      : '未选择（默认免费组合）';
-  }
-}
-function renderDailyChatFallbackPicker(selected){
-  DAILY_CHAT_FALLBACK_SELECTED = Array.isArray(selected) ? selected.slice() : [];
-  const list = document.getElementById('setDailyChatWebFallbackList');
-  if(!list) return;
-  loadDailyChatModels().then(function(models){
-    list.innerHTML = (models || []).map(function(m){
-      const checked = DAILY_CHAT_FALLBACK_SELECTED.indexOf(m.id) >= 0 ? ' checked' : '';
-      const tag = m.free ? '免费' : (m.credits || '付费');
-      return '<label class="fallback-pick-row" data-search="' + esc(m.id.toLowerCase()) + '" style="display:flex;align-items:center;gap:6px;font-size:12px;padding:3px 4px"><input type="checkbox" value="' + esc(m.id) + '"' + checked + ' onchange="toggleDailyChatFallbackModel(this)">' + esc(m.id) + ' <span style="color:var(--dim-light)">' + esc(tag) + '</span></label>';
-    }).join('') || '<div style="font-size:12px;color:var(--dim);padding:4px">模型清单为空</div>';
-    updateDailyChatFallbackState();
-  });
-}
-function toggleDailyChatFallbackPicker(){
-  const el = document.getElementById('setDailyChatWebFallbackPicker');
-  if(el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
-}
-function toggleDailyChatFallbackModel(el){
-  const id = el.value;
-  const index = DAILY_CHAT_FALLBACK_SELECTED.indexOf(id);
-  if(el.checked && index < 0) DAILY_CHAT_FALLBACK_SELECTED.push(id);
-  if(!el.checked && index >= 0) DAILY_CHAT_FALLBACK_SELECTED.splice(index, 1);
-  updateDailyChatFallbackState();
-}
-function setDailyChatFallbackAll(on){
-  const list = document.getElementById('setDailyChatWebFallbackList');
-  if(!list) return;
-  list.querySelectorAll('input[type=checkbox]').forEach(function(el){ el.checked = on; });
-  DAILY_CHAT_FALLBACK_SELECTED = on
-    ? Array.from(list.querySelectorAll('input[type=checkbox]')).map(function(el){ return el.value; })
-    : [];
-  updateDailyChatFallbackState();
-}
-function filterDailyChatFallbackPicker(){
-  const input = document.getElementById('setDailyChatWebFallbackSearch');
-  const list = document.getElementById('setDailyChatWebFallbackList');
-  if(!list) return;
-  const q = String((input && input.value) || '').trim().toLowerCase();
-  list.querySelectorAll('.fallback-pick-row').forEach(function(el){
-    el.style.display = !q || (el.getAttribute('data-search') || '').indexOf(q) >= 0 ? 'flex' : 'none';
-  });
-}
-async function saveDailyChatWebFallbackModels(btn){
-  const models = DAILY_CHAT_FALLBACK_SELECTED.slice();
-  if(btn) btn.disabled = true;
-  try {
-    await postJSON('/settings/save', {daily_chat_web_fallback_models: models});
-    toast(models.length ? ('已保存回退组合：' + models.length + ' 个模型')
-                        : '已清空回退组合，使用默认免费组合', 'ok');
-    loadSettings();
-  } catch(e) {
-    toast('保存失败: ' + e.message, 'bad');
-  } finally {
-    if(btn) btn.disabled = false;
-  }
-}
-
-/* 每轮等待时间（秒）与最多尝试次数。与「上游响应头超时」同一套收口：空值、
-   小数、非数字就地拦下，不发上去换一个 400 回来。上限由后端把关。 */
-async function saveDailyChatWebTuning(btn){
-  const attemptsEl = document.getElementById('setDailyChatWebAttempts');
-  const timeoutEl = document.getElementById('setDailyChatWebTimeout');
-  const concurrencyEl = document.getElementById('setDailyChatWebConcurrency');
-  const attempts = Math.floor(Number(attemptsEl && attemptsEl.value));
-  const timeout = Math.floor(Number(timeoutEl && timeoutEl.value));
-  const concurrency = Math.floor(Number(concurrencyEl && concurrencyEl.value));
-  if(!isFinite(attempts) || attempts < 1){
-    toast('请输入不小于 1 的整数次数', 'bad');
-    return;
-  }
-  if(!isFinite(timeout) || timeout < 1){
-    toast('请输入不小于 1 的整数秒', 'bad');
-    return;
-  }
-  if(!isFinite(concurrency) || concurrency < 1){
-    toast('请输入不小于 1 的整数并发数', 'bad');
-    return;
-  }
-  if(btn) btn.disabled = true;
-  try {
-    await postJSON('/settings/save', {daily_chat_web_attempts: attempts,
-                                      daily_chat_web_timeout: timeout,
-                                      daily_chat_web_concurrency: concurrency});
-    toast('已保存：最多尝试 ' + attempts + ' 次，首轮等待 ' + timeout + ' 秒，并发 ' + concurrency + ' 个账号', 'ok');
-    loadSettings();
-  } catch(e) {
-    toast('保存失败: ' + e.message, 'bad');
-  } finally {
-    if(btn) btn.disabled = false;
-  }
-}
-
-/* 每日活跃模型的候选项：国际版目录里的全部模型，免费（0.00x）的排前面并标出来。
-   面板本来就为「可用模型」取过同一份目录，这里另取一次 intl 的，
-   与当前查看的区域无关（每日活跃只对国际版存在）。 */
-let DAILY_CHAT_MODELS = null;
 async function loadDailyChatModels(){
   if(DAILY_CHAT_MODELS) return DAILY_CHAT_MODELS;
   try {
@@ -12331,7 +12739,7 @@ async function loadDailyChatModels(){
       const free = (raw === '0.00' || raw === '0');
       out.push({id: m.id, free: free, credits: credits});
     }
-    // 免费的在前，其余在后，各自按 id 排序；默认模型由「默认」那一项负责。
+    // 免费的在前，其余在后，各自按 id 排序。
     out.sort((a, b) => (a.free === b.free ? a.id.localeCompare(b.id) : (a.free ? -1 : 1)));
     DAILY_CHAT_MODELS = out;
   } catch(e) {
@@ -12340,43 +12748,170 @@ async function loadDailyChatModels(){
   return DAILY_CHAT_MODELS;
 }
 
-async function renderDailyChatModel(current, def){
-  const sel = document.getElementById('setDailyChatModel');
-  if(!sel) return;
+async function renderDailyChatModelList(selected){
+  DAILY_CHAT_MODEL_SELECTED = Array.isArray(selected) ? selected.slice() : [];
+  const state = document.getElementById('setDailyChatModelsState');
+  if(state){
+    state.textContent = DAILY_CHAT_MODEL_SELECTED.length
+      ? ('已指定 ' + DAILY_CHAT_MODEL_SELECTED.length + ' 个 · 按顺序试')
+      : '(自动：首选 + 该区域免费模型)';
+    state.style.color = DAILY_CHAT_MODEL_SELECTED.length ? 'var(--accent2)' : 'var(--dim)';
+  }
+  const box = document.getElementById('setDailyChatModelList');
+  if(!box) return;
+  if(!DAILY_CHAT_MODEL_SELECTED.length){
+    box.innerHTML = '<div style="font-size:12px;color:var(--dim)">自动模式：只用首选模型，失败时按目录倍率挑下一个免费模型。</div>';
+    return;
+  }
   const models = await loadDailyChatModels();
-  const label = m => {
-    if(!m.credits) return m.id;
-    const raw = m.credits.replace(/^x/i, '');
-    return m.free ? (m.id + '（免费 0.00x）') : (m.id + '（' + raw + 'x）');
-  };
-  const opts = ['<option value="">' + esc('默认模型（' + (def || '内置免费模型') + '，免费）') + '</option>'];
-  const seen = new Set(['']);
-  for(const m of models){
-    if(m.id === def || seen.has(m.id)) continue;   // 内置默认由「默认」那一项承担
-    seen.add(m.id);
-    opts.push('<option value="' + esc(m.id) + '">' + esc(label(m)) + '</option>');
-  }
-  // 已保存但不在目录里的值（上游下线了、或手工改过 settings.json）也要显示出来，
-  // 否则面板会把操作员的设置悄悄吞掉。
-  if(current && current !== def && !seen.has(current)){
-    opts.push('<option value="' + esc(current) + '">' + esc(current + '（不在当前目录里）') + '</option>');
-  }
-  sel.innerHTML = opts.join('');
-  sel.value = current || '';
-  const state = document.getElementById('setDailyChatModelState');
-  if(state) state.textContent = current ? '(已指定)' : '(默认)';
+  const byId = {};
+  for(const m of models) byId[m.id] = m;
+  box.innerHTML = DAILY_CHAT_MODEL_SELECTED.map(function(id, index){
+    const meta = byId[id];
+    const tag = meta ? (meta.free ? '免费' : (meta.credits || '付费')) : '不在目录里';
+    return '<div style="display:flex;align-items:center;gap:8px;font-size:12px">'
+      + '<span style="color:var(--dim);min-width:18px">' + (index + 1) + '.</span>'
+      + '<span style="font-family:var(--mono,monospace)">' + esc(id) + '</span>'
+      + '<span style="color:var(--dim-light)">' + esc(tag) + '</span>'
+      + '<button class="sec mini" onclick="moveDailyChatModel(' + index + ',-1)">↑</button>'
+      + '<button class="sec mini" onclick="moveDailyChatModel(' + index + ',1)">↓</button>'
+      + '<button class="sec mini" onclick="removeDailyChatModel(' + index + ')">×</button>'
+      + '</div>';
+  }).join('');
 }
 
-async function saveDailyChatModel(btn){
-  const sel = document.getElementById('setDailyChatModel');
-  const value = sel ? sel.value : '';
+function moveDailyChatModel(index, delta){
+  const next = index + delta;
+  if(index < 0 || index >= DAILY_CHAT_MODEL_SELECTED.length) return;
+  if(next < 0 || next >= DAILY_CHAT_MODEL_SELECTED.length) return;
+  const list = DAILY_CHAT_MODEL_SELECTED.slice();
+  const item = list.splice(index, 1)[0];
+  list.splice(next, 0, item);
+  renderDailyChatModelList(list);
+}
+function removeDailyChatModel(index){
+  const list = DAILY_CHAT_MODEL_SELECTED.slice();
+  if(index < 0 || index >= list.length) return;
+  list.splice(index, 1);
+  renderDailyChatModelList(list);
+}
+async function toggleDailyChatModelPicker(){
+  const el = document.getElementById('setDailyChatModelPicker');
+  if(!el) return;
+  const opening = el.style.display === 'none';
+  el.style.display = opening ? 'block' : 'none';
+  if(opening) await renderDailyChatModelPicker();
+}
+async function renderDailyChatModelPicker(){
+  const list = document.getElementById('setDailyChatModelPickList');
+  if(!list) return;
+  const models = await loadDailyChatModels();
+  list.innerHTML = (models || []).map(function(m){
+    const checked = DAILY_CHAT_MODEL_SELECTED.indexOf(m.id) >= 0 ? ' checked' : '';
+    const tag = m.free ? '免费' : (m.credits || '付费');
+    return '<label class="fallback-pick-row" data-search="' + esc(m.id.toLowerCase()) + '" style="display:flex;align-items:center;gap:6px;font-size:12px;padding:3px 4px"><input type="checkbox" value="' + esc(m.id) + '"' + checked + ' onchange="toggleDailyChatModel(this)">' + esc(m.id) + ' <span style="color:var(--dim-light)">' + esc(tag) + '</span></label>';
+  }).join('') || '<div style="font-size:12px;color:var(--dim);padding:4px">模型清单为空</div>';
+}
+function toggleDailyChatModel(el){
+  const id = el.value;
+  const list = DAILY_CHAT_MODEL_SELECTED.slice();
+  const index = list.indexOf(id);
+  if(el.checked && index < 0) list.push(id);
+  if(!el.checked && index >= 0) list.splice(index, 1);
+  renderDailyChatModelList(list);
+}
+function setDailyChatModelAll(on){
+  const box = document.getElementById('setDailyChatModelPickList');
+  if(!box) return;
+  const ids = Array.from(box.querySelectorAll('input[type=checkbox]')).map(function(el){ return el.value; });
+  if(!on){ renderDailyChatModelList([]); renderDailyChatModelPicker(); return; }
+  const merged = DAILY_CHAT_MODEL_SELECTED.slice();
+  for(const id of ids) if(merged.indexOf(id) < 0) merged.push(id);
+  renderDailyChatModelList(merged);
+  renderDailyChatModelPicker();
+}
+function filterDailyChatModelPicker(){
+  const input = document.getElementById('setDailyChatModelSearch');
+  const box = document.getElementById('setDailyChatModelPickList');
+  if(!box) return;
+  const q = String((input && input.value) || '').trim().toLowerCase();
+  box.querySelectorAll('.fallback-pick-row').forEach(function(el){
+    el.style.display = !q || (el.getAttribute('data-search') || '').indexOf(q) >= 0 ? 'flex' : 'none';
+  });
+}
+async function resetDailyChatModels(){
+  renderDailyChatModelList([]);
+  await renderDailyChatModelPicker();
+}
+function resetDailyChatTimes(){
+  renderDailyChatTimes([]);
+}
+
+async function saveDailyChatModule(btn){
+  const webEl = document.getElementById('setDailyChatWeb');
+  const budgetEl = document.getElementById('setDailyChatBudget');
+  const turnEl = document.getElementById('setDailyChatTurnTimeout');
+  const concEl = document.getElementById('setDailyChatWebConcurrency');
+  const backoffEl = document.getElementById('setDailyChatWebRetryBackoff');
+  const catchupEl = document.getElementById('setDailyChatStartupCatchup');
+  const fallbackEl = document.getElementById('setDailyChatActivityFallback');
+  const payload = {
+    daily_chat_web: !!(webEl && webEl.checked),
+    daily_chat_models: DAILY_CHAT_MODEL_SELECTED.slice(),
+    daily_chat_budget: Number((budgetEl && budgetEl.value) || 0),
+    daily_chat_web_timeout: Number((turnEl && turnEl.value) || 120),
+    daily_chat_web_concurrency: Number((concEl && concEl.value) || 1),
+    daily_chat_web_retry_backoff: Number((backoffEl && backoffEl.value) || 0),
+    daily_chat_startup_catchup: !!(catchupEl && catchupEl.checked),
+    daily_chat_web_fallback_activity: !!(fallbackEl && fallbackEl.checked),
+    schedule: {daily_chat: DAILY_CHAT_TIMES_SELECTED.slice()}
+  };
   if(btn) btn.disabled = true;
+  const state = document.getElementById('setDailyChatSaveState');
   try {
-    await postJSON('/settings/save', {daily_chat_model: value});
-    toast(value ? ('每日活跃改用 ' + value) : '每日活跃恢复内置默认模型', 'ok');
+    await postJSON('/settings/save', payload);
+    if(state){ state.textContent = '已保存'; state.style.color = 'var(--accent2)'; }
+    toast('每日活跃设置已保存', 'ok');
     loadSettings();
   } catch(e) {
+    if(state){ state.textContent = ''; }
     toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function resetDailyChatModule(btn){
+  const budgetEl = document.getElementById('setDailyChatBudget');
+  const turnEl = document.getElementById('setDailyChatTurnTimeout');
+  const concEl = document.getElementById('setDailyChatWebConcurrency');
+  const backoffEl = document.getElementById('setDailyChatWebRetryBackoff');
+  const catchupEl = document.getElementById('setDailyChatStartupCatchup');
+  const fallbackEl = document.getElementById('setDailyChatActivityFallback');
+  if(budgetEl) budgetEl.value = '600';
+  if(turnEl) turnEl.value = '120';
+  if(concEl) concEl.value = '1';
+  if(backoffEl) backoffEl.value = '5';
+  if(catchupEl) catchupEl.checked = true;
+  if(fallbackEl) fallbackEl.checked = false;
+  renderDailyChatModelList([]);
+  renderDailyChatTimes([]);
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {
+      daily_chat_models: [],
+      daily_chat_budget: 600,
+      daily_chat_web_timeout: 120,
+      daily_chat_web_concurrency: 1,
+      daily_chat_web_retry_backoff: 5,
+      daily_chat_startup_catchup: true,
+      daily_chat_web_fallback_activity: false,
+      schedule: {daily_chat: []}
+    });
+    toast('已恢复推荐值：随机两个时段、自动候选、预算 600 秒', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('恢复失败: ' + e.message, 'bad');
   } finally {
     if(btn) btn.disabled = false;
   }
@@ -12407,13 +12942,13 @@ function renderDailyChatTimes(times){
   if(list){
     list.innerHTML = DAILY_CHAT_TIMES_SELECTED.map(function(t){
       return '<span class="badge s" style="font-size:12px;padding:4px 8px;display:inline-flex;align-items:center;gap:6px">' + esc(t) + '<button class="key-action-btn" style="padding:0 4px" data-time="' + esc(t) + '" onclick="removeDailyChatTime(this)">×</button></span>';
-    }).join('') || '<span style="font-size:12px;color:var(--dim)">未设置，跟随签到整点</span>';
+    }).join('') || '<span style="font-size:12px;color:var(--dim)">未设置：每天随机两个时间（间隔 12 小时）</span>';
   }
   const state = document.getElementById('setDailyChatTimesState');
   if(state){
     state.textContent = DAILY_CHAT_TIMES_SELECTED.length
       ? ('独立时段 · ' + DAILY_CHAT_TIMES_SELECTED.join(' / '))
-      : '跟随签到整点';
+      : '每天随机两个时间（间隔 12 小时）';
     state.style.color = DAILY_CHAT_TIMES_SELECTED.length
       ? 'var(--accent2)' : 'var(--dim)';
   }
@@ -12440,7 +12975,7 @@ async function saveDailyChatTimes(btn){
   try {
     await postJSON('/settings/save', {schedule: {daily_chat: times}});
     toast(times.length ? ('已保存每日活跃时段：' + times.join(' / '))
-                       : '已清空：每日活跃跟随签到整点', 'ok');
+                       : '已清空：每日活跃改为每天随机两个时间', 'ok');
     loadSettings();
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');
@@ -12501,6 +13036,43 @@ async function saveWindowProbe(btn){
   try {
     await postJSON('/settings/save', {window_probe: value});
     toast(value ? '已启用：额度窗口到点自动请求' : '已关闭额度窗口探针', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function saveAffinityStableKey(btn){
+  const el = document.getElementById('setAffinityStableKey');
+  const value = !!(el && el.checked);
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {affinity_stable_key_enabled: value});
+    toast(value ? '已启用：会话键包含首条回复' : '已关闭：会话键只用前两条消息', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+/* 账号级并发上限：0 = 不限，1..10 = 每账号同时几个。后端只接受整数，
+   空值/小数/非数字就地拦下，不送上去换 400。 */
+async function saveAccountConcurrent(btn){
+  const el = document.getElementById('setAccountConcurrent');
+  const raw = (el && el.value !== '') ? Number(el.value) : NaN;
+  const value = Math.floor(raw);
+  if(!isFinite(value) || value < 0 || value > 10){
+    toast('请输入 0 到 10 的整数（0 = 不限）', 'bad');
+    return;
+  }
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {account_max_concurrent: value});
+    toast(value > 0 ? ('已保存：每个账号同时最多 ' + value + ' 个请求') : '已保存：账号并发不限', 'ok');
     loadSettings();
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');
@@ -12687,8 +13259,11 @@ function applyUpdateStatus(data){
     install.disabled = !canInstall;
     install.title = !data.install_enabled ? '更新服务未安装'
       : busy ? '已有更新任务正在运行'
+      : data.checking ? '正在检查更新，请稍候'
       : !data.update_available ? '当前没有可安装的新版本'
       : (!data.latest_tag || !data.release_url) ? '请先点击立即检查更新' : '';
+    const hint = document.getElementById('setUpdateInstallHint');
+    if(hint) hint.textContent = canInstall ? '发现新版本，点击“安装更新”开始安装。' : install.title;
   }
 }
 
@@ -16051,7 +16626,11 @@ if(typeof MutationObserver !== 'undefined'){
  * 的一轮（刚切了区间、或轮询撞上点击），这批结果已经过期，直接丢掉——否则慢的那一轮
  * 晚到，会把上一个区间的数字画到新区间的标题下面（实测有 1.2~1.8 秒的错位窗口）。 */
 let WBA_GEN = 0;
+const WBA_PENDING = new Map();
 async function loadRange(polled){
+  const range = state.range;
+  if(polled && WBA_PENDING.has(range)) return;
+  WBA_PENDING.set(range, (WBA_PENDING.get(range) || 0) + 1);
   const gen = ++WBA_GEN;
   const untilAt = polled ? pollUntil() : null;
   $('kpis').style.opacity = .55;
@@ -16069,6 +16648,10 @@ async function loadRange(polled){
   } catch(e){
     if (gen !== WBA_GEN) return;
     console.error('load range failed', e);
+  } finally {
+    const remaining = WBA_PENDING.get(range) - 1;
+    if(remaining) WBA_PENDING.set(range, remaining);
+    else WBA_PENDING.delete(range);
   }
   $('kpis').style.opacity = 1;
   renderKpis();
@@ -16866,6 +17449,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
     ['--accent2', '成功色', 'signal'],
     ['--warn', '警告色', 'signal'],
     ['--bad', '错误色', 'signal'],
+    ['--on-accent', '主按钮字', 'onaccent'],
     ['--bg', '页面底', 'layer'],
     ['--panel', '卡片', 'layer'],
     ['--panel2', '内嵌块', 'layer'],
@@ -16880,6 +17464,114 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
   var box = document.getElementById('tunerBox');
   var rowsEl = document.getElementById('tunerRows');
   var themeLabel = document.getElementById('tunerTheme');
+  var TEXT_MIN = 4.5;
+  /* Kept inline: the page is served as one HTML document, and a separate
+     <script src> would add a second request and a failure mode when the page
+     is opened from disk. tests/_test_dashboard_theme_contrast.js executes the
+     same functions from this block. */
+  var COLOR = (function(){
+    function clampByte(value){ return Math.max(0, Math.min(255, Math.round(Number(value)))); }
+    function parseColor(value, backdrop){
+      var text = String(value == null ? '' : value).trim();
+      if (!text) return null;
+      if (text.toLowerCase() === 'transparent') {
+        var clearBase = backdrop ? parseColor(backdrop) : [255,255,255,1];
+        return clearBase ? clearBase.slice() : null;
+      }
+      var rgba = text.match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/i);
+      if (rgba){
+        var alpha = rgba[4] === undefined ? 1 : Number(rgba[4]);
+        if (!isFinite(alpha) || alpha < 0 || alpha > 1) return null;
+        var base = backdrop ? parseColor(backdrop) : [255,255,255,1];
+        if (!base) return null;
+        return [
+          clampByte(Number(rgba[1]) * alpha + base[0] * (1 - alpha)),
+          clampByte(Number(rgba[2]) * alpha + base[1] * (1 - alpha)),
+          clampByte(Number(rgba[3]) * alpha + base[2] * (1 - alpha)),
+          1
+        ];
+      }
+      var hex = text.replace(/^#/, '');
+      if (hex.length === 3) hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];
+      if (hex.length === 4) hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2]+hex[3]+hex[3];
+      if (/^[0-9a-f]{6}$/i.test(hex)) {
+        return [parseInt(hex.slice(0,2),16), parseInt(hex.slice(2,4),16),
+                parseInt(hex.slice(4,6),16), 1];
+      }
+      if (/^[0-9a-f]{8}$/i.test(hex)) {
+        var bg = backdrop ? parseColor(backdrop) : [255,255,255,1];
+        if (!bg) return null;
+        var a = parseInt(hex.slice(6,8),16) / 255;
+        return [
+          clampByte(parseInt(hex.slice(0,2),16) * a + bg[0] * (1 - a)),
+          clampByte(parseInt(hex.slice(2,4),16) * a + bg[1] * (1 - a)),
+          clampByte(parseInt(hex.slice(4,6),16) * a + bg[2] * (1 - a)),
+          1
+        ];
+      }
+      return null;
+    }
+    function hexOf(rgb){
+      if (!rgb) return null;
+      return '#' + rgb.slice(0,3).map(function(v){
+        return clampByte(v).toString(16).padStart(2,'0');
+      }).join('');
+    }
+    function channel(v){ v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
+    function luminance(value){
+      var rgb = parseColor(value);
+      if (!rgb) return null;
+      return 0.2126 * channel(rgb[0]) + 0.7152 * channel(rgb[1]) + 0.0722 * channel(rgb[2]);
+    }
+    function contrast(a, b){
+      var la = luminance(a), lb = luminance(b);
+      if (la == null || lb == null) return null;
+      return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+    }
+    function worstContrast(value, backgrounds){
+      var worst = null;
+      for (var i = 0; i < backgrounds.length; i++){
+        var r = contrast(value, backgrounds[i]);
+        if (r == null) return null;
+        if (worst == null || r < worst) worst = r;
+      }
+      return worst;
+    }
+    function mix(from, to, amount){
+      var a = parseColor(from), b = parseColor(to);
+      if (!a || !b) return null;
+      return [
+        clampByte(a[0] + (b[0] - a[0]) * amount),
+        clampByte(a[1] + (b[1] - a[1]) * amount),
+        clampByte(a[2] + (b[2] - a[2]) * amount),
+        1
+      ];
+    }
+    function ensureContrast(value, backgrounds, fallback, minimum){
+      var min = typeof minimum === 'number' ? minimum : TEXT_MIN;
+      var ratio = worstContrast(value, backgrounds);
+      if (ratio != null && ratio >= min) return { value: value, ratio: ratio, adjusted: false };
+      var backup = worstContrast(fallback, backgrounds);
+      if (backup != null && backup >= min) return { value: fallback, ratio: backup, adjusted: true };
+      var seed = value;
+      if (worstContrast(seed, backgrounds) == null) seed = fallback;
+      if (worstContrast(seed, backgrounds) == null) seed = '#808080';
+      var black = worstContrast('#000000', backgrounds);
+      var white = worstContrast('#ffffff', backgrounds);
+      var target = (white != null && (black == null || white > black)) ? '#ffffff' : '#000000';
+      var best = seed, bestRatio = worstContrast(seed, backgrounds);
+      for (var step = 1; step <= 255; step++){
+        var candidate = hexOf(mix(seed, target, step / 255));
+        var candidateRatio = worstContrast(candidate, backgrounds);
+        if (candidateRatio == null) continue;
+        best = candidate; bestRatio = candidateRatio;
+        if (candidateRatio >= min) break;
+      }
+      return { value: best, ratio: bestRatio, adjusted: true };
+    }
+    return { parseColor: parseColor, hexOf: hexOf, contrast: contrast,
+             worstContrast: worstContrast, ensureContrast: ensureContrast };
+  })();
 
   function theme(){ return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light'; }
   function readVar(n){
@@ -16893,26 +17585,47 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
     switching = true;
     var cur = document.documentElement.getAttribute('data-theme') || 'light';
     document.documentElement.setAttribute('data-theme', t);
+    var raw = {};
+    for (var i = 0; i < VARS.length; i++) raw[VARS[i][0]] = readVar(VARS[i][0]);
     var out = {};
-    for (var i = 0; i < VARS.length; i++) out[VARS[i][0]] = readVar(VARS[i][0]) || '#000000';
+    for (var i = 0; i < VARS.length; i++){
+      var name = VARS[i][0];
+      var backdrop = name === '--panel2' ? raw['--panel'] : null;
+      out[name] = COLOR.hexOf(COLOR.parseColor(raw[name], backdrop)) || '#000000';
+    }
     document.documentElement.setAttribute('data-theme', cur);
     switching = false;
     return out;
   }
-  function chan(v){ v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
-  function lum(hex){
-    hex = String(hex).replace('#', '');
-    if (hex.length === 3) hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];
-    var r = parseInt(hex.slice(0,2),16), g = parseInt(hex.slice(2,4),16), b = parseInt(hex.slice(4,6),16);
-    if (isNaN(r) || isNaN(g) || isNaN(b)) return null;
-    return 0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b);
+  /* The fallback must come from the built-in CSS, not from a saved tuner
+     value: an older low-contrast custom colour must not become the new floor. */
+  function readBuiltInVals(t){
+    var style = document.getElementById('tunerStyle');
+    var hostText = Array.prototype.map.call(document.querySelectorAll('style'), function(node){
+      return node === style ? '' : (node.textContent || '');
+    }).join('');
+    var themeData = window.__WB_THEME_STYLES__ || {};
+    var styleId = document.documentElement.getAttribute('data-theme-style') || 'claude';
+    var palette = themeData[styleId] && themeData[styleId][t];
+    var values = {};
+    for (var i = 0; i < VARS.length; i++) {
+      var name = VARS[i][0];
+      var re = new RegExp((t === 'dark' ? '\\[data-theme="dark"\\]' : ':root') +
+        '\\{(?=[^}]*' + name + '\\s*:)[^}]*' + name + '\\s*:\\s*([^;}]+)', 'i');
+      var m = hostText.match(re);
+      values[name] = (palette && palette[name]) || (m ? m[1].trim() : '');
+    }
+    return values;
   }
-  function ratio(a, b){
-    var la = lum(a), lb = lum(b);
-    if (la == null || lb == null) return null;
-    return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+  function ratio(a, b){ return COLOR.contrast(a, b); }
+  function check(name, kind, t){
+    if (kind === 'onaccent') return ratio(t[name], t['--accent']);
+    if (kind === 'text') return COLOR.worstContrast(t[name], [t['--panel'], t['--bg']]);
+    if (kind === 'signal'){
+      return COLOR.worstContrast(t[name], [t['--panel'], t['--bg']]);
+    }
+    return ratio(t[name], t['--panel']);
   }
-
   var edits;
   try { var saved = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch(e){ saved = null; }
   if (saved && saved.light && saved.dark && saved.light['--accent'] && saved.dark['--accent']) {
@@ -16920,6 +17633,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
   } else {
     edits = { light: readThemeVals('light'), dark: readThemeVals('dark') };
   }
+  var DEFAULT = { light: readBuiltInVals('light'), dark: readBuiltInVals('dark') };
 
   function apply(){
     if (!styleEl){ styleEl = document.createElement('style'); styleEl.id = 'tunerStyle'; document.head.appendChild(styleEl); }
@@ -16932,6 +17646,32 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
       '[data-theme="dark"] #pageAnalytics{' + scoped('dark') + '}';
   }
   function save(){ try { localStorage.setItem(KEY, JSON.stringify(edits)); } catch(e){} }
+
+  function backgrounds(name, t){
+    if (name === '--on-accent') return [t['--accent']];
+    if (name === '--accent' || name === '--accent2' || name === '--warn' || name === '--bad'){
+      return [t['--panel'], t['--bg']];
+    }
+    if (name === '--fg' || name === '--dim') return [t['--panel'], t['--bg']];
+    if (name === '--panel2') return [t['--panel']];
+    return [t['--panel']];
+  }
+
+  function safeValue(name, kind, t, mode){
+    var candidate = t[name];
+    if (kind === 'layer' || kind === 'edge') return candidate;
+    var fallback = (DEFAULT[mode] || {})[name] || '';
+    var result = COLOR.ensureContrast(candidate, backgrounds(name, t), fallback, TEXT_MIN);
+    return result.value || candidate;
+  }
+
+  function normalizeAll(){
+    ['light', 'dark'].forEach(function(t){
+      VARS.forEach(function(v){
+        edits[t][v[0]] = safeValue(v[0], v[2], edits[t], t);
+      });
+    });
+  }
 
   function renderRows(){
     var t = theme();
@@ -16949,7 +17689,9 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
       row.appendChild(lab); row.appendChild(inp); row.appendChild(code); row.appendChild(rat);
       inp.addEventListener('input', function(){
         edits[t][name] = inp.value;
-        code.textContent = inp.value;
+        edits[t][name] = safeValue(name, v[2], edits[t], t);
+        inp.value = edits[t][name];
+        code.textContent = edits[t][name];
         apply(); renderRatios(); save();
       });
       rowsEl.appendChild(row);
@@ -16965,14 +17707,15 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
       if(!rows || !rows[i] || !rows[i].children) continue;
       var el = rows[i].children[3];
       if(!el) continue;
-      var r = ratio(t[name], panel);
+      var r = check(name, kind, t);
       if (kind === 'layer'){
         if (name === '--panel') r = ratio(t['--panel'], t['--bg']);   /* 卡片行显示与页面底的层次 */
+        if (name === '--panel2') r = ratio(t['--panel2'], t['--panel']);
         el.textContent = '层次 ' + (r ? r.toFixed(2) : '-'); el.className = 'ratio';
       }
       else if (kind === 'edge'){ el.textContent = '边框 ' + (r ? r.toFixed(2) : '-'); el.className = 'ratio'; }
       else {
-        var ok = r != null && r >= 4.5;
+        var ok = r != null && r >= TEXT_MIN;
         el.textContent = (r ? r.toFixed(2) : '-') + (ok ? ' ✓' : ' ⚠');
         el.className = 'ratio ' + (ok ? 'ok' : 'low');
       }
@@ -17015,6 +17758,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
     try { localStorage.removeItem(KEY); } catch(e){}
     if (styleEl){ styleEl.remove(); styleEl = null; }
     edits = { light: readThemeVals('light'), dark: readThemeVals('dark') };
+    DEFAULT = { light: Object.assign({}, edits.light), dark: Object.assign({}, edits.dark) };
     apply(); renderRows();
   });
   document.getElementById('tunerExport').addEventListener('click', function(){
@@ -17032,8 +17776,282 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
     }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
   }
 
+  normalizeAll();
   apply();
   renderRows();
+})();
+</script>
+<script>
+/* ── 自定义下拉：运行时渐进增强 ────────────────────────────────────
+   把页面里所有原生 <select> 换成同尺寸的自绘下拉，展开层不再由浏览器
+   绘制（原生 option 列表无法用 CSS 控制，深色模式下尤其突兀）。
+   原生 select 元素保留：value / selectedIndex / change 事件 / 表单提交 /
+   无障碍语义全部不变，只是视觉被隐藏。JS 未执行时页面照常可用。 */
+(function(){
+  'use strict';
+  if (window.__csEnhanced) return;
+  window.__csEnhanced = true;
+
+  var openWrap = null;
+
+  function labelOf(sel){
+    var o = sel.options[sel.selectedIndex];
+    return o ? (o.textContent || o.text || '') : '';
+  }
+
+  function closeWrap(wrap){
+    if (!wrap) return;
+    wrap.classList.remove('cs-open');
+    var trg = wrap.querySelector('.cs-trigger');
+    if (trg) trg.setAttribute('aria-expanded','false');
+    if (openWrap === wrap) openWrap = null;
+  }
+
+  function closeAll(except){
+    if (openWrap && openWrap !== except) closeWrap(openWrap);
+  }
+
+  function syncLabel(sel, wrap){
+    var v = wrap.querySelector('.cs-value');
+    if (!v) return;
+    var txt = labelOf(sel);
+    v.textContent = txt;
+    v.classList.toggle('cs-placeholder', !txt);
+    var opts = wrap.querySelectorAll('.cs-opt');
+    for (var i = 0; i < opts.length; i++){
+      opts[i].classList.toggle('cs-selected', i === sel.selectedIndex);
+      opts[i].setAttribute('aria-selected', i === sel.selectedIndex ? 'true' : 'false');
+    }
+  }
+
+  function buildPanel(sel, wrap){
+    var panel = wrap.querySelector('.cs-panel');
+    if (!panel){
+      panel = document.createElement('div');
+      panel.className = 'cs-panel';
+      panel.setAttribute('role','listbox');
+      wrap.appendChild(panel);
+    }
+    panel.textContent = '';
+    var n = sel.options.length;
+    for (var i = 0; i < n; i++){
+      var o = sel.options[i];
+      var row = document.createElement('div');
+      row.className = 'cs-opt' + (o.disabled ? ' cs-disabled' : '');
+      row.setAttribute('role','option');
+      row.setAttribute('data-idx', i);
+      if (o.disabled) row.setAttribute('aria-disabled','true');
+      var tick = document.createElement('span');
+      tick.className = 'cs-tick';
+      tick.textContent = '\u2713';
+      var lab = document.createElement('span');
+      lab.textContent = o.textContent || o.text || '';
+      row.appendChild(tick);
+      row.appendChild(lab);
+      panel.appendChild(row);
+    }
+    if (!n){
+      var em = document.createElement('div');
+      em.className = 'cs-empty';
+      em.textContent = '\u2014';
+      panel.appendChild(em);
+    }
+    syncLabel(sel, wrap);
+  }
+
+  function positionPanel(wrap){
+    var r = wrap.getBoundingClientRect();
+    var below = window.innerHeight - r.bottom;
+    var need = Math.min(320, window.innerHeight * 0.52);
+    var up = below < need && r.top > below;
+    wrap.classList.toggle('cs-drop-up', up);
+  }
+
+  function openWrap_(wrap){
+    closeAll(wrap);
+    positionPanel(wrap);
+    wrap.classList.add('cs-open');
+    openWrap = wrap;
+    var trg = wrap.querySelector('.cs-trigger');
+    if (trg) trg.setAttribute('aria-expanded','true');
+    var sel = wrap.querySelector('select');
+    var panel = wrap.querySelector('.cs-panel');
+    if (panel && sel){
+      var cur = panel.children[sel.selectedIndex];
+      if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function pick(sel, wrap, idx){
+    var o = sel.options[idx];
+    if (!o || o.disabled) return;
+    if (sel.selectedIndex !== idx){
+      sel.selectedIndex = idx;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    syncLabel(sel, wrap);
+    closeWrap(wrap);
+    var trg = wrap.querySelector('.cs-trigger');
+    if (trg) trg.focus();
+  }
+
+  function hoverIdx(panel, idx){
+    var rows = panel.querySelectorAll('.cs-opt');
+    for (var i = 0; i < rows.length; i++){
+      rows[i].classList.toggle('cs-hover', i === idx);
+    }
+    if (rows[idx] && rows[idx].scrollIntoView) rows[idx].scrollIntoView({ block: 'nearest' });
+  }
+
+  function enhance(sel){
+    if (!sel || sel.dataset.csDone === '1') return;
+    if (sel.closest('.cs-wrap')) return;
+    sel.dataset.csDone = '1';
+
+    var wrap = document.createElement('span');
+    wrap.className = 'cs-wrap';
+    /* 只认控件自己的显式 width:100%：computed display 不可信——flex 容器的
+       子项、以及还藏在 display:none 页签里的 select，计算值都会被规范化成
+       block，曾经因此把工具栏里并排的下拉全部误判成「独占一行」顶成竖排
+       （账号页筛选条、任务页、设置页、历史弹窗、积分包排序都中招）。 */
+    if (sel.style.width === '100%'){
+      wrap.classList.add('cs-block');
+    }
+    /* 原生控件上的 max-width（.slot-select 的 140px 等）要跟着搬：增强后
+       可见的是触发器而不是 select，不搬的话「全部账号」里一条长昵称就能把
+       工具栏撑歪——上限本来就是给控件定的，不该因为增强而消失。 */
+    var mw = window.getComputedStyle(sel).maxWidth;
+    if (mw && mw !== 'none' && mw !== '0px') wrap.style.maxWidth = mw;
+    if (sel.id) wrap.setAttribute('data-for', sel.id);
+    sel.parentNode.insertBefore(wrap, sel);
+    wrap.appendChild(sel);
+    sel.classList.add('cs-native');
+    sel.setAttribute('tabindex','-1');
+
+    var trg = document.createElement('button');
+    trg.type = 'button';
+    trg.className = 'cs-trigger';
+    trg.setAttribute('aria-haspopup','listbox');
+    trg.setAttribute('aria-expanded','false');
+    var val = document.createElement('span');
+    val.className = 'cs-value';
+    var arrow = document.createElement('span');
+    arrow.className = 'cs-arrow';
+    trg.appendChild(val);
+    trg.appendChild(arrow);
+    wrap.insertBefore(trg, sel);
+
+    buildPanel(sel, wrap);
+
+    trg.addEventListener('click', function(e){
+      e.preventDefault();
+      e.stopPropagation();
+      if (wrap.classList.contains('cs-open')) closeWrap(wrap);
+      else openWrap_(wrap);
+    });
+
+    trg.addEventListener('keydown', function(e){
+      var panel = wrap.querySelector('.cs-panel');
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp'){
+        e.preventDefault();
+        if (!wrap.classList.contains('cs-open')) openWrap_(wrap);
+        var rows = panel.querySelectorAll('.cs-opt');
+        var cur = -1;
+        for (var i = 0; i < rows.length; i++) if (rows[i].classList.contains('cs-hover')) { cur = i; break; }
+        var next = e.key === 'ArrowDown'
+          ? Math.min(rows.length - 1, cur + 1)
+          : Math.max(0, cur < 0 ? rows.length - 1 : cur - 1);
+        hoverIdx(panel, next);
+      } else if (e.key === 'Enter' || e.key === ' '){
+        e.preventDefault();
+        if (!wrap.classList.contains('cs-open')) { openWrap_(wrap); return; }
+        var rows2 = panel.querySelectorAll('.cs-opt');
+        for (var j = 0; j < rows2.length; j++){
+          if (rows2[j].classList.contains('cs-hover')) { pick(sel, wrap, j); return; }
+        }
+      } else if (e.key === 'Escape'){
+        closeWrap(wrap);
+      } else if (e.key === 'Tab'){
+        closeWrap(wrap);
+      }
+    });
+
+    wrap.addEventListener('click', function(e){
+      var row = e.target.closest ? e.target.closest('.cs-opt') : null;
+      if (row && !row.classList.contains('cs-disabled')){
+        pick(sel, wrap, parseInt(row.getAttribute('data-idx'), 10));
+      }
+    });
+
+    wrap.addEventListener('mousemove', function(e){
+      var row = e.target.closest ? e.target.closest('.cs-opt') : null;
+      if (!row) return;
+      var panel = wrap.querySelector('.cs-panel');
+      var rows = panel.querySelectorAll('.cs-opt');
+      for (var i = 0; i < rows.length; i++) rows[i].classList.toggle('cs-hover', rows[i] === row);
+    });
+
+    /* 外部数据改了 options（例如账号列表刷新）时重建面板 */
+    if (typeof MutationObserver !== 'undefined'){
+      new MutationObserver(function(){
+        buildPanel(sel, wrap);
+      }).observe(sel, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled','selected'] });
+    }
+    /* 程序直接改 value 时同步显示 */
+    var desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value');
+    if (desc && desc.set && !sel.__csPatched){
+      sel.__csPatched = true;
+      try {
+        Object.defineProperty(sel, 'value', {
+          configurable: true,
+          get: function(){ return desc.get.call(sel); },
+          set: function(v){ desc.set.call(sel, v); syncLabel(sel, wrap); }
+        });
+      } catch (err) { /* 老浏览器忽略 */ }
+    }
+
+    sel.addEventListener('change', function(){ syncLabel(sel, wrap); });
+  }
+
+  function scan(root){
+    var list = (root || document).querySelectorAll('select');
+    for (var i = 0; i < list.length; i++) enhance(list[i]);
+  }
+
+  document.addEventListener('click', function(e){
+    if (openWrap && !openWrap.contains(e.target)) closeWrap(openWrap);
+  }, true);
+
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'Escape' && openWrap) closeWrap(openWrap);
+  });
+
+  window.addEventListener('resize', function(){ if (openWrap) positionPanel(openWrap); });
+  /* 滚动时只重算方向，不关闭：scrollIntoView / 容器滚动都会派发 scroll，
+     直接关闭会让"点开就消失"。面板相对触发器定位，跟随即可。 */
+  window.addEventListener('scroll', function(){
+    if (openWrap) positionPanel(openWrap);
+  }, true);
+
+  function boot(){
+    scan(document);
+    if (typeof MutationObserver !== 'undefined'){
+      new MutationObserver(function(muts){
+        for (var i = 0; i < muts.length; i++){
+          var added = muts[i].addedNodes;
+          for (var j = 0; j < added.length; j++){
+            var n = added[j];
+            if (n.nodeType !== 1) continue;
+            if (n.tagName === 'SELECT') enhance(n);
+            else if (n.querySelectorAll) scan(n);
+          }
+        }
+      }).observe(document.body, { childList: true, subtree: true });
+    }
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
 })();
 </script>
 </body>

@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import re
 import secrets
 import threading
@@ -132,6 +133,81 @@ EGRESS_BACKOFF_ENABLED_KEY = "egress_backoff_enabled"
 # 打开后方向仍是单向的：只有 intl → cn，永远不会把请求从国内版打到国际版。
 REALM_FALLBACK_ENABLED_KEY = "realm_fallback_enabled"
 
+# 账号级并发上限：同一个上游账号同时最多跑几个 chat 请求。缺失键读作 0（不限），
+# 老安装的派发行为与上游一字不差。
+#
+# 为什么需要它：上游按「账号 + 分钟」计 token（TPM），而一个大上下文会话单请求
+# 就带十几万 token。两个会话同时落在一个账号上，一分钟内轻松过百万 token，上游
+# 直接回 429；网关随即把该账号停放 60 秒并换号，新账号没有这段对话的前缀缓存，
+# 缓存命中率从 99% 掉到 0、TTFT 从 1.5s 涨到 5-6s。也就是说「并发越高」反而让
+# 每个请求更慢。设成 1 时两个会话自然分到两个账号，各走各的缓存。
+ACCOUNT_MAX_CONCURRENT_KEY = "account_max_concurrent"
+#: 上限值域：0 = 不限；1..10 是「每账号同时几个」。10 只是防手滑的上界。
+ACCOUNT_MAX_CONCURRENT_MAX = 10
+
+
+def account_max_concurrent(accounts_dir):
+    """How many chat requests one upstream account may run at once.
+
+    0 (the default) means unlimited: dispatch behaves exactly as upstream does.
+    Anything unreadable falls back to 0 rather than to a limit, so a hand-edited
+    settings.json can never silently throttle a working install.
+    """
+    value = load(accounts_dir).get(ACCOUNT_MAX_CONCURRENT_KEY)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    if value < 0 or value > ACCOUNT_MAX_CONCURRENT_MAX:
+        return 0
+    return value
+
+
+def set_account_max_concurrent(accounts_dir, value):
+    """Persist the per-account concurrency cap. Returns the stored whole number."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("account_max_concurrent must be a whole number")
+    if value < 0:
+        raise ValueError("account_max_concurrent cannot be less than 0")
+    if value > ACCOUNT_MAX_CONCURRENT_MAX:
+        raise ValueError("account_max_concurrent cannot be more than %d"
+                         % ACCOUNT_MAX_CONCURRENT_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data[ACCOUNT_MAX_CONCURRENT_KEY] = value
+        save(accounts_dir, data)
+    return value
+
+# 更稳的会话粘滞键：把「首条 assistant 回复 + 它后面那条 user」也算进会话键。
+#
+# 为什么需要：会话键原本只用【system + 首条 user】，两个开场白相同的会话会算出
+# 同一个键、共享同一个绑定槽，于是每轮互相覆盖、轮流换账号，缓存每轮归零
+# （见 affinity_route）。把第 2 轮才出现的内容算进去之后，两个会话从第 2 轮起
+# 各走各的账号；前缀真的完全相同的会话仍会共用账号——那本来就是最优的缓存共享。
+#
+# 默认关：改的是派发路径上的会话识别，老安装必须保持原逻辑。关着时
+# affinity_route 与上游一字不差，可随时回退。
+AFFINITY_STABLE_KEY_ENABLED_KEY = "affinity_stable_key_enabled"
+
+
+def affinity_stable_key_enabled(accounts_dir):
+    """Whether the conversation key also covers the first assistant turn."""
+    return load(accounts_dir).get(AFFINITY_STABLE_KEY_ENABLED_KEY) is True
+
+
+def set_affinity_stable_key_enabled(accounts_dir, enabled):
+    """Persist the stable-affinity-key switch. Returns the stored boolean.
+
+    Strict on purpose: ``bool("false")`` is True, so a string that slipped in
+    from a caller would silently turn the new key on. The HTTP layer already
+    rejects non-booleans; this keeps every other caller honest too.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError("affinity_stable_key_enabled must be true or false")
+    with _lock:
+        data = load(accounts_dir)
+        data[AFFINITY_STABLE_KEY_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
 # 日志落库：把运行日志追加写进 usage/logs.sqlite3，重启后仍能回看，方便事后
 # debug。缺失键读作关 —— 关着的时候日志只留在内存环形缓冲里，与上游一字不差；
 # 只有显式 true 才建库、落盘。
@@ -159,10 +235,44 @@ def settings_path(accounts_dir):
     return os.path.join(accounts_dir, "settings.json")
 
 
+class PanelPasswordCryptoError(RuntimeError):
+    """Raised when hashlib.pbkdf2_hmac is missing or fails due to interpreter environment issues."""
+    pass
+
+
+def check_pbkdf2_available():
+    """Verify hashlib.pbkdf2_hmac is functional in this interpreter.
+
+    Returns (ok: bool, reason: str).
+    """
+    if not hasattr(hashlib, "pbkdf2_hmac"):
+        return False, "module 'hashlib' has no attribute 'pbkdf2_hmac'"
+    try:
+        hashlib.pbkdf2_hmac("sha256", b"smoke", b"salt", 1)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _digest(password, salt_hex, rounds=PBKDF2_ROUNDS):
-    return hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), rounds
-    ).hex()
+    if not hasattr(hashlib, "pbkdf2_hmac"):
+        raise PanelPasswordCryptoError(
+            "当前 Python 解释器缺少 hashlib.pbkdf2_hmac 支持，无法进行密码哈希计算。"
+            "若使用 Windows 便携版 Python，请检查系统安全策略（如 Smart App Control）是否拦截了 DLLs/_hashlib.pyd。"
+        )
+    try:
+        salt_bytes = bytes.fromhex(salt_hex)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"invalid password salt hex: {exc}") from exc
+    try:
+        return hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt_bytes, rounds
+        ).hex()
+    except (AttributeError, ImportError, ModuleNotFoundError, NotImplementedError, RuntimeError, OSError) as exc:
+        raise PanelPasswordCryptoError(
+            f"当前 Python 解释器计算 hashlib.pbkdf2_hmac 失败: {exc}。"
+            "若使用 Windows 便携版 Python，请检查系统安全策略（如 Smart App Control）是否拦截了 DLLs/_hashlib.pyd。"
+        ) from exc
 
 
 # settings.json 的解析结果按 (path, mtime, size) 缓存：请求热路径上它被读约 10
@@ -261,7 +371,9 @@ def verify_panel_password(accounts_dir, password):
     rounds = int(data.get("panel_password_rounds") or PBKDF2_ROUNDS)
     try:
         given = _digest(password, salt, rounds)
-    except Exception:
+    except PanelPasswordCryptoError:
+        raise
+    except ValueError:
         return False
     return hmac.compare_digest(given, stored)
 
@@ -1218,6 +1330,40 @@ def set_section_max_height(accounts_dir, value):
 # 退回完整目录；显式保存空列表表示「用户全部取消」，一键配置会拒绝写空清单
 # ——空清单会生成一个没有模型的 provider，客户端直接不可用。
 AGENT_MODELS_KEY = "agent_models"
+MODEL_ALIASES_KEY = "model_aliases"
+
+
+def _clean_model_aliases(raw):
+    """Normalise an alias table to ``{lowercase alias: target}``.
+
+    ``model_aliases`` predates the current tree and appears in existing
+    settings files as a plain object.  Accept that shape plus the common
+    ``[{"from": ..., "to": ...}]`` spelling, but never let a malformed entry
+    turn a request into a 500: unknown shapes are ignored.
+    """
+    out = {}
+    pairs = []
+    if isinstance(raw, dict):
+        pairs = list(raw.items())
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            source = item.get("from") or item.get("alias") or item.get("name")
+            target = item.get("to") or item.get("target") or item.get("model")
+            pairs.append((source, target))
+    for source, target in pairs:
+        alias = str(source or "").strip().lower()
+        model = str(target or "").strip()
+        if alias and model and alias != model.lower():
+            out[alias] = model
+    return out
+
+
+def model_aliases(accounts_dir):
+    """Read the operator-maintained model alias table."""
+    raw = load(accounts_dir).get(MODEL_ALIASES_KEY)
+    return _clean_model_aliases(raw)
 # 清单写进客户端配置后会被逐条展开；200 条已远超任何出口的模型数，上限只挡
 # 手编 settings.json 把客户端配置撑爆。
 MAX_AGENT_MODELS = 200
@@ -2063,99 +2209,15 @@ def set_daily_chat_web(accounts_dir, enabled):
     return enabled
 
 
-def daily_chat_model(accounts_dir):
-    """Which model the intl daily activity runs on; "" keeps the built-in one.
-
-    The activity is two throwaway conversations ("Hi") whose only job is to
-    register the day, so it has no reason to spend credits. The built-in
-    default is already a free catalogue model, and this lets a deployment move
-    the activity onto a different free model - useful when the default one is
-    the same model the real traffic hammers, so the daily run does not eat its
-    window quota. Empty means "unset": the caller falls back to the built-in id.
-    """
-    value = load(accounts_dir).get("daily_chat_model")
-    return str(value or "").strip()
-
-
-def set_daily_chat_model(accounts_dir, model):
-    """Persist the daily-activity model id. Returns the stored string."""
-    model = str(model or "").strip()
-    with _lock:
-        data = load(accounts_dir)
-        data["daily_chat_model"] = model
-        save(accounts_dir, data)
-    return model
-
-
 #: 网页通道一轮等多久（秒）的默认值。与 wb_accounts.WEB_TURN_TIMEOUT 同值：
 #: 没配过的部署保持既有行为，改过的部署按自己配的来。
 DAILY_CHAT_WEB_TIMEOUT_DEFAULT = 120
-#: 上限只是防手滑。每轮等待时间按首轮递增，配成几百秒会让单账号最坏情况跑到小时级。
+#: 上限只是防手滑：单轮等待再长也不该超过一小时。
 DAILY_CHAT_WEB_TIMEOUT_MAX = 3600
-#: 网页通道总共试几次（含第一轮）的默认值，与 wb_accounts.WEB_TURN_ATTEMPTS 同值。
-DAILY_CHAT_WEB_ATTEMPTS_DEFAULT = 3
-#: 上限同样只是防手滑：最坏等待是 base×(2^次数−1) 秒，5 次已经接近一小时。
-DAILY_CHAT_WEB_ATTEMPTS_MAX = 5
-
-
-def daily_chat_web_retry(accounts_dir):
-    """Whether a failed web-channel turn is tried again.
-
-    On unless the operator turns it off. The usual failure is a session that is
-    still ``working`` when the first wait runs out - slow, not broken - and the
-    daily activity is the only thing that earns the 30/50 credits, so giving up
-    on the first timeout silently loses the day. Off restores the old
-    single-attempt behaviour.
-    """
-    value = load(accounts_dir).get("daily_chat_web_retry")
-    return True if value is None else value is True
-
-
-def set_daily_chat_web_retry(accounts_dir, enabled):
-    """Persist the web-channel retry toggle. Returns the stored boolean."""
-    enabled = bool(enabled)
-    with _lock:
-        data = load(accounts_dir)
-        data["daily_chat_web_retry"] = enabled
-        save(accounts_dir, data)
-    return enabled
-
-
-def daily_chat_web_attempts(accounts_dir, default=None):
-    """How many times the web channel is tried in total, the first one included.
-
-    ``default`` is what an unset install gets, so a caller with its own
-    built-in default keeps it. Out-of-range or non-integer values fall back to
-    it too, so a hand-edited settings.json cannot park the sweep on one
-    account.
-    """
-    if default is None:
-        default = DAILY_CHAT_WEB_ATTEMPTS_DEFAULT
-    value = load(accounts_dir).get("daily_chat_web_attempts")
-    if (isinstance(value, bool) or not isinstance(value, int)
-            or value < 1 or value > DAILY_CHAT_WEB_ATTEMPTS_MAX):
-        return default
-    return value
-
-
-def set_daily_chat_web_attempts(accounts_dir, attempts):
-    """Persist the total number of tries. Returns the stored whole number."""
-    if isinstance(attempts, bool) or not isinstance(attempts, int):
-        raise ValueError("daily_chat_web_attempts must be a whole number")
-    if attempts < 1:
-        raise ValueError("daily_chat_web_attempts cannot be less than 1")
-    if attempts > DAILY_CHAT_WEB_ATTEMPTS_MAX:
-        raise ValueError("daily_chat_web_attempts cannot be more than %d"
-                         % DAILY_CHAT_WEB_ATTEMPTS_MAX)
-    with _lock:
-        data = load(accounts_dir)
-        data["daily_chat_web_attempts"] = attempts
-        save(accounts_dir, data)
-    return attempts
 
 
 def daily_chat_web_timeout(accounts_dir, default=None):
-    """Seconds to wait for the first web-channel turn; later tries double it.
+    """Seconds one web-channel round may wait for the session to finish.
 
     ``default`` is what an unset install gets, so a caller that has its own
     built-in default (the env-overridable ``WB_WEB_TURN_TIMEOUT``) keeps it
@@ -2189,34 +2251,47 @@ def set_daily_chat_web_timeout(accounts_dir, seconds):
     return seconds
 
 
-#: 回退模型组合的条数上限。网页活跃每次只发一句短提示词，组合过长的收益
-#: 只是把等待时间摊长，20 条已经覆盖目录里的免费与低价模型。
-DAILY_CHAT_WEB_FALLBACK_MAX_MODELS = 20
-#: 单个模型 id 的长度上限，与其它列表型设置保持一致。
-DAILY_CHAT_WEB_FALLBACK_MODEL_MAX_LEN = 128
+#: 「还没跑到 turn 就失败」（建会话 5xx、取沙箱失败）时的退避基数上限（秒）。
+#: 那一轮只花掉几百毫秒、不消耗任何等待预算，所以退避是唯一的节奏；但它同样
+#: 有上限——一个卡住的上游会让每个候选都睡这么久。
+DAILY_CHAT_WEB_RETRY_BACKOFF_MAX = 60
+#: 没配过时的退避基数（秒）。调用方另有内置默认（wb_accounts.WEB_RETRY_BACKOFF，
+#: 吃 WB_WEB_RETRY_BACKOFF 环境变量）时会把自己的默认传进来。
+DAILY_CHAT_WEB_RETRY_BACKOFF_DEFAULT = 5
 
 
-def _clean_fallback_models(value):
-    """Coerce a list / comma string into a deduplicated model-id list."""
-    if isinstance(value, str):
-        raw = value.replace("，", ",").split(",")
-    elif isinstance(value, (list, tuple)):
-        raw = list(value)
-    else:
-        return []
-    out = []
-    seen = set()
-    for item in raw:
-        model = str(item or "").strip()
-        if not model or len(model.encode("utf-8")) > DAILY_CHAT_WEB_FALLBACK_MODEL_MAX_LEN:
-            continue
-        if model in seen:
-            continue
-        seen.add(model)
-        out.append(model)
-        if len(out) >= DAILY_CHAT_WEB_FALLBACK_MAX_MODELS:
-            break
-    return out
+def daily_chat_web_retry_backoff(accounts_dir, default=None):
+    """Seconds to wait before retrying a round that never reached the turn.
+
+    0 disables the backoff, which is the pre-1.7.x timing (retry immediately).
+    ``default`` is what an unset install gets, so a caller that has its own
+    built-in default (the env-overridable ``WB_WEB_RETRY_BACKOFF``) keeps it.
+    Anything that is not a whole number in range also falls back to it.
+    """
+    if default is None:
+        default = DAILY_CHAT_WEB_RETRY_BACKOFF_DEFAULT
+    value = load(accounts_dir).get("daily_chat_web_retry_backoff")
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 0 or value > DAILY_CHAT_WEB_RETRY_BACKOFF_MAX):
+        return default
+    return value
+
+
+def set_daily_chat_web_retry_backoff(accounts_dir, seconds):
+    """Persist the backoff base. Returns the stored whole number of seconds."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError(
+            "daily_chat_web_retry_backoff must be a whole number of seconds")
+    if seconds < 0:
+        raise ValueError("daily_chat_web_retry_backoff cannot be negative")
+    if seconds > DAILY_CHAT_WEB_RETRY_BACKOFF_MAX:
+        raise ValueError("daily_chat_web_retry_backoff cannot be more than %d"
+                         % DAILY_CHAT_WEB_RETRY_BACKOFF_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_retry_backoff"] = seconds
+        save(accounts_dir, data)
+    return seconds
 
 
 #: 随机池的条数上限：内置 300 条全选 + 200 条自定义。池里存的是完整列表
@@ -2251,25 +2326,6 @@ def _clean_web_prompts(value):
     return out
 
 
-def daily_chat_web_fallback(accounts_dir):
-    """Whether a failed web turn falls back to the next model.
-
-    Off by default: an install that predates the setting keeps retrying the
-    same model, which is the behaviour that earned the daily credits until now.
-    """
-    return load(accounts_dir).get("daily_chat_web_fallback") is True
-
-
-def set_daily_chat_web_fallback(accounts_dir, enabled):
-    """Persist the web-channel model-fallback toggle. Returns the stored bool."""
-    enabled = bool(enabled)
-    with _lock:
-        data = load(accounts_dir)
-        data["daily_chat_web_fallback"] = enabled
-        save(accounts_dir, data)
-    return enabled
-
-
 def daily_chat_web_random_prompt(accounts_dir):
     """Whether the web leg draws a random prompt instead of always sending Hi.
 
@@ -2288,27 +2344,6 @@ def set_daily_chat_web_random_prompt(accounts_dir, enabled):
         data["daily_chat_web_random_prompt"] = enabled
         save(accounts_dir, data)
     return enabled
-
-
-def daily_chat_web_fallback_models(accounts_dir):
-    """The model combination to fall back through; [] means "use the default".
-
-    Order is not significant: the caller sorts the candidates by catalogue
-    credits, so the free model runs before a low-credit one and that one before
-    an expensive one.
-    """
-    return _clean_fallback_models(
-        load(accounts_dir).get("daily_chat_web_fallback_models"))
-
-
-def set_daily_chat_web_fallback_models(accounts_dir, models):
-    """Persist the fallback combination. Returns the normalized list."""
-    cleaned = _clean_fallback_models(models)
-    with _lock:
-        data = load(accounts_dir)
-        data["daily_chat_web_fallback_models"] = cleaned
-        save(accounts_dir, data)
-    return cleaned
 
 
 def daily_chat_web_prompts(accounts_dir):
@@ -2361,6 +2396,225 @@ def set_daily_chat_web_concurrency(accounts_dir, value):
         data["daily_chat_web_concurrency"] = value
         save(accounts_dir, data)
     return value
+
+
+# ---------------------------------------------------------------- 每日活跃预算模型
+# 网页活跃过去有六个互相覆盖的旋钮：最多尝试次数、首轮等待、失败重试、失败后按
+# 模型组合回退、回退组合、建会话失败退避。它们其实共同决定同一个乘积 —— 一次打卡
+# 最长占住调度器多久；而面板把它们画成六个独立开关，于是「勾选的模型不生效」
+# 「次数设了 1 还是跑 6 次」这类组合根本看不出来。
+#
+# 现在只留两个真正的输入：
+#   * daily_chat_models —— 有序候选序列：第一个是首选，其余是回退；空 = 自动
+#   * daily_chat_budget —— 单账号总预算（秒），0 = 不限制（回到旧行为）
+# 尝试轮数由候选序列推出，建会话退避与每轮等待都从同一个预算里扣，所以不可能
+# 再出现「次数 × 等待 × 回退轮次」失控的组合。
+DAILY_CHAT_BUDGET_DEFAULT = 600
+DAILY_CHAT_BUDGET_MAX = 7200
+#: 剩余预算低于这个值就不再开新的一轮：一轮至少要能等到会话真的跑起来。
+DAILY_CHAT_BUDGET_MIN_ROUND = 30
+#: 候选序列最多几个模型。每个候选都是一次真实的上游会话，别配成整份目录。
+DAILY_CHAT_MODELS_MAX = 8
+#: 随机时段的基准小时区间，第二个时段 = 基准 + 12 小时（06–11 → 18–23）。
+DAILY_CHAT_RANDOM_HOURS = (6, 11)
+#: 随机时段的分钟区间。14220 全部落在整点批处理窗口（09:0x / 01:0x），
+#: 分钟避开 00–04 就绕开了那一段。
+DAILY_CHAT_RANDOM_MINUTES = (5, 55)
+DAILY_CHAT_RANDOM_KEY = "daily_chat_random"
+DAILY_CHAT_STARTUP_CATCHUP_KEY = "daily_chat_startup_catchup"
+DAILY_CHAT_WEB_FALLBACK_ACTIVITY_KEY = "daily_chat_web_fallback_activity"
+
+
+def _clean_models(value):
+    """Normalize a candidate list: strings only, de-duplicated, order kept."""
+    out = []
+    for item in value or []:
+        model = str(item or "").strip()
+        if not model or model in out:
+            continue
+        out.append(model)
+    return out[:DAILY_CHAT_MODELS_MAX]
+
+
+def daily_chat_models(accounts_dir):
+    """The ordered model candidates for the web activity; [] means "automatic".
+
+    First entry is the preferred model, the rest are the fallback combination.
+    An explicit list is used **in that order** - the old code kept the preferred
+    model in one key and the fallback combination in another, then re-sorted the
+    combination by catalogue multiplier, which is how a model picked in the
+    panel ended up never running at all.
+    """
+    data = load(accounts_dir)
+    stored = data.get("daily_chat_models")
+    if isinstance(stored, (list, tuple)):
+        return _clean_models(stored)
+    # Upgrade path for installs that configured the old pair. The old fallback
+    # list was only active when its switch was on; the preferred model still
+    # ran first. Fold both into one ordered list so the panel starts from the
+    # operator's actual prior behaviour instead of silently resetting.
+    legacy_fallback = data.get("daily_chat_web_fallback") is True
+    candidates = []
+    preferred = str(data.get("daily_chat_model") or "").strip()
+    if preferred:
+        candidates.append(preferred)
+    if legacy_fallback:
+        raw = data.get("daily_chat_web_fallback_models")
+        if isinstance(raw, str):
+            raw = raw.replace("，", ",").split(",")
+        elif isinstance(raw, (list, tuple)):
+            raw = list(raw)
+        else:
+            raw = []
+        candidates.extend(str(item or "").strip() for item in raw)
+    if candidates:
+        return _clean_models(candidates)
+    return []
+
+
+def set_daily_chat_models(accounts_dir, models):
+    """Persist the ordered candidate list. Returns the stored list.
+
+    An empty value clears the key, which means "automatic": the account's
+    preferred model plus the realm's free models, ordered by multiplier.
+    """
+    cleaned = _clean_models(models)
+    with _lock:
+        data = load(accounts_dir)
+        if cleaned:
+            data["daily_chat_models"] = cleaned
+        else:
+            data.pop("daily_chat_models", None)
+        save(accounts_dir, data)
+    return cleaned
+
+
+def daily_chat_budget(accounts_dir, default=None):
+    """How long one account may spend on the web activity, in seconds.
+
+    ``default`` is what an unset install gets, so a caller with its own
+    built-in default keeps it. 0 disables the budget. This is the single knob
+    that decides the worst case: rounds and the create-failure backoff both draw
+    from it, so `ceil(accounts / concurrency) x budget` is the whole batch's
+    upper bound.
+    """
+    if default is None:
+        default = DAILY_CHAT_BUDGET_DEFAULT
+    value = load(accounts_dir).get("daily_chat_budget")
+    if isinstance(value, bool) or not isinstance(value, int) \
+            or value < 0 or value > DAILY_CHAT_BUDGET_MAX:
+        return default
+    return value
+
+
+def set_daily_chat_budget(accounts_dir, seconds):
+    """Persist the per-account budget. Returns the stored whole number."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError("daily_chat_budget must be a whole number")
+    if seconds < 0:
+        raise ValueError("daily_chat_budget cannot be negative")
+    if seconds > DAILY_CHAT_BUDGET_MAX:
+        raise ValueError("daily_chat_budget cannot be more than %d"
+                         % DAILY_CHAT_BUDGET_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_budget"] = seconds
+        save(accounts_dir, data)
+    return seconds
+
+
+def _draw_daily_chat_times():
+    """Draw one base time and its +12h twin, minutes kept off the top of the hour."""
+    hour = random.randint(*DAILY_CHAT_RANDOM_HOURS)
+    minute = random.randint(*DAILY_CHAT_RANDOM_MINUTES)
+    return ["%02d:%02d" % (hour, minute),
+            "%02d:%02d" % ((hour + 12) % 24, minute)]
+
+
+def daily_chat_random_times(accounts_dir, now=None):
+    """Today's two random slots, 12 hours apart; drawn once per local day.
+
+    Persisted because the scheduler re-reads settings every 30 seconds and the
+    process may restart mid-day: re-drawing on each read would move the slots
+    around under the accounts that already ran, and "next slot in ..." would
+    never converge. The stored date is the guard.
+    """
+    moment = time.localtime(now) if now is not None else time.localtime()
+    today = time.strftime("%Y-%m-%d", moment)
+    data = load(accounts_dir)
+    stored = data.get(DAILY_CHAT_RANDOM_KEY)
+    if isinstance(stored, dict) and stored.get("date") == today:
+        times = _normalize_times(stored.get("times"))
+        if times and len(times) == 2:
+            return times
+    times = _draw_daily_chat_times()
+    with _lock:
+        data = load(accounts_dir)
+        data[DAILY_CHAT_RANDOM_KEY] = {"date": today, "times": times}
+        save(accounts_dir, data)
+    return times
+
+
+def daily_chat_effective_times(accounts_dir, now=None):
+    """The slots the scheduler should actually use.
+
+    An explicit `schedule.daily_chat` wins. When it is empty the activity runs
+    on two random slots, 12 hours apart - the old "empty = follow the checkin
+    hours" default put every run on 09:00 / 21:00, which is exactly the
+    upstream batch window that answers 14220 (`failed to create initial
+    session`).
+    """
+    explicit = daily_chat_times(accounts_dir)
+    if explicit:
+        return explicit
+    return daily_chat_random_times(accounts_dir, now=now)
+
+
+def daily_chat_startup_catchup(accounts_dir):
+    """Whether a restart still catches up on today's missed activity.
+
+    On unless the operator turns it off. A gateway that was down (or whose
+    scheduler was stuck) during a slot used to wait for the next slot - up to
+    12 hours - and if that one failed too, the day was simply lost.
+    """
+    value = load(accounts_dir).get(DAILY_CHAT_STARTUP_CATCHUP_KEY)
+    return True if value is None else value is True
+
+
+def set_daily_chat_startup_catchup(accounts_dir, enabled):
+    """Persist the startup catch-up switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[DAILY_CHAT_STARTUP_CATCHUP_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def daily_chat_web_fallback_activity(accounts_dir):
+    """Whether a web-channel TLS failure falls back to the activity report.
+
+    Off unless the operator turns it on. The web channel is the only leg that
+    actually earns the daily reward, so its failure is reported as a failure -
+    otherwise the day looks done and the credits silently never arrive. The
+    exception is a certificate failure on the sandbox endpoint (#645): that is
+    an upstream/network configuration fault, retrying the same turn cannot
+    fix it, and leaving the whole day failed while the streak can be lit by a
+    plain POST /v2/report costs the operator the streak too. With this switch
+    on, a TLS failure on the web leg reports activity instead of failing the
+    round. Every other web failure keeps its old meaning.
+    """
+    return load(accounts_dir).get(DAILY_CHAT_WEB_FALLBACK_ACTIVITY_KEY) is True
+
+
+def set_daily_chat_web_fallback_activity(accounts_dir, enabled):
+    """Persist the web-leg fallback switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[DAILY_CHAT_WEB_FALLBACK_ACTIVITY_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
 
 
 def local_web_tools(accounts_dir):

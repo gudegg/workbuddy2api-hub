@@ -13,6 +13,7 @@ calling those models successfully, so treating them as exclusive would refuse
 working requests (the same rule as the Go gateway's ADR-0049).
 """
 import threading
+import time
 
 #: User-type spellings the upstream uses for an unpaid account.
 FREE_TYPES = frozenset((
@@ -24,6 +25,10 @@ FREE_TYPES = frozenset((
 _lock = threading.Lock()
 #: realm -> {model id: "free" | "standard"}
 _tiers = {}
+#: realm -> epoch seconds of the last successful ingest (the catalogue refresh
+#: the map came from). The panel shows it next to the label so a stale map is
+#: visible instead of silently trusted.
+_ingested_at = {}
 
 
 def _priority_only(entry):
@@ -93,6 +98,7 @@ def ingest(realm, payload):
                 out[model] = tier
     with _lock:
         _tiers[str(realm or "")] = out
+        _ingested_at[str(realm or "")] = time.time()
     return True
 
 
@@ -123,7 +129,22 @@ def requires_pro(model, realm=None):
                    for mapping in _tiers.values())
 
 
+def ingested_at(realm=None):
+    """When the realm's tier map was last refreshed, or None if never.
+
+    `/v1/models` carries this next to the label: the map is in-memory only and
+    is rebuilt by every catalogue refresh, so "when" is the only honest way to
+    say how current the claim is.
+    """
+    with _lock:
+        if realm:
+            return _ingested_at.get(str(realm))
+        stamps = list(_ingested_at.values())
+    return max(stamps) if stamps else None
+
+
 def reset():
     """Drop every recorded tier map (tests only)."""
     with _lock:
         _tiers.clear()
+        _ingested_at.clear()

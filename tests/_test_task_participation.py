@@ -166,6 +166,63 @@ class RouteTests(unittest.TestCase):
                 self.assertTrue(body["account"]["tasksEnabled"])
 
 
+class CheckinRouteTests(unittest.TestCase):
+    """「一键签到」不传 uid 时也要按任务开关选号 (#521)。
+
+    成长任务、猫猫旅行、连登管家、网页活跃都按 `task_active()` 选号了，
+    只有签到路由漏了：`tasksEnabled=False` 的账号被顺手打了一遍上游。
+    """
+
+    class Handler(wb_proxy.Handler):
+        def __init__(self):
+            self.captured = None
+
+        def _json_panel(self, code, obj):
+            self.captured = (code, obj)
+
+    def test_a_task_disabled_account_is_not_checked_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for uid, tasks in (("uid-on", True), ("uid-off", False)):
+                with open(os.path.join(directory, uid + ".json"), "w",
+                          encoding="utf-8") as fh:
+                    json.dump({"uid": uid, "accessToken": jwt(uid), "realm": "cn",
+                               "enabled": True, "tasksEnabled": tasks}, fh)
+            pool = wb_accounts.AccountPool(directory)
+            pool.load()
+            called = []
+
+            def fake_checkin(account, trigger="unknown"):
+                called.append(account.uid)
+                return {"ok": True, "code": 0, "msg": "ok"}
+
+            handler = self.Handler()
+            with mock.patch.object(wb_proxy, "POOL", pool), \
+                    mock.patch.object(wb_accounts.Account, "checkin", fake_checkin):
+                handler._route_accounts_checkin({})
+            self.assertEqual(called, ["uid-on"])
+
+    def test_an_explicit_uid_is_still_honoured(self):
+        # 显式点名单个账号与其它手动入口一致：任务开关不挡手动执行。
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "uid-off.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"uid": "uid-off", "accessToken": jwt("uid-off"),
+                           "realm": "cn", "enabled": True, "tasksEnabled": False}, fh)
+            pool = wb_accounts.AccountPool(directory)
+            pool.load()
+            called = []
+
+            def fake_checkin(account, trigger="unknown"):
+                called.append(account.uid)
+                return {"ok": True, "code": 0, "msg": "ok"}
+
+            handler = self.Handler()
+            with mock.patch.object(wb_proxy, "POOL", pool), \
+                    mock.patch.object(wb_accounts.Account, "checkin", fake_checkin):
+                handler._route_accounts_checkin({"uid": "uid-off"})
+            self.assertEqual(called, ["uid-off"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

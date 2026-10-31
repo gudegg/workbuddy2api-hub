@@ -75,6 +75,18 @@ class TierParsingTests(unittest.TestCase):
         self.assertFalse(wb_tiers.ingest("intl", {"agents": []}))
         self.assertTrue(wb_tiers.requires_pro("pro-model", "intl"))
 
+    def test_ingest_records_when_the_map_was_refreshed(self):
+        self.assertIsNone(wb_tiers.ingested_at("intl"))
+        wb_tiers.ingest("intl", {"modelTiers": [
+            {"requiredUserType": "standard", "modelIds": ["pro-model"]}]})
+        stamp = wb_tiers.ingested_at("intl")
+        self.assertTrue(isinstance(stamp, float) and stamp > 0, stamp)
+        # A realm nobody ingested stays unknown, and a payload without the
+        # array must not move the stamp of the realm that has one.
+        self.assertIsNone(wb_tiers.ingested_at("cn"))
+        wb_tiers.ingest("intl", {"agents": []})
+        self.assertEqual(wb_tiers.ingested_at("intl"), stamp)
+
 
 class SchedulerTierTests(unittest.TestCase):
     def setUp(self):
@@ -182,6 +194,10 @@ class FakeRequest(object):
         _kind, _status, payload = self.answering[-1]
         return [m.get("id") for m in (payload.get("data") or [])]
 
+    def models_payload(self):
+        _kind, _status, payload = self.answering[-1]
+        return payload
+
 
 CATALOG = [("free-model", {}), ("pro-model", {})]
 
@@ -230,6 +246,46 @@ class ModelsEndpointTests(unittest.TestCase):
         self.assertFalse(S.models_only_available(self.dir))
         self.assertTrue(S.set_models_only_available(self.dir, True))
         self.assertTrue(S.models_only_available(self.dir))
+
+    def test_pro_models_carry_a_one_way_catalogue_label(self):
+        """#505: the label comes from the same tier map the scheduler uses.
+
+        One-way on purpose: the gated model carries `entitlement`, everything
+        else carries nothing at all - the payload never claims a model is
+        available.
+        """
+        S.set_models_only_available(self.dir, False)
+        self.pool.accounts = [make_account("free")]
+        req = FakeRequest()
+        with mock.patch.object(proxy, "POOL", self.pool), \
+             mock.patch.object(proxy, "fetch_models", return_value=list(CATALOG)), \
+             mock.patch.object(proxy, "catalog_meta", return_value=None), \
+             mock.patch.object(proxy, "pinned_account", return_value=None), \
+             mock.patch.object(proxy.wb_modelsdev, "refresh_async", return_value=None):
+            proxy.Handler._get_v1_models(req)
+        by_id = {m["id"]: m for m in req.models_payload()["data"]}
+        self.assertNotIn("entitlement", by_id["free-model"])
+        ent = by_id["pro-model"]["entitlement"]
+        self.assertEqual(ent["source"], "catalog")
+        self.assertEqual(ent["required"], "standard")
+        self.assertEqual(ent["at"], wb_tiers.ingested_at("intl"))
+        # The old runtime channel wrote an upstream code; the catalogue
+        # source must not pretend it saw one.
+        self.assertNotIn("code", ent)
+
+    def test_no_tier_map_means_no_label(self):
+        wb_tiers.reset()
+        S.set_models_only_available(self.dir, False)
+        self.pool.accounts = [make_account("free")]
+        req = FakeRequest()
+        with mock.patch.object(proxy, "POOL", self.pool), \
+             mock.patch.object(proxy, "fetch_models", return_value=list(CATALOG)), \
+             mock.patch.object(proxy, "catalog_meta", return_value=None), \
+             mock.patch.object(proxy, "pinned_account", return_value=None), \
+             mock.patch.object(proxy.wb_modelsdev, "refresh_async", return_value=None):
+            proxy.Handler._get_v1_models(req)
+        for m in req.models_payload()["data"]:
+            self.assertNotIn("entitlement", m)
 
 
 if __name__ == "__main__":
