@@ -2,6 +2,7 @@ import re
 import base64
 import datetime
 import json
+import math
 import os
 import random
 import ssl
@@ -436,6 +437,14 @@ TIER_TTL_SECONDS = 24 * 3600.0
 
 LOGIN_PENDING = 11217
 LOGIN_TTL_SECONDS = 600
+# proxySlot value asking start_login to pick a random free proxy slot.
+LOGIN_SLOT_AUTO = "auto"
+
+
+class LoginProxySlotError(ValueError):
+    """The proxy slot asked for by a login does not exist or is disabled."""
+
+
 USER_AGENT = REALM_CONFIGS['intl']['chat_ua']
 
 #: 签到文案判据。10001 在本仓库**不是**「签到成功」专属码：活动补偿的
@@ -545,7 +554,8 @@ REALM_MARKERS = {"cn": CN_REALM_MARKERS, "intl": INTL_REALM_MARKERS}
 #: 不在这套 24h 窗口配额里。键与 Account.realm 的取值一致（intl / cn），
 #: 国内版的 deepseek-v4.1-flash 是收费模型（x0.11），不在名单内。
 FREE_CAP_MODELS = {
-    "intl": frozenset({"hy4-preview-f", "hy3", "deepseek-v4.1-flash"}),
+    "intl": frozenset({"hy4-preview-f", "hy3", "deepseek-v4.1-flash",
+                        "deepseek-v4.1-flash-sg"}),
     "cn": frozenset({"hy4-preview-f", "hy3"}),
 }
 
@@ -753,6 +763,13 @@ DEGRADE_COOLDOWN_MAX = 7200.0   # ... doubling up to 2 hours
 # 与其它冷却不同，这个期限是**持久化**的（见 note_restricted）。
 RESTRICTED_ACCOUNT_COOLDOWN = 7200.0
 
+# 临期积分优先的权重放大系数。_expiry_weight() 算出的乘积（紧迫度 × 剩余量，
+# 约 1.0–5.5）乘上它再取整，让相邻档位之间留出足够的分辨率：不放大时
+# round() 会把一整段天数压成同一个整数，权重就失去区分度（实测生产池 110 个
+# 账号权重全部相同，退化成纯轮询）。取 10 表示最急的账号大约拿到最不急的
+# 5 倍流量，而不是独占。
+EXPIRY_WEIGHT_SCALE = 10.0
+
 
 def _exponential_backoff(count, base, cap, offset):
     """base * 2 ** (count - offset), clamped to cap and to 20 steps."""
@@ -952,6 +969,11 @@ class Account(object):
         # 写过，超长截断，别让一条长备注把账号行撑爆。
         raw_note = data.get("note")
         self.note = (raw_note if isinstance(raw_note, str) else "").strip()[:200]
+        # Free-form operator label used to filter and batch-act on a subset of
+        # the pool. Unlike API-key whitelists, a group is display/selection
+        # metadata and never changes routing by itself.
+        raw_group = data.get("group")
+        self.group = (raw_group if isinstance(raw_group, str) else "").strip()[:64]
         # 该账号**人工**禁用的模型名单（面板 / 接口配置）。与 weight、note 同款：
         # 随凭证档持久化 —— 这是使用者的明确意图，不该在重启后悄悄回到默认。
         #
@@ -1162,6 +1184,7 @@ class Account(object):
             "tasksEnabled": bool(self.tasks_enabled),
             "weight": self.weight,
             "note": self.note,
+            "group": self.group,
             "disabledModels": list(self.disabled_models),
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
@@ -1244,6 +1267,7 @@ class Account(object):
             "tasksEnabled": bool(self.tasks_enabled),
             "weight": int(self.weight),
             "note": self.note,
+            "group": self.group,
             "disabledModels": list(self.disabled_models),
             "source": self.source,
             "apiKey": bool(self.is_api_key),
@@ -1496,6 +1520,43 @@ class Account(object):
             if soonest is None or days < soonest:
                 soonest = float(days)
         return soonest
+
+    def soonest_expiring_remain(self):
+        """How many credits the soonest-lapsing package still holds.
+
+        The companion of `soonest_expiring_days()`: that one says *when* the
+        first package lapses, this one says *how much* is still unspent in it.
+        Both come from the same package, so the weight in `_expiry_weight()`
+        multiplies urgency by the amount actually at risk of being wasted.
+
+        None when nothing can be said - no credit data, no package with a
+        usable remainder, or no end date - which keeps an unjudgeable account
+        on weight 1 instead of guessing.
+        """
+        credits = self.credits
+        if not isinstance(credits, dict):
+            return None
+        soonest = None
+        remain_of_soonest = None
+        for package in (credits.get("packages") or []):
+            if not isinstance(package, dict):
+                continue
+            if package.get("no_expiry"):
+                continue
+            if package.get("package_code") == "enterprise":
+                continue
+            if package.get("is_expired"):
+                continue
+            days = package.get("days_left")
+            remain = package.get("remain")
+            if not isinstance(days, (int, float)) or days < 0:
+                continue
+            if not isinstance(remain, (int, float)) or remain <= 0:
+                continue
+            if soonest is None or days < soonest:
+                soonest = float(days)
+                remain_of_soonest = float(remain)
+        return remain_of_soonest
 
     def in_expiring_window(self):
         """True when this account should jump the dispatch queue.
@@ -1852,11 +1913,13 @@ class Account(object):
         return self.product == wb_identity.PRODUCT_CLI
 
     def headers(self, purpose="chat", session_key=None, turn_request_id=None,
-                model=None, conversation_id=None):
+                model=None, conversation_id=None, media_identity=None):
         """组出这一轮的出站标头。
 
         chat 用途走 wb_identity（CLI 头 / WorkBuddy 头 / VSCode 头，可切换）；
-        billing 用途维持原本的轻量标头，计费端点不吃那套身分。
+        billing 用途维持原本的轻量标头，计费端点不吃那套身分；media 用途复用
+        chat 那份身分再加三个媒体端点特有的头（生图 / 生视频的 /v2/images/*、
+        /v2/videos/*），见该分支里的注释。
 
         `model` / `conversation_id` 只对 chat 用途有意义：官方 VSCode 扩展在
         model 请求上带 `X-Model-ID`（值就是本次 model），`X-Conversation-ID`
@@ -1888,6 +1951,57 @@ class Account(object):
         cfg = get_realm_config(self.realm)
 
         if purpose != "chat":
+            if purpose == "media":
+                # 媒体端点（/v2/images/*、/v2/videos/*）的出站标头。
+                #
+                # 组法：直接复用本账号 chat 那份身分（build_identity_headers，与
+                # chat 分支同一个函数），再补三个媒体端点要的头。理由两条：
+                #   1) 同一个客户端发的所有请求，头形状一致最自然；chat 已经在同一
+                #      个 host（copilot.tencent.com / www.workbuddy.ai）上稳定 200；
+                #   2) dsh 插件的 imageHeaders 是拿 **CLI 身份**的账号实测出来的，
+                #      本仓库账号是桌面身份（product=workbuddy），照抄它的 UA 反而
+                #      是猜测。要切到 CLI 形状就把 media_identity="cli" 传进来，
+                #      P0 取证之后由配置决定默认值，不用改这里。
+                #
+                # 差异只有三处，都是媒体端点特有的：Accept 用列表形态、补
+                # X-Requested-With、补企业标识（chat 的桌面分支不发 X-Enterprise-Id）。
+                # 刻意**不带** Origin / Referer：dsh 的取证探针就是不带这两个头拿到
+                # 200 的，多带两个头只多一个可能被网关拒掉的变量，没有收益。
+                product = wb_identity.normalize_product(
+                    media_identity or self.product)
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/plain, */*",
+                    "X-Requested-With": "XMLHttpRequest",
+                }
+                headers.update(wb_identity.build_identity_headers(
+                    product=product,
+                    realm=self.realm,
+                    uid=self.uid,
+                    token=self.access_token,
+                    enterprise_id=self.enterprise_id,
+                    tenant_id=self.enterprise_id,
+                    private_data=(wb_settings.identity_private_data(
+                        os.path.dirname(self.path)) if self.path else "auto"),
+                ))
+                if self.enterprise_id:
+                    headers["X-Enterprise-Id"] = self.enterprise_id
+                    headers["X-Tenant-Id"] = self.enterprise_id
+                else:
+                    headers["X-No-Enterprise-Id"] = "1"
+                if self.realm == "cn":
+                    headers["X-Product"] = "SaaS"
+                if self.is_api_key:
+                    # 与 chat / billing 两条路口径一致：静态 Key 两个鉴权头都发。
+                    headers["X-API-Key"] = self.access_token
+                # 国内版才发设备 token（国际版客户端本来就没有这个头，见 #448）；
+                # CLI 身份全包没有设备 token 逻辑。
+                device_token = (self._device_token()
+                                if self.realm == "cn" and not self.is_cli_identity()
+                                else "")
+                if device_token:
+                    headers["X-Device-Token"] = device_token
+                return headers
             headers = {
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/plain, */*",
@@ -2678,7 +2792,7 @@ class Account(object):
         """每日活跃对话的实际流程；返回形状见 daily_chat。"""
         import wb_proxy
         url = self.chat_base_url() + wb_proxy.CHAT_PATH
-        model = self.daily_chat_model()
+        model = wb_proxy.intl_model_alias(self.daily_chat_model(), self.realm)
         headers = self.headers("chat", model=model)
         body = {
             "model": model,
@@ -4106,6 +4220,8 @@ class AccountPool(object):
         self.log = log or (lambda msg: None)
         self.accounts = []
         self.logins = {}
+        # Slots picked by a login whose auth/state request is still in flight.
+        self._login_slot_reserved = set()
         self._lock = threading.RLock()
         self._cursor = 0
         # Smooth weighted round-robin state for the expiring-credits window,
@@ -4393,6 +4509,15 @@ class AccountPool(object):
         account.save(self.dir)
         return account.public()
 
+    def set_group(self, uid, group):
+        """Set the optional operator label used for filtering and batch actions."""
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.group = str(group or "").strip()[:64]
+        account.save(self.dir)
+        return account.public()
+
     def set_disabled_models(self, uid, models):
         """设置该账号**人工**禁用的模型名单，落盘并回公共视图。
 
@@ -4637,6 +4762,25 @@ class AccountPool(object):
                 account.save(self.dir)
         self.apply_proxy_slots()
 
+    def set_group_enabled(self, group, enabled):
+        """Enable/disable exactly the accounts carrying one non-empty group."""
+        group = str(group or "").strip()
+        if not group:
+            return []
+        changed = []
+        with self._lock:
+            for account in self.accounts:
+                if account.group != group:
+                    continue
+                account.enabled = bool(enabled)
+                account.tasks_enabled = bool(enabled)
+                if enabled:
+                    account.clear_error()
+                account.save(self.dir)
+                changed.append(account.uid)
+        self.apply_proxy_slots()
+        return changed
+
     def task_accounts(self, realm=None):
         """Accounts that participate in scheduled / manual tasks.
 
@@ -4682,7 +4826,20 @@ class AccountPool(object):
           every oversized body onto a single account.
         """
         exclude = exclude or set()
-        if session_key and page is None:
+        # A page that covers the whole realm is not a page at all: every
+        # oversized conversation would rotate through the entire pool and lose
+        # its prefix cache every turn (issue #718). Bind it like a normal
+        # conversation instead; real multi-page pools keep rotating.
+        whole_pool_page = False
+        if page is not None:
+            with self._lock:
+                pool_size = sum(1 for a in self.accounts
+                                if not realm or a.realm == realm)
+            try:
+                whole_pool_page = int(page[1]) >= pool_size
+            except (TypeError, ValueError, IndexError):
+                whole_pool_page = False
+        if session_key and (page is None or whole_pool_page):
             for uid in self.affinity.recent(session_key):
                 if uid in exclude:
                     continue
@@ -4695,7 +4852,8 @@ class AccountPool(object):
                 if account and account.realm == realm and account.ready(model=model):
                     self.affinity.bind(session_key, uid)
                     return account
-        account = self.pick(realm=realm, exclude=exclude, model=model, page=page,
+        account = self.pick(realm=realm, exclude=exclude, model=model,
+                            page=None if whole_pool_page else page,
                             allowed=allowed)
         if account is None and page is not None:
             # The page has nobody usable right now. Serving the conversation
@@ -4705,7 +4863,7 @@ class AccountPool(object):
         # A page conversation is not bound on purpose: its rotation is what keeps
         # every account of the page warm, and a binding would pin it back to one
         # (the state it was released from). The page cursor carries its rotation.
-        if account and session_key and page is None:
+        if account and session_key and (page is None or whole_pool_page):
             self.affinity.bind(session_key, account.uid)
         return account
 
@@ -4792,18 +4950,47 @@ class AccountPool(object):
     def _expiry_weight(self, account):
         """How much of the window's traffic this account should take.
 
-        Linear in how close the credits are to lapsing, floored at 1 so an
-        account at the far edge of the window still gets served rather than
-        starved until the others run dry.
+        Two factors, multiplied, floored at 1 so an account at the far edge of
+        the window still gets served rather than starved until the others run
+        dry:
+
+          * urgency - how close the soonest-lapsing package is. Kept as a
+            fraction of the window rather than a rounded day count, because
+            rounding collapsed the whole 0-1.4 day range onto one weight and
+            that is exactly where a real pool sits: on the live pool 110 of
+            112 accounts reported days_left 0.10 and every one of them got the
+            same weight, so the preference degraded into a plain rotation.
+
+          * amount - how much of the lapsing package is still unspent. This is
+            the part that actually gets "spent before it expires": an account
+            holding 30 expiring credits is worth 30x the traffic of one holding
+            1, and the old weight ignored the figure entirely. Logarithmic, so
+            a 30-vs-1 gap does not turn into a 30x share that starves everyone
+            else, and floored at 1 so a nearly-spent package still counts.
+
+        A pool where nobody can be judged keeps the plain rotation: an unknown
+        soonest-expiring day yields weight 1, and equal weights degenerate to
+        a plain rotation in `_smooth_weighted_pick`.
         """
         try:
-            window = int(account.expiring_window_days or 0)
+            window = float(account.expiring_window_days or 0)
         except (TypeError, ValueError):
-            window = 0
+            window = 0.0
         days = account.soonest_expiring_days()
         if days is None:
             return 1
-        return max(1, int(round(window - days)) + 1)
+        # urgency: 1 at the far edge of the window, growing to ~1+1/scale at 0
+        if window <= 0:
+            return 1
+        remaining_fraction = max(0.0, min(1.0, 1.0 - (float(days) / window)))
+        urgency = 1.0 + remaining_fraction
+        # amount: log-scaled so 30 credits is not a 30x share of the traffic
+        amount = account.soonest_expiring_remain()
+        if amount is None or amount <= 0:
+            amount_weight = 1.0
+        else:
+            amount_weight = 1.0 + math.log10(1.0 + float(amount))
+        return max(1, int(round(urgency * amount_weight * EXPIRY_WEIGHT_SCALE)))
 
     def _pick_remaining_first(self, snapshot, exclude, model):
         """剩余估算接近耗尽的 (账号, 模型) 优先接单，或 None（没有可交的）。
@@ -5001,7 +5188,56 @@ class AccountPool(object):
             return None, "is ambiguous"
         return None, "was not found"
 
-    def start_login(self, realm="intl", platform="CLI"):
+    def _login_proxy(self, slot_id=None, taken_slots=()):
+        """Resolve the egress used by one OAuth login (start + poll).
+
+        Order: explicit slot id > LOGIN_SLOT_AUTO (a random enabled slot that
+        is not bound to an account - here or in `taken_slots`, the caller's
+        other pools such as CodeArts - and not held by another pending login). Nothing given means direct, exactly as before
+        this option existed - configured slots are only used when asked for.
+        Random rather than list order, so new accounts spread over the free
+        exits instead of always taking the head of the list.
+        Returns (slot_id, proxy_url); ("", "") means direct. An auto-picked
+        slot is reserved until start_login records (or drops) its state, so two
+        concurrent logins cannot pick the same slot; logins past their TTL no
+        longer hold one.
+        """
+        wanted = str(slot_id or "").strip()
+        if not wanted:
+            return "", ""
+        slots = [s for s in wb_settings.proxy_slots(self.dir) if s.get("enabled")]
+        for s in slots:
+            if s["id"] == wanted:
+                return s["id"], s["url"]
+        if wanted != LOGIN_SLOT_AUTO:
+            raise LoginProxySlotError(
+                "proxy slot %s does not exist or is disabled" % wanted)
+        now = time.time()
+        with self._lock:
+            taken = {a.proxy_slot for a in self.accounts if a.proxy_slot}
+            taken |= {str(t) for t in (taken_slots or ()) if t}
+            taken |= {str(i.get("proxy_slot") or "") for i in self.logins.values()
+                      if now - i.get("created", 0) <= LOGIN_TTL_SECONDS}
+            taken |= self._login_slot_reserved
+            free = [s for s in slots if s["id"] not in taken]
+            if not free:
+                return "", ""
+            pick = random.choice(free)
+            self._login_slot_reserved.add(pick["id"])
+        return pick["id"], pick["url"]
+
+    def start_login(self, realm="intl", platform="CLI", proxy_slot=None,
+                    taken_slots=()):
+        auto_slot = str(proxy_slot or "").strip() == LOGIN_SLOT_AUTO
+        slot_id, proxy_url = self._login_proxy(proxy_slot, taken_slots)
+        try:
+            return self._start_login(realm, platform, slot_id, proxy_url, auto_slot)
+        finally:
+            if auto_slot and slot_id:  # explicit picks never reserved anything
+                with self._lock:
+                    self._login_slot_reserved.discard(slot_id)
+
+    def _start_login(self, realm, platform, slot_id, proxy_url, auto_slot):
         cfg = get_realm_config(realm)
         url = "%s%s?platform=%s" % (cfg["chat_upstream"], AUTH_STATE_PATH, urllib.parse.quote(str(platform)))
         headers = {
@@ -5013,15 +5249,18 @@ class AccountPool(object):
             "Referer": cfg["origin"] + "/",
         }
         payload = http_json(url, data=b"{}", method="POST", headers=headers,
-                            timeout=30, retries=3, log=self.log)
+                            timeout=30, retries=3, log=self.log, proxy=proxy_url)
         data = payload.get("data") or {}
         state = data.get("state")
         auth_url = data.get("authUrl")
         if not state or not auth_url:
             raise RuntimeError("auth/state returned no state/authUrl: %s" % payload)
         with self._lock:
-            self.logins[state] = {"created": time.time(), "platform": platform, "realm": realm}
-        return {"state": state, "authUrl": auth_url, "realm": realm, "platform": platform}
+            self.logins[state] = {"created": time.time(), "platform": platform,
+                                  "realm": realm, "proxy_slot": slot_id,
+                                  "proxy": proxy_url, "auto_slot": auto_slot}
+        return {"state": state, "authUrl": auth_url, "realm": realm,
+                "platform": platform, "proxySlot": slot_id, "proxy": proxy_url}
 
     def poll_login(self, state):
         state = str(state or "").strip()
@@ -5033,6 +5272,7 @@ class AccountPool(object):
             with self._lock: self.logins.pop(state, None)
             return {"status": "expired", "message": "login window expired - start again"}
         realm = info.get("realm") or "intl"
+        proxy_url = info.get("proxy") or ""
         cfg = get_realm_config(realm)
         url = "%s%s?state=%s" % (cfg["chat_upstream"], AUTH_TOKEN_PATH, urllib.parse.quote(state))
         headers = {
@@ -5044,7 +5284,8 @@ class AccountPool(object):
             "Referer": cfg["origin"] + "/",
         }
         try:
-            payload = http_json(url, method="GET", headers=headers, timeout=30, retries=2)
+            payload = http_json(url, method="GET", headers=headers, timeout=30, retries=2,
+                                proxy=proxy_url)
         except Exception as exc:
             return {"status": "pending", "message": "poll error: %s" % exc}
         code = payload.get("code")
@@ -5057,13 +5298,24 @@ class AccountPool(object):
         if not token:
             return {"status": "pending", "message": "waiting for token"}
         uid = jwt_uid(token)
+        slot_id = info.get("proxy_slot") or ""
+        if info.get("auto_slot"):
+            # Re-login of a bound account keeps its exit; the auto pick only
+            # served this login (add() keeps the existing slot when ours is "").
+            with self._lock:
+                existing = self.get(uid)
+            if existing is not None and existing.proxy_slot:
+                slot_id = ""
         nickname = ""
         try:
             acct_url = "%s%s?state=%s" % (cfg["chat_upstream"], LOGIN_ACCOUNT_PATH, urllib.parse.quote(state))
             acct_headers = dict(headers)
             acct_headers["Authorization"] = "Bearer " + token
             req_acct = urllib.request.Request(acct_url, method="GET", headers=acct_headers)
-            with urllib.request.urlopen(req_acct, timeout=15) as resp_acct:
+            # Direct logins keep the exact pre-slot path (plain urllib).
+            opened = (urlopen(req_acct, timeout=15, proxy=proxy_url) if proxy_url
+                      else urllib.request.urlopen(req_acct, timeout=15))
+            with opened as resp_acct:
                 profile = json.loads(resp_acct.read().decode("utf-8"))
                 profile_data = profile.get("data") or {}
                 nickname = str(profile_data.get("nickname") or "")
@@ -5079,6 +5331,10 @@ class AccountPool(object):
             "expiresAt": normalize_epoch(data.get("expiresAt")) or jwt_exp(token),
             "source": "oauth",
             "enabled": True,
+            # Only the slot id is stored; copying its URL into the legacy
+            # "proxy" field would keep the account on it after the slot is
+            # removed/disabled.
+            "proxySlot": slot_id,
         })
         self.add(account)
         if realm == "cn":
@@ -5486,6 +5742,7 @@ def normalise_import_row(row, realm=None):
         "expiresAt": (0 if api_key
                       else normalize_epoch(pick("expiresAt")) or jwt_exp(token)),
         "source": str(pick("source") or (SOURCE_API_KEY if api_key else "import")),
+        "group": str(pick("group") or "").strip()[:64],
         "enabled": True,
         # Imported accounts start with tasks on (they are new to this pool);
         # an export that carries the flag keeps the operator's choice.

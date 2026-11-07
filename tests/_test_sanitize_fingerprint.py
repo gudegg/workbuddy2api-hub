@@ -389,6 +389,132 @@ class DshFileReferenceParagraphTests(unittest.TestCase):
             self.assertEqual(P.sanitize_text(text), text)
 
 
+class CodexIntroFingerprintTests(unittest.TestCase):
+    """Codex 基础提示词首段（#743）。
+
+    旧规则把中性句改写成 ``You are a coding agent running in the Codex CLI
+    tool, ...``，而 ``SANITIZE_FEATURES`` 恰好在找 ``... running in the Codex
+    CLI``，于是 sanitize 之后 has_fingerprint() 仍为 True，出站 body 继续
+    11-128。这里钉住两件事：首段必须被中性化；改写必须是幂等的。
+    """
+
+    INTRO = ("You are a coding agent running in the Codex CLI, a terminal-based "
+             "coding assistant.")
+    INTRO_TOOL = ("You are a coding agent running in the Codex CLI tool, a "
+                  "terminal-based coding assistant.")
+    CLEAN = "You are a helpful AI assistant."
+
+    def test_codex_intro_is_neutralized(self):
+        for text in (self.INTRO, self.INTRO_TOOL):
+            self.assertTrue(P.has_fingerprint(text))
+            self.assertEqual(P.sanitize_text(text), self.CLEAN, text)
+            self.assertFalse(P.has_fingerprint(P.sanitize_text(text)))
+
+    def test_embedded_after_neutral_sentence_still_matches(self):
+        # 真实 Codex base_instructions 的形态：中性首句 + 自述句 + 后续段落。
+        text = ("You are a helpful AI assistant. " + self.INTRO +
+                "\n\nYour capabilities:\n\n- Receive user prompts.")
+        out = P.sanitize_text(text)
+        self.assertFalse(P.has_fingerprint(out))
+        self.assertIn("Your capabilities:", out)
+
+    def test_neutral_sentence_is_untouched(self):
+        self.assertEqual(P.sanitize_text(self.CLEAN), self.CLEAN)
+        self.assertFalse(P.has_fingerprint(self.CLEAN))
+
+    def test_idempotent(self):
+        once = P.sanitize_text(self.INTRO)
+        self.assertEqual(P.sanitize_text(once), once)
+
+
+class LegacyRewriteFingerprintTests(unittest.TestCase):
+    """The two rewrites that regressed into no-ops in v1.10.5 (issue #796)."""
+
+    def test_main_branch_fingerprint_is_rewritten(self):
+        source = "Main branch (you will usually use this for PRs): main"
+        out = P.sanitize_text(source)
+        self.assertEqual(
+            out, "Default branch (you will usually use this for PRs): main")
+        self.assertNotIn("Main branch (", out)
+
+    def test_feedback_fingerprint_is_rewritten(self):
+        source = ("To give feedback, users should report the issue at "
+                  "https://github.com/anthropics/claude-code/issues")
+        out = P.sanitize_text(source)
+        self.assertEqual(
+            out,
+            "To provide feedback, users should report the issue at "
+            "https://github.com/anthropics/claude-code/issues")
+        self.assertNotIn("To give feedback,", out)
+
+    def test_rewrites_are_not_noops(self):
+        for old, new in P.SANITIZE_REWRITES:
+            if old == "11-128":
+                continue
+            self.assertNotEqual(old, new, "rewrite is a no-op: %r" % old)
+
+
+class ClaudeCodeIntroFingerprintTests(unittest.TestCase):
+    """Claude Code 基础提示词首段（#733）。
+
+    报告者把提示词模式改成「替换」后 400 消失，确认指纹在 system 文本里。
+    旧规则把 ``Anthropic's official CLI for Claude`` 改写成 ``... CLI tool
+    for Claude``，反而把 ``You are Claude Code`` 保留下来；这里按 #743 处理
+    Codex 自述句的同一套办法整句中性化，并钉住 Anthropic 转换后的出站链路。
+    """
+
+    INTRO = "You are Claude Code, Anthropic's official CLI tool for Claude."
+    INTRO_NO_TOOL = "You are Claude Code, Anthropic's official CLI for Claude."
+    INTRO_CODE = "You are Claude Code, Anthropic\u2019s official CLI tool for Claude Code."
+    CLEAN = "You are a helpful AI assistant."
+
+    def test_intro_variants_neutralized(self):
+        for text in (self.INTRO, self.INTRO_NO_TOOL, self.INTRO_CODE,
+                     self.INTRO.lower(), self.INTRO.upper()):
+            self.assertTrue(P.has_fingerprint(text), text)
+            out = P.sanitize_text(text)
+            self.assertEqual(out, self.CLEAN, text)
+            self.assertFalse(P.has_fingerprint(out), text)
+
+    def test_embedded_in_system_prompt_preserves_surrounding_text(self):
+        text = "Before.\n" + self.INTRO + "\nAfter."
+        out = P.sanitize_text(text)
+        self.assertEqual(out, "Before.\n" + self.CLEAN + "\nAfter.")
+        self.assertFalse(P.has_fingerprint(out))
+
+    def test_idempotent(self):
+        once = P.sanitize_text(self.INTRO)
+        self.assertEqual(P.sanitize_text(once), once)
+
+    def test_scoped_to_system_developer_and_assistant(self):
+        out = P.sanitize_messages([
+            {"role": "system", "content": self.INTRO},
+            {"role": "developer", "content": self.INTRO},
+            {"role": "assistant", "content": self.INTRO},
+            {"role": "user", "content": self.INTRO},
+            {"role": "tool", "content": self.INTRO},
+        ])
+        for i in range(3):
+            self.assertEqual(out[i]["content"], self.CLEAN, out[i]["role"])
+        self.assertEqual(out[3]["content"], self.INTRO)
+        self.assertEqual(out[4]["content"], self.INTRO)
+
+    def test_other_claude_code_mentions_untouched(self):
+        for text in ("Claude Code is a CLI.", "Use Claude Code for this task."):
+            self.assertEqual(P.sanitize_text(text), text)
+
+    def test_anthropic_messages_path_carries_the_rewrite(self):
+        chat = P.messages_to_chat({
+            "model": "deepseek-v4.1-flash",
+            "system": [{"type": "text", "text": self.INTRO}],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 128,
+        })
+        body = P.build_upstream_body(chat)
+        self.assertEqual(body["messages"][0]["content"], self.CLEAN)
+        self.assertEqual(body["messages"][1]["content"], "hi")
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -109,6 +109,7 @@ UI_LANGUAGE_VALUES = ("zh", "zh-Hant", "en")
 # reads as off - the opposite of the switches above - because turning it on
 # makes the gateway send a request on its own schedule.
 UPDATE_CHECK_ENABLED_KEY = "update_check_enabled"
+UPDATE_CHECK_PROXY_SLOT_KEY = "update_check_proxy_slot"
 # The last-check bookkeeping for that daily check. One small object, never a
 # general update-state store: see update_check_state().
 UPDATE_CHECK_STATE_KEY = "update_check"
@@ -435,7 +436,23 @@ def ensure_launcher_key(accounts_dir):
 # Each key can be bound to one upstream realm, so several clients can hit
 # different exits at the same time instead of sharing the global switch.
 
-REALMS = ("", "intl", "cn")
+REALMS = ("", "intl", "cn", "codearts")
+
+
+def codearts_config(accounts_dir):
+    """CodeArts 配置的薄包装，避免 wb_settings ↔ wb_codearts 的模块级循环。"""
+    import wb_codearts
+    return wb_codearts.load_config(accounts_dir)
+
+
+def set_codearts_config(accounts_dir, patch):
+    import wb_codearts
+    return wb_codearts.save_config(accounts_dir, patch)
+
+
+def codearts_configured(accounts_dir):
+    import wb_codearts
+    return wb_codearts.configured(accounts_dir)
 
 
 def _clean_model_patterns(value):
@@ -1611,6 +1628,21 @@ def set_upstream_config(accounts_dir, cfg):
     return clean
 
 
+def max_payload_mb(accounts_dir):
+    value = load(accounts_dir).get("max_payload_mb")
+    return value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 256 else None
+
+
+def set_max_payload_mb(accounts_dir, value):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 256:
+        raise ValueError("max_payload_mb must be an integer between 1 and 256")
+    with _lock:
+        data = load(accounts_dir)
+        data["max_payload_mb"] = value
+        save(accounts_dir, data)
+    return value
+
+
 USAGE_DEFAULTS = {
     "hour_keep_hours": 48,
     "day_keep_days": 32,
@@ -1658,6 +1690,132 @@ def set_usage_config(accounts_dir, patch):
     with _lock:
         data = load(accounts_dir)
         data["usage"] = deep_merge(data.get("usage"), clean)
+        save(accounts_dir, data)
+    return clean
+
+# ---------------------------------------------------------------- 媒体能力（生图 / 生视频）
+#
+# **默认全关**：这是本仓库里唯一一项「模型自己决定花钱」的能力——一次生图约 5.7
+# 积分、一条 5 秒视频 57~129 积分，直接扣账号积分而不经 token 计费，宿主也没有
+# 「调用前先确认」的机制。所以升级不能附赠它，必须是操作者显式打开的。
+#
+# 每一项都有上限（与 USAGE_LIMITS 同一套理由）：面板输入框贴错一位数就会把
+# 「每分钟 6 次」变成「每分钟 600 次」，那等于关掉了这道闸。
+
+MEDIA_DEFAULTS = {
+    # 总闸。false 时媒体路由**根本不存在**（404），不是 403——少一个探测面。
+    "enabled": False,
+    # 媒体只走哪个区。默认国内版：已取证的媒体目录在 cn；intl 有 hy-image-3.5
+    # 与 kling-video-v3，但没有 intl 账号时选它只会得到「该区没有可用账号」。
+    "realm": "cn",
+    # 出站身份：desktop（跟账号自身）或 cli。P0 取证之后把结论落到这里，
+    # 换默认值不需要改代码路径。
+    "identity": "desktop",
+    # 每个 API Key 每分钟最多几次生图。6 次/分钟 × 5.71 积分 ≈ 34 积分/分钟。
+    "image_max_per_minute": 6,
+    # 视频时长上限（秒）。与目录的 maxSeconds 取小值。
+    "video_max_seconds": 15,
+    # 每个 API Key 每天最多在媒体上花多少积分；0 = 不限。
+    # 这是第二道闸门：key 级防「一个客户端把整个池子烧光」，账号级的
+    # daily_credit_limit 防「某个账号被烧穿」。两层都过才派发。
+    # **默认不限**（0）。设一个有限的默认值等于替用户决定花多少，而失败模式很难看：
+    # 跑到一半撞额度，客户端只看到 402，还得自己猜是不是该改配置。
+    "daily_credits_per_key": 0,
+    # 同时跑几条生视频。超过就排队（不提交上游、不扣费），等有任务结束再自动提交。
+    # 3 是"三条并行、各占一个账号"的默认：再多会放大同一账号的风控面，
+    # 而账号数不足时排队比硬塞更划算。
+    "video_concurrency": 3,
+}
+
+MEDIA_LIMITS = {
+    "image_max_per_minute": 60,
+    "video_max_seconds": 60,
+    "daily_credits_per_key": 100000,
+    # 上限压在媒体并发槽（4）以内：再大也没有东西去跑。
+    "video_concurrency": 8,
+}
+
+#: 每个数值项的合法下界。生图次数与视频时长至少 1 秒/次；每日额度允许 0（不限）。
+MEDIA_MINIMUMS = {
+    "image_max_per_minute": 1,
+    "video_max_seconds": 1,
+    "daily_credits_per_key": 0,
+    "video_concurrency": 1,
+}
+
+MEDIA_REALMS = ("cn", "intl")
+MEDIA_IDENTITIES = ("desktop", "cli")
+
+
+def validate_media_patch(raw):
+    """严格校验面板提交的媒体设置补丁。
+
+    未知键**报错**而不是忽略：静默忽略会让前端拼错字段名时显示「保存成功」、
+    而实际什么都没存——那是最难查的一类问题。
+    """
+    out = {}
+    for key, value in (raw or {}).items():
+        if key not in MEDIA_DEFAULTS:
+            raise ValueError("unknown media setting %r" % key)
+        if key == "enabled":
+            if not isinstance(value, bool):
+                raise ValueError("enabled must be true or false")
+            out[key] = value
+            continue
+        if key == "realm":
+            if value not in MEDIA_REALMS:
+                raise ValueError("realm must be one of %s" % ", ".join(MEDIA_REALMS))
+            out[key] = value
+            continue
+        if key == "identity":
+            if value not in MEDIA_IDENTITIES:
+                raise ValueError("identity must be one of %s" % ", ".join(MEDIA_IDENTITIES))
+            out[key] = value
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("%s must be a whole number" % key)
+        if value < MEDIA_MINIMUMS[key]:
+            raise ValueError("%s cannot be less than %d" % (key, MEDIA_MINIMUMS[key]))
+        if value > MEDIA_LIMITS[key]:
+            raise ValueError("%s cannot be more than %d" % (key, MEDIA_LIMITS[key]))
+        out[key] = value
+    return out
+
+
+def media_config(accounts_dir, environ=None):
+    """媒体设置（带默认值，坏值回落到默认值而不是抛）。
+
+    `WB_MEDIA_ENABLED=1` 可临时打开总闸，供 CI 与冒烟用。**只有总闸**吃这个环境
+    变量：限额要是能被环境变量改大，「谁把它调大了」就变成不可查的问题。
+    """
+    stored = load(accounts_dir).get("media")
+    stored = stored if isinstance(stored, dict) else {}
+    out = {}
+    for key, default in MEDIA_DEFAULTS.items():
+        value = stored.get(key, default)
+        if key == "enabled":
+            out[key] = value if isinstance(value, bool) else default
+        elif key == "realm":
+            out[key] = value if value in MEDIA_REALMS else default
+        elif key == "identity":
+            out[key] = value if value in MEDIA_IDENTITIES else default
+        elif (isinstance(value, bool) or not isinstance(value, int)
+              or value < MEDIA_MINIMUMS[key] or value > MEDIA_LIMITS[key]):
+            out[key] = default
+        else:
+            out[key] = value
+    environ = os.environ if environ is None else environ
+    if str(environ.get("WB_MEDIA_ENABLED") or "").strip() == "1":
+        out["enabled"] = True
+    return out
+
+
+def set_media_config(accounts_dir, patch):
+    """持久化一份校验过的媒体设置补丁。"""
+    clean = validate_media_patch(patch)
+    with _lock:
+        data = load(accounts_dir)
+        data["media"] = deep_merge(data.get("media"), clean)
         save(accounts_dir, data)
     return clean
 
@@ -1741,21 +1899,6 @@ def set_enable_anthropic_messages(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data["enable_anthropic_messages"] = enabled
-        save(accounts_dir, data)
-    return enabled
-
-
-def free_model_credit_fallback(accounts_dir):
-    """Whether exhausted free models (deepseek-v4.1-flash) can fall back to credit siblings."""
-    return load(accounts_dir).get("free_model_credit_fallback") is True
-
-
-def set_free_model_credit_fallback(accounts_dir, enabled):
-    """Persist the free model credit fallback toggle. Returns the stored boolean."""
-    enabled = bool(enabled)
-    with _lock:
-        data = load(accounts_dir)
-        data["free_model_credit_fallback"] = enabled
         save(accounts_dir, data)
     return enabled
 
@@ -2015,6 +2158,44 @@ def set_egress_backoff_enabled(accounts_dir, enabled):
     return enabled
 
 
+RESTRICTION_HOLD_SECONDS_KEY = "restriction_hold_seconds"
+DEFAULT_RESTRICTION_HOLD_SECONDS = 1800
+MAX_RESTRICTION_HOLD_SECONDS = 86400 * 7
+
+
+def restriction_hold_seconds(accounts_dir):
+    """How many seconds the gateway pauses dispatch when upstream reports an
+    unusual activity restriction (403 / 11140).
+
+    Defaults to 1800 seconds (30 minutes). When set to 0, restriction hold is
+    disabled. Operator can configure custom duration via panel settings.
+    """
+    val = load(accounts_dir).get(RESTRICTION_HOLD_SECONDS_KEY)
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
+        return float(val)
+    env_val = os.environ.get("WB_RESTRICTION_HOLD_SECONDS")
+    if env_val is not None:
+        try:
+            return max(0.0, float(env_val))
+        except (ValueError, TypeError):
+            pass
+    return float(DEFAULT_RESTRICTION_HOLD_SECONDS)
+
+
+def set_restriction_hold_seconds(accounts_dir, value):
+    """Persist the restriction hold duration in seconds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError("restriction_hold_seconds must be a non-negative number")
+    if value > MAX_RESTRICTION_HOLD_SECONDS:
+        raise ValueError("restriction_hold_seconds exceeds maximum allowed")
+    stored = int(value) if float(value).is_integer() else round(float(value), 1)
+    with _lock:
+        data = load(accounts_dir)
+        data[RESTRICTION_HOLD_SECONDS_KEY] = stored
+        save(accounts_dir, data)
+    return stored
+
+
 def realm_fallback_enabled(accounts_dir):
     """Whether a throttled international exit may fail over to the domestic one.
 
@@ -2183,6 +2364,31 @@ def set_log_db_max_bytes(accounts_dir, value):
         data[LOG_DB_MAX_BYTES_KEY] = stored
         save(accounts_dir, data)
     return stored
+
+
+def daily_activity_enabled(accounts_dir):
+    """Whether the scheduler runs the intl daily activity at all (master switch).
+
+    On unless the operator turns it off: an install that never touched the
+    setting keeps the scheduled daily activity exactly as before. Writing
+    ``false`` stops it (like ``daily_chat_web``, any stored value other than
+    unset / ``true`` reads as off; the panel and API only ever write booleans):
+    the scheduled slots, the forced "check now" cycle and the startup catch-up
+    all skip it, while the manual per-account / batch buttons in the panel
+    still work, because those are explicit operator actions.
+    """
+    value = load(accounts_dir).get("daily_activity")
+    return True if value is None else value is True
+
+
+def set_daily_activity_enabled(accounts_dir, enabled):
+    """Persist the daily-activity master switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_activity"] = enabled
+        save(accounts_dir, data)
+    return enabled
 
 
 def daily_chat_web(accounts_dir):
@@ -2770,6 +2976,25 @@ def set_update_check_enabled(accounts_dir, enabled):
     return enabled
 
 
+def update_check_proxy_slot(accounts_dir):
+    """Proxy slot used only by the release checker; "" means direct."""
+    value = load(accounts_dir).get(UPDATE_CHECK_PROXY_SLOT_KEY)
+    return str(value or "").strip()[:64]
+
+
+def set_update_check_proxy_slot(accounts_dir, slot_id):
+    """Persist the optional update-check proxy slot. Returns the stored id."""
+    slot_id = str(slot_id or "").strip()[:64]
+    with _lock:
+        data = load(accounts_dir)
+        if slot_id:
+            data[UPDATE_CHECK_PROXY_SLOT_KEY] = slot_id
+        else:
+            data.pop(UPDATE_CHECK_PROXY_SLOT_KEY, None)
+        save(accounts_dir, data)
+    return slot_id
+
+
 def window_probe(accounts_dir):
     """是否在模型额度窗口重置时刻主动发探针请求，抢占新一轮计时。
 
@@ -2915,6 +3140,29 @@ def set_quota_scan_models(accounts_dir, models):
 _SLOT_ID_RE = re.compile(r"^slot-(\d+)$")
 
 
+def normalize_proxy_url(url):
+    """Normalize user/vendor proxy input into standard http://[user:pass@]host:port.
+
+    Supports:
+      - host:port:user:pass or http://host:port:user:pass (vendor format)
+      - user:pass@host:port (adds missing http:// scheme)
+      - standard http://user:pass@host:port or http://host:port
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    scheme = "http"
+    if "://" in raw:
+        s, _, rest = raw.partition("://")
+        scheme = s.strip().lower() or "http"
+        raw = rest.strip()
+    parts = raw.split(":")
+    if len(parts) == 4 and parts[1].isdigit():
+        host, port, user, password = parts[0], parts[1], parts[2], parts[3]
+        return "%s://%s:%s@%s:%s" % (scheme, user, password, host, port)
+    return "%s://%s" % (scheme, raw)
+
+
 def _clean_slot_entry(entry, fallback_id=None):
     """Normalize one stored slot; returns None when unusable.
 
@@ -2925,7 +3173,7 @@ def _clean_slot_entry(entry, fallback_id=None):
     """
     if not isinstance(entry, dict):
         return None
-    url = str(entry.get("url") or "").strip()
+    url = normalize_proxy_url(entry.get("url"))
     if not url:
         return None
     slot_id = str(entry.get("id") or "").strip()
